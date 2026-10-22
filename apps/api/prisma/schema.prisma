@@ -1,0 +1,554 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum PrivacyLevel {
+  STRUCTURED_ONLY
+  TEXT_AND_EMBEDDINGS
+  ENCRYPTED_COPY
+}
+
+enum NotificationDetail {
+  MINIMAL
+  DETAILED
+}
+
+enum DocumentSource {
+  WEB_UPLOAD
+}
+
+enum ParseState {
+  PENDING
+  PROCESSING
+  SUCCEEDED
+  FAILED
+  UNSUPPORTED
+}
+
+enum FileCopyKind {
+  WEB_SOURCE
+  ENCRYPTED_COPY
+}
+
+enum FileCopyState {
+  UPLOADING
+  AVAILABLE
+  DELETE_PENDING
+  DELETED
+}
+
+enum ExtractionStatus {
+  PENDING
+  CONFIRMED
+  REJECTED
+  SUPERSEDED
+}
+
+enum ObligationStatus {
+  ACTIVE
+  NEEDS_REVIEW
+  COMPLETED
+  CANCELLED
+}
+
+enum ActionKind {
+  PAYMENT
+  RENEWAL
+  CANCELLATION
+  EXPIRY
+  WARRANTY
+  CUSTOM
+}
+
+enum ActionStatus {
+  ACTIVE
+  PAUSED
+  COMPLETED
+  CANCELLED
+}
+
+enum EventStatus {
+  UPCOMING
+  DONE
+  SKIPPED
+  CANCELLED
+}
+
+enum IntegrationKind {
+  TELEGRAM
+  EMAIL
+}
+
+enum ReminderStatus {
+  PENDING
+  SENT
+  CANCELLED
+  FAILED
+}
+
+enum NotificationStatus {
+  PENDING
+  SENDING
+  SENT
+  FAILED
+  UNKNOWN
+}
+
+enum JobKind {
+  PARSE
+  CLASSIFY
+  EXTRACT
+  SUMMARIZE
+  EMBED
+  PURGE
+}
+
+enum JobStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  DEAD
+  CANCELLED
+}
+
+model User {
+  id                 String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email              String             @unique @db.VarChar(254)
+  emailVerifiedAt    DateTime?          @db.Timestamptz(3)
+  passwordHash       String             @db.VarChar(255)
+  passwordChangedAt  DateTime           @default(now()) @db.Timestamptz(3)
+  displayName        String?            @db.VarChar(100)
+  timezone           String             @default("Asia/Ho_Chi_Minh") @db.VarChar(64)
+  locale             String             @default("vi") @db.VarChar(16)
+  privacyLevel       PrivacyLevel       @default(TEXT_AND_EMBEDDINGS)
+  notificationDetail NotificationDetail @default(MINIMAL)
+  revision           BigInt             @default(1)
+  createdAt          DateTime           @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime           @default(now()) @updatedAt @db.Timestamptz(3)
+
+  sessions            Session[]
+  documents           Document[]
+  documentVersions    DocumentVersion[]
+  fileCopies          FileCopy[]
+  documentChunks      DocumentChunk[]
+  extractedMetadata   ExtractedMetadata[]
+  collections         Collection[]
+  documentCollections DocumentCollection[]
+  obligations         Obligation[]
+  actions             Action[]
+  events              Event[]
+  integrations        Integration[]
+  reminders           Reminder[]
+  notifications       Notification[]
+  aiJobs              AIJob[]
+}
+
+model Session {
+  id               String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId           String    @db.Uuid
+  refreshTokenHash String    @unique @db.Char(64)
+  expiresAt        DateTime  @db.Timestamptz(3)
+  lastUsedAt       DateTime? @db.Timestamptz(3)
+  revokedAt        DateTime? @db.Timestamptz(3)
+  userAgent        String?   @db.VarChar(255)
+  ipAddress        String?   @db.Inet
+  createdAt        DateTime  @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model DocumentType {
+  code            String   @id @db.VarChar(64)
+  name            String   @db.VarChar(100)
+  pathTemplate    String   @db.VarChar(255)
+  fieldSchema     Json
+  obligationRules Json     @default("[]")
+  schemaVersion   Int      @default(1)
+  isActive        Boolean  @default(true)
+  sortOrder       Int      @default(0)
+  createdAt       DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime @default(now()) @updatedAt @db.Timestamptz(3)
+
+  documents         Document[]
+  extractedMetadata ExtractedMetadata[]
+}
+
+model Document {
+  id           String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId       String         @db.Uuid
+  title        String         @db.VarChar(255)
+  source       DocumentSource
+  typeCode     String?        @db.VarChar(64)
+  privacyLevel PrivacyLevel?
+  deletedAt    DateTime?      @db.Timestamptz(3)
+  revision     BigInt         @default(1)
+  createdAt    DateTime       @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime       @default(now()) @updatedAt @db.Timestamptz(3)
+
+  user              User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type              DocumentType?        @relation(fields: [typeCode], references: [code], onDelete: NoAction)
+  versions          DocumentVersion[]
+  fileCopies        FileCopy[]
+  chunks            DocumentChunk[]
+  extractedMetadata ExtractedMetadata[]
+  collections       DocumentCollection[]
+  obligations       Obligation[]
+  aiJobs            AIJob[]
+
+  @@unique([id, userId])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([userId, typeCode])
+}
+
+model DocumentVersion {
+  id               String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId           String         @db.Uuid
+  documentId       String         @db.Uuid
+  number           Int
+  sha256           String         @db.Char(64)
+  byteSize         BigInt
+  mimeType         String         @db.VarChar(127)
+  originalFilename String         @db.VarChar(255)
+  source           DocumentSource
+  parseState       ParseState     @default(PENDING)
+  parseErrorCode   String?        @db.VarChar(64)
+  parserVersion    String?        @db.VarChar(32)
+  pageCount        Int?
+  charCount        Int?
+  createdAt        DateTime       @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime       @default(now()) @updatedAt @db.Timestamptz(3)
+
+  user              User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  document          Document            @relation(fields: [documentId, userId], references: [id, userId], onDelete: Cascade)
+  fileCopies        FileCopy[]
+  chunks            DocumentChunk[]
+  extractedMetadata ExtractedMetadata[]
+  obligations       Obligation[]
+  aiJobs            AIJob[]
+
+  @@unique([documentId, number])
+  @@unique([id, documentId])
+  @@index([userId, sha256])
+}
+
+model FileCopy {
+  id                String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId            String        @db.Uuid
+  documentId        String        @db.Uuid
+  versionId         String        @db.Uuid
+  kind              FileCopyKind
+  state             FileCopyState @default(UPLOADING)
+  storageKey        String        @unique @db.VarChar(512)
+  contentType       String        @db.VarChar(127)
+  byteSize          BigInt?
+  sha256            String?       @db.Char(64)
+  encryptionKeyRef  String?       @db.VarChar(256)
+  expiresAt         DateTime?     @db.Timestamptz(3)
+  deleteRequestedAt DateTime?     @db.Timestamptz(3)
+  deletedAt         DateTime?     @db.Timestamptz(3)
+  revision          BigInt        @default(1)
+  createdAt         DateTime      @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime      @default(now()) @updatedAt @db.Timestamptz(3)
+
+  user     User            @relation(fields: [userId], references: [id], onDelete: NoAction)
+  document Document        @relation(fields: [documentId, userId], references: [id, userId], onDelete: NoAction)
+  version  DocumentVersion @relation(fields: [versionId, documentId], references: [id, documentId], onDelete: NoAction)
+
+  @@index([userId])
+  @@index([documentId])
+  @@index([versionId])
+}
+
+model DocumentChunk {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId         String   @db.Uuid
+  documentId     String   @db.Uuid
+  versionId      String   @db.Uuid
+  ordinal        Int
+  content        String
+  charStart      Int
+  charEnd        Int
+  pageFrom       Int?
+  pageTo         Int?
+  tokenCount     Int?
+  chunkerVersion String   @db.VarChar(32)
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+
+  user     User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  document Document        @relation(fields: [documentId, userId], references: [id, userId], onDelete: Cascade)
+  version  DocumentVersion @relation(fields: [versionId, documentId], references: [id, documentId], onDelete: Cascade)
+
+  @@unique([versionId, ordinal])
+  @@index([documentId])
+}
+
+model ExtractedMetadata {
+  id              String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId          String           @db.Uuid
+  documentId      String           @db.Uuid
+  versionId       String           @db.Uuid
+  status          ExtractionStatus @default(PENDING)
+  typeCode        String?          @db.VarChar(64)
+  confidence      Decimal?         @db.Decimal(4, 3)
+  fields          Json             @default("{}")
+  evidence        Json             @default("{}")
+  summary         String?
+  confirmedFields Json?
+  modelId         String           @db.VarChar(128)
+  promptVersion   String           @db.VarChar(32)
+  schemaVersion   Int
+  confirmedAt     DateTime?        @db.Timestamptz(3)
+  revision        BigInt           @default(1)
+  createdAt       DateTime         @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime         @default(now()) @updatedAt @db.Timestamptz(3)
+
+  user        User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  document    Document        @relation(fields: [documentId, userId], references: [id, userId], onDelete: Cascade)
+  version     DocumentVersion @relation(fields: [versionId, documentId], references: [id, documentId], onDelete: Cascade)
+  type        DocumentType?   @relation(fields: [typeCode], references: [code], onDelete: NoAction)
+  obligations Obligation[]
+
+  @@unique([id, documentId])
+  @@index([documentId])
+  @@index([versionId])
+  @@index([userId, status])
+}
+
+model Collection {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId      String   @db.Uuid
+  name        String   @db.VarChar(100)
+  nameKey     String   @db.VarChar(100)
+  description String?  @db.VarChar(500)
+  revision    BigInt   @default(1)
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime @default(now()) @updatedAt @db.Timestamptz(3)
+
+  user      User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  documents DocumentCollection[]
+
+  @@unique([id, userId])
+  @@unique([userId, nameKey])
+}
+
+model DocumentCollection {
+  documentId   String   @db.Uuid
+  collectionId String   @db.Uuid
+  userId       String   @db.Uuid
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  document   Document   @relation(fields: [documentId, userId], references: [id, userId], onDelete: Cascade)
+  collection Collection @relation(fields: [collectionId, userId], references: [id, userId], onDelete: Cascade)
+
+  @@id([documentId, collectionId])
+  @@index([collectionId])
+}
+
+model Obligation {
+  id               String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId           String           @db.Uuid
+  documentId       String           @db.Uuid
+  versionId        String           @db.Uuid
+  metadataId       String           @db.Uuid
+  sourceKey        String           @db.VarChar(128)
+  title            String           @db.VarChar(200)
+  counterparty     String?          @db.VarChar(200)
+  status           ObligationStatus @default(ACTIVE)
+  startDate        DateTime?        @db.Date
+  endDate          DateTime?        @db.Date
+  noticePeriodDays Int?
+  revision         BigInt           @default(1)
+  createdAt        DateTime         @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime         @default(now()) @updatedAt @db.Timestamptz(3)
+
+  user     User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  document Document          @relation(fields: [documentId, userId], references: [id, userId], onDelete: NoAction)
+  version  DocumentVersion   @relation(fields: [versionId, documentId], references: [id, documentId], onDelete: NoAction)
+  metadata ExtractedMetadata @relation(fields: [metadataId, documentId], references: [id, documentId], onDelete: NoAction)
+  actions  Action[]
+
+  @@unique([id, userId])
+  @@unique([documentId, sourceKey])
+  @@index([userId, status])
+  @@index([versionId])
+  @@index([metadataId])
+}
+
+model Action {
+  id                String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId            String       @db.Uuid
+  obligationId      String       @db.Uuid
+  kind              ActionKind
+  title             String       @db.VarChar(200)
+  amount            Decimal?     @db.Decimal(19, 4)
+  currency          String?      @db.Char(3)
+  recurrence        String?      @db.VarChar(255)
+  anchorDate        DateTime?    @db.Date
+  anchorTime        DateTime?    @db.Time(0)
+  untilDate         DateTime?    @db.Date
+  timezone          String       @db.VarChar(64)
+  leadMinutes       Int[]        @default([10080, 4320, 0])
+  materializedUntil DateTime?    @db.Date
+  status            ActionStatus @default(ACTIVE)
+  revision          BigInt       @default(1)
+  createdAt         DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime     @default(now()) @updatedAt @db.Timestamptz(3)
+
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  obligation Obligation @relation(fields: [obligationId, userId], references: [id, userId], onDelete: Cascade)
+  events     Event[]
+
+  @@unique([id, userId])
+  @@index([obligationId])
+  @@index([userId, status])
+}
+
+model Event {
+  id            String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId        String      @db.Uuid
+  actionId      String      @db.Uuid
+  occurrenceKey String      @db.VarChar(64)
+  dueDate       DateTime?   @db.Date
+  dueAt         DateTime?   @db.Timestamptz(3)
+  status        EventStatus @default(UPCOMING)
+  completedAt   DateTime?   @db.Timestamptz(3)
+  revision      BigInt      @default(1)
+  createdAt     DateTime    @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime    @default(now()) @updatedAt @db.Timestamptz(3)
+
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  action    Action     @relation(fields: [actionId, userId], references: [id, userId], onDelete: Cascade)
+  reminders Reminder[]
+
+  @@unique([id, userId])
+  @@unique([actionId, occurrenceKey])
+  @@index([userId, dueDate])
+  @@index([userId, dueAt])
+}
+
+model Integration {
+  id                    String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId                String          @db.Uuid
+  kind                  IntegrationKind
+  target                String?         @db.VarChar(320)
+  enabled               Boolean         @default(false)
+  verifiedAt            DateTime?       @db.Timestamptz(3)
+  verificationCodeHash  String?         @db.Char(64)
+  verificationExpiresAt DateTime?       @db.Timestamptz(3)
+  revision              BigInt          @default(1)
+  createdAt             DateTime        @default(now()) @db.Timestamptz(3)
+  updatedAt             DateTime        @default(now()) @updatedAt @db.Timestamptz(3)
+
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  reminders Reminder[]
+
+  @@unique([id, userId])
+  @@unique([userId, kind])
+}
+
+model Reminder {
+  id                 String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId             String         @db.Uuid
+  eventId            String         @db.Uuid
+  integrationId      String         @db.Uuid
+  leadMinutes        Int
+  scheduledAt        DateTime       @db.Timestamptz(3)
+  snoozedUntil       DateTime?      @db.Timestamptz(3)
+  status             ReminderStatus @default(PENDING)
+  deliveryGeneration Int            @default(1)
+  attempts           Int            @default(0)
+  leaseOwner         String?        @db.VarChar(64)
+  leaseUntil         DateTime?      @db.Timestamptz(3)
+  sentAt             DateTime?      @db.Timestamptz(3)
+  revision           BigInt         @default(1)
+  createdAt          DateTime       @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime       @default(now()) @updatedAt @db.Timestamptz(3)
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  event         Event          @relation(fields: [eventId, userId], references: [id, userId], onDelete: Cascade)
+  integration   Integration    @relation(fields: [integrationId, userId], references: [id, userId], onDelete: NoAction)
+  notifications Notification[]
+
+  @@unique([id, userId])
+  @@unique([eventId, integrationId, leadMinutes])
+  @@index([integrationId])
+}
+
+model Notification {
+  id                 String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId             String             @db.Uuid
+  reminderId         String             @db.Uuid
+  deliveryGeneration Int
+  idempotencyKey     String             @unique @db.VarChar(128)
+  status             NotificationStatus @default(PENDING)
+  attempts           Int                @default(0)
+  providerMessageId  String?            @db.VarChar(128)
+  lastErrorCode      String?            @db.VarChar(64)
+  lastAttemptAt      DateTime?          @db.Timestamptz(3)
+  sentAt             DateTime?          @db.Timestamptz(3)
+  createdAt          DateTime           @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime           @default(now()) @updatedAt @db.Timestamptz(3)
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  reminder Reminder @relation(fields: [reminderId, userId], references: [id, userId], onDelete: NoAction)
+
+  @@unique([reminderId, deliveryGeneration])
+  @@index([userId, createdAt(sort: Desc)])
+}
+
+model AIJob {
+  id               String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId           String    @db.Uuid
+  kind             JobKind
+  status           JobStatus @default(QUEUED)
+  documentId       String?   @db.Uuid
+  versionId        String?   @db.Uuid
+  payload          Json      @default("{}")
+  idempotencyKey   String    @unique @db.VarChar(200)
+  priority         Int       @default(0) @db.SmallInt
+  attempts         Int       @default(0)
+  maxAttempts      Int       @default(5)
+  availableAt      DateTime  @default(now()) @db.Timestamptz(3)
+  leaseOwner       String?   @db.VarChar(64)
+  leaseUntil       DateTime? @db.Timestamptz(3)
+  startedAt        DateTime? @db.Timestamptz(3)
+  finishedAt       DateTime? @db.Timestamptz(3)
+  lastErrorCode    String?   @db.VarChar(64)
+  lastErrorMessage String?   @db.VarChar(1000)
+  createdAt        DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime  @default(now()) @updatedAt @db.Timestamptz(3)
+
+  user     User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  document Document?        @relation(fields: [documentId, userId], references: [id, userId], onDelete: Cascade)
+  version  DocumentVersion? @relation(fields: [versionId, documentId], references: [id, documentId], onDelete: Cascade)
+
+  @@index([userId, status])
+  @@index([documentId])
+  @@index([versionId])
+}
+
+model OutboxEvent {
+  id            BigInt    @id @default(autoincrement())
+  userId        String?   @db.Uuid
+  aggregateType String    @db.VarChar(64)
+  aggregateId   String    @db.Uuid
+  eventType     String    @db.VarChar(100)
+  payload       Json      @default("{}")
+  attempts      Int       @default(0)
+  availableAt   DateTime  @default(now()) @db.Timestamptz(3)
+  publishedAt   DateTime? @db.Timestamptz(3)
+  lastErrorCode String?   @db.VarChar(64)
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+
+  @@index([aggregateType, aggregateId])
+}

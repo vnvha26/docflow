@@ -1,0 +1,7 @@
+# Keep LF everywhere: Prisma checksums migration.sql by content, so a CRLF checkout
+# on Windows would make `prisma migrate deploy` report the migration as modified.
+* text=auto eol=lf
+*.sql text eol=lf
+*.prisma text eol=lf
+*.docx binary
+*.pdf binary
