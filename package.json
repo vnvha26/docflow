@@ -1,16 +1,13 @@
 {
   "name": "docflow",
   "private": true,
-  "workspaces": [
-    "apps/api"
-  ],
-  "engines": {
-    "node": ">=22.13"
-  },
+  "workspaces": ["apps/api", "apps/web"],
+  "engines": { "node": ">=22.13" },
   "scripts": {
     "setup": "node tools/setup.mjs",
-    "dev": "npm run dev -w apps/api",
+    "dev": "node tools/dev.mjs",
     "dev:api": "npm run dev -w apps/api",
+    "dev:web": "npm run dev -w apps/web",
     "build": "npm run build --workspaces --if-present",
     "test": "npm run test --workspaces --if-present && npm run db:test",
     "test:auth": "npm run build -w apps/api && node --test tools/auth.integration.test.mjs",
