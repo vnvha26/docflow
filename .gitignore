@@ -10,3 +10,4 @@ dist/
 /apps/api/test/
 docs/
 .cp1-backup/
+/README.md
