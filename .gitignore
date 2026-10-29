@@ -2,5 +2,11 @@ node_modules/
 dist/
 .env
 *.log
+*.tsbuildinfo
+.env.*
+!.env.example
+.local/
+.test-dist/
+/apps/api/test/
 docs/
 .cp1-backup/
