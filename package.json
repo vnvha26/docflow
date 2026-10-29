@@ -8,6 +8,12 @@
     "node": ">=22.13"
   },
   "scripts": {
+    "setup": "node tools/setup.mjs",
+    "dev": "npm run dev -w apps/api",
+    "dev:api": "npm run dev -w apps/api",
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present && npm run db:test",
+    "test:auth": "npm run build -w apps/api && node --test tools/auth.integration.test.mjs",
     "db:generate": "npm run db:generate -w apps/api",
     "db:migrate": "npm run db:migrate -w apps/api",
     "db:test": "node --test tools/database.test.mjs"
@@ -16,6 +22,14 @@
     "@electric-sql/pglite": "0.3.16"
   },
   "overrides": {
+    "@nestjs/platform-express": {
+      "multer": "2.5.0"
+    },
+    "@nestjs/swagger": {
+      "js-yaml": "5.5.0"
+    },
+    "js-yaml@>=4 <5": "4.3.2",
+    "ajv@>=7 <9": "8.20.0",
     "@prisma/config": {
       "deepmerge-ts": "8.0.0",
       "effect": "3.21.0"
