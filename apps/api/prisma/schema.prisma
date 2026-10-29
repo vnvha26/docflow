@@ -117,6 +117,11 @@ enum JobStatus {
   CANCELLED
 }
 
+enum EmailChallengePurpose {
+  REGISTER
+  RESET_PASSWORD
+}
+
 model User {
   id                 String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   email              String             @unique @db.VarChar(254)
@@ -133,6 +138,7 @@ model User {
   updatedAt          DateTime           @default(now()) @updatedAt @db.Timestamptz(3)
 
   sessions            Session[]
+  emailChallenges     EmailChallenge[]
   documents           Document[]
   documentVersions    DocumentVersion[]
   fileCopies          FileCopy[]
@@ -164,6 +170,29 @@ model Session {
 
   @@index([userId])
   @@index([expiresAt])
+}
+
+// Pending registration data is held here until the email owner confirms the code.
+// Only a keyed HMAC of the OTP is stored; raw codes exist only in the outgoing email.
+model EmailChallenge {
+  id                String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email             String                @db.VarChar(254)
+  purpose           EmailChallengePurpose
+  userId            String?               @db.Uuid
+  codeHash          String                @db.Char(64)
+  passwordHash      String?               @db.VarChar(255)
+  displayName       String?               @db.VarChar(100)
+  attempts          Int                   @default(0)
+  expiresAt         DateTime              @db.Timestamptz(3)
+  resendAvailableAt DateTime              @db.Timestamptz(3)
+  consumedAt        DateTime?             @db.Timestamptz(3)
+  createdAt         DateTime              @default(now()) @db.Timestamptz(3)
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([email, purpose, createdAt(sort: Desc)])
+  @@index([expiresAt])
+  @@index([userId])
 }
 
 model DocumentType {

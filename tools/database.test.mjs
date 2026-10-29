@@ -17,7 +17,7 @@ before(async () => {
   db = new PGlite();
   const dirs = (await readdir(MIGRATIONS, { withFileTypes: true }))
     .filter((d) => d.isDirectory()).map((d) => d.name).sort();
-  assert.equal(dirs.length, 2);
+  assert.equal(dirs.length, 4);
   for (const dir of dirs) await db.exec(await readFile(new URL(`${dir}/migration.sql`, MIGRATIONS), 'utf8'));
   await db.exec(`INSERT INTO "DocumentType" ("code","name","pathTemplate","fieldSchema")
                  VALUES ('RENTAL_CONTRACT','Hợp đồng thuê nhà','Hợp đồng/Thuê nhà/{year}','{"type":"object"}')`);
@@ -75,14 +75,64 @@ async function seedUser(tag) {
 
 // ───────────────────────────── Structure ─────────────────────────────
 
-test('migrations create the 18 CP1 tables', async () => {
+test('migrations create the 19 CP1 tables including email challenges', async () => {
   const { count } = await one(`SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'public'`);
-  assert.equal(count, 18);
+  assert.equal(count, 19);
 });
 
 test('privacy enum is ordered so LEAST() gives the effective level', async () => {
   const row = await one(`SELECT LEAST('ENCRYPTED_COPY'::"PrivacyLevel", 'STRUCTURED_ONLY', 'TEXT_AND_EMBEDDINGS') AS level`);
   assert.equal(row.level, 'STRUCTURED_ONLY');
+});
+
+// Auth data must be valid even when written outside the HTTP API.
+test('auth rejects unnormalized email and a nonpositive user revision', async () => {
+  for (const email of ['A@example.com', ' a@example.com', 'a@example.com ', 'invalid']) {
+    await rejects(`INSERT INTO "User" ("email","passwordHash") VALUES ($1,'x')`, [email], 'User_email_normalized_check');
+  }
+  const a = await seedUser('a');
+  await rejects(`UPDATE "User" SET "revision" = 0 WHERE "id" = $1`, [a.user], 'User_revision_check');
+});
+
+test('session refresh hashes must be lowercase SHA-256 hex', async () => {
+  const a = await seedUser('a');
+  for (const hash of ['raw-refresh-token', 'A'.repeat(64), 'g'.repeat(64)]) {
+    await rejects(`UPDATE "Session" SET "refreshTokenHash" = $2 WHERE "id" = $1`, [a.session, hash], 'Session_refreshTokenHash_hex_check');
+  }
+});
+
+test('session expiry must be after its creation', async () => {
+  const a = await seedUser('a');
+  await rejects(`UPDATE "Session" SET "expiresAt" = "createdAt" WHERE "id" = $1`, [a.session], 'Session_expiry_check');
+});
+
+test('email challenges enforce bounded attempts, normalized email and keyed hash format', async () => {
+  const challenge = await id(`INSERT INTO "EmailChallenge" ("email","purpose","codeHash","passwordHash","expiresAt","resendAvailableAt")
+    VALUES ('verify@example.com','REGISTER',$1,'argon-hash',now()+interval '10 minutes',now()+interval '60 seconds')`, [hex('a')]);
+  await rejects(`UPDATE "EmailChallenge" SET "attempts" = 6 WHERE "id" = $1`, [challenge], 'EmailChallenge_attempts_check');
+  await rejects(`UPDATE "EmailChallenge" SET "attempts" = -1 WHERE "id" = $1`, [challenge], 'EmailChallenge_attempts_check');
+  await rejects(`UPDATE "EmailChallenge" SET "codeHash" = '123456' WHERE "id" = $1`, [challenge], 'EmailChallenge_hash_check');
+  await rejects(`UPDATE "EmailChallenge" SET "email" = 'Verify@Example.com' WHERE "id" = $1`, [challenge], 'EmailChallenge_email_check');
+  await db.query(`UPDATE "EmailChallenge" SET "attempts" = 5 WHERE "id" = $1`, [challenge]);
+});
+
+test('challenge purpose and lifetime stay consistent, and consumed registration data can be scrubbed', async () => {
+  const challenge = await id(`INSERT INTO "EmailChallenge" ("email","purpose","codeHash","passwordHash","expiresAt","resendAvailableAt")
+    VALUES ('verify@example.com','REGISTER',$1,'argon-hash',now()+interval '10 minutes',now()+interval '60 seconds')`, [hex('b')]);
+  await rejects(`UPDATE "EmailChallenge" SET "passwordHash" = NULL WHERE "id" = $1`, [challenge], 'EmailChallenge_purpose_check');
+  await rejects(`UPDATE "EmailChallenge" SET "purpose" = 'RESET_PASSWORD' WHERE "id" = $1`, [challenge], 'EmailChallenge_purpose_check');
+  await rejects(`UPDATE "EmailChallenge" SET "expiresAt" = "createdAt" WHERE "id" = $1`, [challenge], 'EmailChallenge_times_check');
+  await db.query(`UPDATE "EmailChallenge" SET "consumedAt" = now(), "passwordHash" = NULL WHERE "id" = $1`, [challenge]);
+});
+
+test('password reset challenges cannot reference missing users and are removed with their account', async () => {
+  const a = await seedUser('a');
+  const insert = `INSERT INTO "EmailChallenge" ("email","purpose","userId","codeHash","expiresAt","resendAvailableAt")
+    VALUES ('a@example.com','RESET_PASSWORD',$1,$2,now()+interval '10 minutes',now()+interval '60 seconds')`;
+  await rejects(insert, ['00000000-0000-0000-0000-000000000001', hex('c')], 'EmailChallenge_userId_fkey');
+  const challenge = await id(insert, [a.user, hex('c')]);
+  await db.query(`DELETE FROM "User" WHERE "id" = $1`, [a.user]);
+  assert.equal((await one(`SELECT count(*)::int AS n FROM "EmailChallenge" WHERE "id" = $1`, [challenge])).n, 0);
 });
 
 // ───────────────────────────── Delete semantics ─────────────────────────────
