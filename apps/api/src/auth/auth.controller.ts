@@ -1,16 +1,16 @@
 import {
-  Body, Controller, Get, HttpCode, Inject, Post, Req, Res, UseGuards,
+  Body, Controller, Get, HttpCode, Inject, Param, ParseUUIDPipe, Post, Req, Res, UseGuards,
 } from '@nestjs/common';
 import {
   ApiAcceptedResponse, ApiBearerAuth, ApiBody, ApiConflictResponse, ApiCookieAuth,
-  ApiNoContentResponse, ApiOkResponse, ApiOperation, ApiTags, ApiUnauthorizedResponse,
+  ApiNoContentResponse, ApiNotFoundResponse, ApiOkResponse, ApiOperation, ApiParam, ApiTags, ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
 import { CookieOptions, Response } from 'express';
 import { API_CONFIG, ApiConfig } from '../config';
 import { ChallengeIdDto, EmptyAuthDto, ForgotPasswordDto, LoginDto, RegisterDto, ResetPasswordDto, VerifyEmailDto } from './auth.dto';
 import { AccessTokenGuard, AuthOriginGuard, AuthRateLimitGuard, bearerToken } from './auth.guards';
 import { AuthService } from './auth.service';
-import { AuthRequest, AuthResponse, ChallengeResponse, IssuedAuth, PublicUser, REFRESH_COOKIE } from './auth.types';
+import { AuthRequest, AuthResponse, ChallengeResponse, IssuedAuth, PublicSession, PublicUser, REFRESH_COOKIE } from './auth.types';
 
 const userSchema = {
   type: 'object',
@@ -36,6 +36,15 @@ const challengeSchema = {
     message: { type: 'string' },
   },
   required: ['challengeId', 'email', 'expiresIn', 'resendAfter', 'message'],
+};
+const sessionSchema = {
+  type: 'object',
+  properties: {
+    id: { type: 'string', format: 'uuid' }, createdAt: { type: 'string', format: 'date-time' },
+    expiresAt: { type: 'string', format: 'date-time' }, userAgent: { type: 'string', nullable: true },
+    isCurrent: { type: 'boolean' },
+  },
+  required: ['id', 'createdAt', 'expiresAt', 'userAgent', 'isCurrent'],
 };
 
 @ApiTags('Authentication')
@@ -71,8 +80,12 @@ export class AuthController {
   @HttpCode(200)
   @ApiOperation({ summary: 'Xác minh OTP, tạo tài khoản và đăng nhập. Mỗi mã có tối đa 5 lần thử.' })
   @ApiOkResponse({ schema: authSchema })
-  async verifyEmail(@Body() body: VerifyEmailDto, @Res({ passthrough: true }) response: Response): Promise<AuthResponse> {
-    return this.issue(await this.auth.verifyEmail(body), response);
+  async verifyEmail(
+    @Body() body: VerifyEmailDto,
+    @Res({ passthrough: true }) response: Response,
+    @Req() request?: AuthRequest,
+  ): Promise<AuthResponse> {
+    return this.issue(await this.auth.verifyEmail(body, request?.get('user-agent')), response);
   }
 
   @Post('resend-code')
@@ -104,8 +117,12 @@ export class AuthController {
   @ApiOperation({ summary: 'Đăng nhập bằng email và mật khẩu.' })
   @ApiOkResponse({ schema: authSchema })
   @ApiUnauthorizedResponse({ description: 'Email hoặc mật khẩu không đúng.' })
-  async login(@Body() body: LoginDto, @Res({ passthrough: true }) response: Response): Promise<AuthResponse> {
-    return this.issue(await this.auth.login(body), response);
+  async login(
+    @Body() body: LoginDto,
+    @Res({ passthrough: true }) response: Response,
+    @Req() request: AuthRequest,
+  ): Promise<AuthResponse> {
+    return this.issue(await this.auth.login(body, request.get('user-agent')), response);
   }
 
   @Post('refresh')
@@ -130,6 +147,31 @@ export class AuthController {
   @ApiOkResponse({ schema: userSchema })
   me(@Req() request: AuthRequest): PublicUser {
     return request.auth!.user;
+  }
+
+  @Get('sessions')
+  @UseGuards(AccessTokenGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Liệt kê các phiên đang hoạt động của tài khoản.' })
+  @ApiOkResponse({ schema: { type: 'array', items: sessionSchema } })
+  @ApiUnauthorizedResponse()
+  sessions(@Req() request: AuthRequest): Promise<PublicSession[]> {
+    const { user, sessionId } = request.auth!;
+    return this.auth.listSessions(user.id, sessionId);
+  }
+
+  @Post('sessions/:id/revoke')
+  @HttpCode(204)
+  @UseGuards(AccessTokenGuard)
+  @ApiBearerAuth()
+  @ApiParam({ name: 'id', format: 'uuid' })
+  @ApiOperation({ summary: 'Thu hồi một phiên khác của cùng tài khoản.' })
+  @ApiNoContentResponse()
+  @ApiNotFoundResponse({ description: 'Không tìm thấy phiên khác đang hoạt động của tài khoản.' })
+  @ApiUnauthorizedResponse()
+  revokeSession(@Param('id', new ParseUUIDPipe()) id: string, @Req() request: AuthRequest): Promise<void> {
+    const { user, sessionId } = request.auth!;
+    return this.auth.revokeSession(user.id, sessionId, id);
   }
 
   @Post('logout')

@@ -6,6 +6,7 @@ import type { User } from './lib/api';
 import { clearChallenge, pendingChallenge, readChallenge, saveChallenge } from './lib/challenge';
 import type { PendingChallenge } from './lib/challenge';
 import { Brand, DocumentArt, Icon } from './components/Brand';
+import { SessionPanel } from './components/SessionPanel';
 
 function useSession() { return useSyncExternalStore(authClient.subscribe, authClient.getSnapshot); }
 
@@ -291,6 +292,7 @@ function AccountHome({ user }: { user: User }) {
     <main className="account-main"><section className="welcome-card"><div><span className="eyebrow"><span /> CHÀO MỪNG VỀ NHÀ</span><h1>Chào {name}<span>.</span></h1><p>Mọi khởi đầu gọn gàng đều từ một không gian riêng.<br />Tài khoản DocFlow của bạn đã sẵn sàng.</p><span className="welcome-status"><span><Icon name="check" size={13} /></span> Bạn đã đăng nhập thành công</span></div><DocumentArt compact /></section>
       {error && <div className="form-alert account-alert" role="alert"><span aria-hidden="true">!</span><p>{error}</p></div>}
       <section className="profile-card" aria-labelledby="profile-title"><div className="profile-heading"><div><span className="auth-kicker">THÔNG TIN TÀI KHOẢN</span><h2 id="profile-title">Một chút về bạn</h2></div><span className="profile-icon"><Icon name="user" size={24} /></span></div><dl><div><dt>Tên hiển thị</dt><dd>{profile.displayName || 'Chưa đặt tên'}</dd></div><div><dt>Địa chỉ email</dt><dd>{profile.email}</dd></div><div><dt>Múi giờ</dt><dd>{profile.timezone}</dd></div><div><dt>Mức lưu trữ</dt><dd>{privacyLabels[profile.privacyLevel]}</dd></div></dl><div className="profile-bottom"><p><Icon name="shield" size={18} /><span>Thông tin được lấy từ tài khoản của bạn.</span></p><button type="button" className="button-secondary" onClick={refreshProfile} disabled={checking}>{checking ? 'Đang cập nhật…' : 'Làm mới thông tin'}{checked ? <Icon name="check" size={16} /> : <Icon name="arrow" size={16} />}</button></div><span className="sr-only" role="status">{checked ? 'Đã cập nhật thông tin tài khoản.' : ''}</span></section>
+      <SessionPanel key={user.id} />
       <div className="account-signout"><span>Đã xong việc hôm nay?</span><button type="button" onClick={logout} disabled={loggingOut}>{loggingOut ? 'Đang đăng xuất…' : 'Đăng xuất an toàn'}<Icon name="logout" size={16} /></button></div>
     </main><footer className="account-footer"><span>© 2026 DocFlow</span><span>Tài liệu gọn. Cuộc sống nhẹ.</span></footer></div>;
 }

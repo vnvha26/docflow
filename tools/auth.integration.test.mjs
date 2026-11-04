@@ -217,11 +217,12 @@ async function restartApi() {
 }
 
 async function request(path, { method = 'GET', body, token, cookie,
-  requestOrigin = origin, rawBody, contentType = 'application/json' } = {}) {
+  requestOrigin = origin, rawBody, contentType = 'application/json', userAgent } = {}) {
   const headers = {};
   if (requestOrigin !== null) headers.origin = requestOrigin;
   if (token) headers.authorization = `Bearer ${token}`;
   if (cookie) headers.cookie = cookiePair(cookie);
+  if (userAgent) headers['user-agent'] = userAgent;
   if (body !== undefined || rawBody !== undefined) headers['content-type'] = contentType;
   const response = await fetch(`${baseUrl}${path}`, {
     method,
@@ -240,9 +241,9 @@ async function request(path, { method = 'GET', body, token, cookie,
     cookie: cookieFrom(response) };
 }
 
-async function login() {
+async function login(userAgent) {
   const result = await request('/api/auth/login', {
-    method: 'POST', body: { email, password },
+    method: 'POST', body: { email, password }, userAgent,
   });
   assertAuthResult(result);
   return result;
@@ -504,6 +505,52 @@ describe('auth over HTTP with PostgreSQL and local SMTP delivery', {
       data: { createdAt: new Date(Date.now() - 120_000), expiresAt: new Date(Date.now() - 60_000) } });
     assert.equal((await request('/api/auth/me', { token: session.body.accessToken })).status, 401);
     assert.equal((await request('/api/auth/refresh', { method: 'POST', cookie: session.cookie })).status, 401);
+  });
+
+  test('users can see and revoke their own active sessions without affecting other users or their current session', async () => {
+    const current = await login('Browser A');
+    const target = await login('Browser B');
+    const owner = await db.user.findUniqueOrThrow({ where: { email } });
+    const otherEmail = `${prefix}sessions-other@example.test`;
+    await db.user.create({
+      data: { email: otherEmail, passwordHash: owner.passwordHash, emailVerifiedAt: new Date() },
+    });
+    const other = await request('/api/auth/login', { method: 'POST', body: { email: otherEmail, password } });
+    assertAuthResult(other, 200, otherEmail);
+    const ids = await db.session.findMany({
+      where: { refreshTokenHash: { in: [current, target, other].map((result) => sha256(rawRefresh(result.cookie))) } },
+    });
+    const sessionId = (result) => ids.find((row) => row.refreshTokenHash === sha256(rawRefresh(result.cookie))).id;
+    const listPath = '/api/auth/sessions';
+    const token = current.body.accessToken;
+    const revoke = (id, options) => request(`${listPath}/${id}/revoke`, { method: 'POST', token, ...options });
+
+    assert.equal((await request(listPath)).status, 401);
+    const list = await request(listPath, { token });
+    assert.equal(list.status, 200);
+    assert.deepEqual(list.body[0], {
+      id: sessionId(current), userAgent: 'Browser A', isCurrent: true,
+      createdAt: ids.find((row) => row.id === sessionId(current)).createdAt.toISOString(),
+      expiresAt: ids.find((row) => row.id === sessionId(current)).expiresAt.toISOString(),
+    });
+    assert.equal(list.body.find((session) => session.id === sessionId(target)).isCurrent, false);
+    assert.equal(list.body.find((session) => session.id === sessionId(target)).userAgent, 'Browser B');
+    assert.ok(list.body.every((session) => session.id !== sessionId(other) && Date.parse(session.expiresAt) > Date.now()));
+    assertPrivateResponse(list.body);
+
+    assert.equal((await revoke('invalid')).status, 400);
+    assert.equal((await revoke(sessionId(current).toUpperCase())).status, 404);
+    assert.equal((await revoke(sessionId(other))).status, 404);
+    assert.equal((await revoke(sessionId(target), { requestOrigin: 'https://example.test' })).status, 403);
+    assert.equal((await request('/api/auth/me', { token: target.body.accessToken })).status, 200);
+
+    assert.equal((await revoke(sessionId(target))).status, 204);
+    assert.equal((await request('/api/auth/me', { token: target.body.accessToken })).status, 401);
+    assert.equal((await request('/api/auth/refresh', { method: 'POST', cookie: target.cookie })).status, 401);
+    const updated = await request(listPath, { token });
+    assert.equal(updated.status, 200);
+    assert.ok(updated.body.every((session) => session.id !== sessionId(target)));
+    assert.equal((await request('/api/auth/me', { token: other.body.accessToken })).status, 200);
   });
 
   test('cross-origin mutations are rejected without consuming or revoking a valid session', async () => {

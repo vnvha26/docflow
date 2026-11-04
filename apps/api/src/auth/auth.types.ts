@@ -32,6 +32,14 @@ export interface AuthResponse {
   user: PublicUser;
 }
 
+export interface PublicSession {
+  id: string;
+  createdAt: Date;
+  expiresAt: Date;
+  userAgent: string | null;
+  isCurrent: boolean;
+}
+
 export interface IssuedAuth {
   body: AuthResponse;
   refreshToken: string;

@@ -1,0 +1,58 @@
+.session-note {
+  margin: 14px 0 18px;
+  color: #67745d;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.session-list ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.session-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 20px;
+  flex-wrap: wrap;
+  padding: 15px 0;
+  border-top: 1px solid #edf0e6;
+}
+
+.session-label {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 14px;
+  color: #365441;
+}
+
+.session-current {
+  padding: 3px 8px;
+  border-radius: 12px;
+  background: #edf4e6;
+  color: #46643b;
+  font-size: 11px;
+}
+
+.session-info p {
+  margin: 5px 0 0;
+  font-size: 12px;
+  color: #67745d;
+}
+
+.session-card .button-secondary,
+.session-card .profile-bottom > p {
+  font-size: 12px;
+}
+
+.session-card .profile-bottom > p {
+  color: #46643b;
+}
+
+.session-card .profile-bottom > button {
+  margin-left: auto;
+}

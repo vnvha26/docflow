@@ -1,4 +1,4 @@
-import { Inject, Injectable, UnauthorizedException } from '@nestjs/common';
+import { Inject, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { Prisma } from '@prisma/client';
 import { createHash, randomBytes } from 'node:crypto';
@@ -8,7 +8,7 @@ import { LoginDto, normalizeEmail, RegisterDto, ResetPasswordDto, VerifyEmailDto
 import { EmailChallengeService, lockAuthEmail } from './email-challenge.service';
 import { PasswordService } from './password.service';
 import {
-  ACCESS_TTL_SECONDS, AccessClaims, AuthResponse, ChallengeResponse, IssuedAuth, PUBLIC_USER_SELECT, PublicUser,
+  ACCESS_TTL_SECONDS, AccessClaims, AuthResponse, ChallengeResponse, IssuedAuth, PUBLIC_USER_SELECT, PublicSession, PublicUser,
   REFRESH_TTL_MS, TOKEN_AUDIENCE, TOKEN_ISSUER,
 } from './auth.types';
 
@@ -37,8 +37,8 @@ export class AuthService {
     return this.challenges.register(input);
   }
 
-  verifyEmail(input: VerifyEmailDto): Promise<IssuedAuth> {
-    return this.challenges.verifyRegistration(input, (user, transaction) => this.createSession(user, transaction));
+  verifyEmail(input: VerifyEmailDto, userAgent?: string): Promise<IssuedAuth> {
+    return this.challenges.verifyRegistration(input, (user, transaction) => this.createSession(user, transaction, userAgent));
   }
 
   resendCode(id: string): Promise<ChallengeResponse> {
@@ -53,7 +53,7 @@ export class AuthService {
     return this.challenges.resetPassword(input);
   }
 
-  async login(input: LoginDto): Promise<IssuedAuth> {
+  async login(input: LoginDto, userAgent?: string): Promise<IssuedAuth> {
     const user = await this.prisma.user.findUnique({
       where: { email: normalizeEmail(input.email) },
       select: { ...PUBLIC_USER_SELECT, passwordHash: true, emailVerifiedAt: true },
@@ -73,15 +73,18 @@ export class AuthService {
         throw new UnauthorizedException(INVALID_LOGIN);
       }
       const { passwordHash: _passwordHash, emailVerifiedAt: _verifiedAt, ...publicUser } = current;
-      return this.createSession(publicUser, transaction);
+      return this.createSession(publicUser, transaction, userAgent);
     });
   }
 
-  private async createSession(user: PublicUser, db: Pick<Prisma.TransactionClient, 'session'> = this.prisma): Promise<IssuedAuth> {
+  private async createSession(user: PublicUser, db: Pick<Prisma.TransactionClient, 'session'>, userAgent?: string): Promise<IssuedAuth> {
     const refreshToken = randomBytes(32).toString('hex');
     const refreshExpiresAt = new Date(Date.now() + REFRESH_TTL_MS);
     const session = await db.session.create({
-      data: { userId: user.id, refreshTokenHash: hashRefreshToken(refreshToken), expiresAt: refreshExpiresAt },
+      data: {
+        userId: user.id, refreshTokenHash: hashRefreshToken(refreshToken), expiresAt: refreshExpiresAt,
+        userAgent: userAgent?.trim().slice(0, 255) || null,
+      },
       select: { id: true },
     });
     return {
@@ -152,6 +155,25 @@ export class AuthService {
     if (!session || !session.user.emailVerifiedAt) throw new UnauthorizedException(INVALID_SESSION);
     const { emailVerifiedAt: _verifiedAt, ...publicUser } = session.user;
     return { user: publicUser, sessionId: session.id };
+  }
+
+  async listSessions(userId: string, currentSessionId: string): Promise<PublicSession[]> {
+    const sessions = await this.prisma.session.findMany({
+      where: { userId, revokedAt: null, expiresAt: { gt: new Date() } },
+      select: { id: true, createdAt: true, expiresAt: true, userAgent: true },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    });
+    const result = sessions.map((session) => ({ ...session, isCurrent: session.id === currentSessionId }));
+    return result.sort((first, second) => Number(second.isCurrent) - Number(first.isCurrent));
+  }
+
+  async revokeSession(userId: string, currentSessionId: string, sessionId: string): Promise<void> {
+    const now = new Date();
+    const changed = await this.prisma.session.updateMany({
+      where: { id: { equals: sessionId, not: currentSessionId }, userId, revokedAt: null, expiresAt: { gt: now } },
+      data: { revokedAt: now },
+    });
+    if (changed.count === 0) throw new NotFoundException('Không tìm thấy phiên đăng nhập khác đang hoạt động.');
   }
 
   async logout(refreshToken: unknown, accessToken?: string): Promise<void> {
