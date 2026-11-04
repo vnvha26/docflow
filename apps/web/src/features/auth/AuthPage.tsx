@@ -87,7 +87,7 @@ export function AuthPage({ mode }: { mode: 'login' | 'register' }) {
       {!register && <div className="forgot-link"><Link to="/forgot-password">Quên mật khẩu?</Link></div>}
       <button className="button-primary" type="submit" disabled={submitting}>{submitting ? <><span className="spinner spinner-small" />{register ? 'Đang tạo tài khoản…' : 'Đang đăng nhập…'}</> : <>{register ? 'Tạo tài khoản' : 'Đăng nhập'}<Icon name="arrow" size={19} /></>}</button>
     </form>
-    {register && <p className="registration-note">Bạn sẽ nhận mã xác minh qua email để hoàn tất đăng ký.</p>}
+    {register && <p className="registration-note">Bạn sẽ nhận mã xác minh qua email để hoàn tất đăng ký. Mặc định DocFlow lưu cả bản gốc đã mã hóa để bạn tải lại từ máy khác; có thể đổi trong Cài đặt.</p>}
     <p className="auth-switch">{register ? 'Đã có tài khoản?' : 'Bạn mới đến DocFlow?'} <Link to={register ? '/login' : '/register'}>{register ? 'Đăng nhập' : 'Tạo tài khoản'}<span aria-hidden="true"> ↗</span></Link></p>
     <div className="security-note"><Icon name="shield" size={17} /><span>Đăng nhập an toàn. Không gian dành riêng cho bạn.</span></div>
   </div></AuthLayout>;

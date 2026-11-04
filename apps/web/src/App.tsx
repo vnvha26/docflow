@@ -2,6 +2,8 @@ import { useEffect } from 'react';
 import { Navigate, Route, Routes } from 'react-router-dom';
 import { Brand } from './components/Brand';
 import { AccountPage } from './features/account/AccountPage';
+import { DocumentsPage } from './features/documents/DocumentsPage';
+import { AppShell } from './components/AppShell';
 import { AuthPage } from './features/auth/AuthPage';
 import { ForgotPasswordPage } from './features/auth/ForgotPasswordPage';
 import { VerifyEmailPage } from './features/auth/VerifyEmailPage';
@@ -17,7 +19,8 @@ export function App() {
     <Route path="/register" element={session.user ? <Navigate to="/" replace /> : <AuthPage mode="register" key="register" />} />
     <Route path="/verify-email" element={session.user ? <Navigate to="/" replace /> : <VerifyEmailPage />} />
     <Route path="/forgot-password" element={session.user ? <Navigate to="/" replace /> : <ForgotPasswordPage />} />
-    <Route path="/" element={session.user ? <AccountPage user={session.user} /> : <Navigate to="/login" replace />} />
+    <Route path="/" element={session.user ? <AppShell user={session.user}><DocumentsPage key={session.user.id} user={session.user} /></AppShell> : <Navigate to="/login" replace />} />
+    <Route path="/account" element={session.user ? <AccountPage user={session.user} /> : <Navigate to="/login" replace />} />
     <Route path="*" element={<Navigate to={session.user ? '/' : '/login'} replace />} />
   </Routes>;
 }

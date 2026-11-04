@@ -11,6 +11,7 @@ import { normalizeEmail, RegisterDto, ResetPasswordDto, VerifyEmailDto } from '.
 import { ChallengeResponse, IssuedAuth, PUBLIC_USER_SELECT, PublicUser } from './auth.types';
 import { MailService } from './mail.service';
 import { PasswordService } from './password.service';
+import { DEFAULT_PRIVACY_LEVEL } from '../documents/privacy';
 
 const OTP_TTL_MS = 10 * 60_000;
 const RESEND_DELAY_MS = 60_000;
@@ -193,7 +194,7 @@ export class EmailChallengeService {
       const user = await transaction.user.create({
         data: {
           email: challenge.email, passwordHash: challenge.passwordHash, displayName: challenge.displayName,
-          emailVerifiedAt: new Date(),
+          emailVerifiedAt: new Date(), privacyLevel: DEFAULT_PRIVACY_LEVEL,
         },
         select: PUBLIC_USER_SELECT,
       });

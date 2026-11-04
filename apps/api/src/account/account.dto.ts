@@ -1,6 +1,7 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
-import { IsOptional, IsString, MaxLength, ValidateBy, ValidateIf, ValidationOptions } from 'class-validator';
+import { PrivacyLevel } from '@prisma/client';
+import { IsEnum, IsOptional, IsString, MaxLength, ValidateBy, ValidateIf, ValidationOptions } from 'class-validator';
 import { isTimeZone } from './timezone';
 
 function IsTimeZone(options?: ValidationOptions): PropertyDecorator {
@@ -21,4 +22,12 @@ export class UpdateAccountDto {
   @ValidateIf((_object: object, value: unknown) => value !== undefined)
   @IsTimeZone({ message: 'Múi giờ không hợp lệ. Chọn một múi giờ trong danh sách.' })
   timezone?: string;
+
+  @ApiPropertyOptional({
+    enum: PrivacyLevel,
+    description: 'Mức lưu trữ (P1). Hạ mức sẽ xóa dữ liệu mức mới không cho giữ (P6): bản gốc khi rời mức 3, nội dung chữ khi về mức 1.',
+  })
+  @ValidateIf((_object: object, value: unknown) => value !== undefined)
+  @IsEnum(PrivacyLevel, { message: 'Mức lưu trữ không hợp lệ.' })
+  privacyLevel?: PrivacyLevel;
 }

@@ -186,7 +186,7 @@ async function startApi() {
   server = spawn(process.execPath, ['apps/api/dist/main.js'], {
     cwd: root,
     env: { ...process.env, NODE_ENV: 'test', DATABASE_URL: databaseUrl,
-      PORT: String(port), JWT_SECRET: secret, WEB_ORIGIN: origin,
+      PORT: String(port), JWT_SECRET: secret, WEB_ORIGIN: origin, FILE_KEKS: `it:${Buffer.alloc(32, 9).toString('base64')}`,
       SMTP_HOST: '127.0.0.1', SMTP_PORT: smtpPort, SMTP_SECURE: 'false',
       SMTP_USER: '', SMTP_PASS: '', MAIL_FROM: `DocFlow Tests <${sender}>` },
     stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
@@ -315,6 +315,7 @@ describe('auth over HTTP with PostgreSQL and local SMTP delivery', {
     assertChallenge(pendingRegistration, 202, email);
     assertAuthResult(registration);
     assert.equal(registration.body.user.displayName, 'Integration Owner');
+    assert.equal(registration.body.user.privacyLevel, 'ENCRYPTED_COPY', 'new accounts start at level 3');
     assert.equal(await db.user.count({ where: { email } }), 1);
     const user = await db.user.findUniqueOrThrow({ where: { email } });
     assert.ok(user.emailVerifiedAt);
@@ -855,7 +856,7 @@ describe('auth over HTTP with PostgreSQL and local SMTP delivery', {
         ['UTC offset', { timezone: '+07:00' }, 'timezone'],
         ['unknown zone', { timezone: 'Mars/Olympus_Mons' }, 'timezone'],
         ['null zone', { timezone: null }, 'timezone'],
-        ['privacy level is not editable here', { privacyLevel: 'ENCRYPTED_COPY' }, 'privacyLevel'],
+        ['unknown privacy level', { privacyLevel: 'EVERYTHING' }, 'privacyLevel'],
         ['email is not editable', { email: 'someone@example.test' }, 'email'],
       ];
       for (const [label, body, field] of cases) {

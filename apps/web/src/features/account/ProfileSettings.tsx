@@ -6,12 +6,6 @@ import { ApiError, authClient, StaleSessionError } from '../../lib/api';
 import type { User } from '../../lib/api';
 import { canonicalZone, deviceZone, timeZoneOptions } from './timezones';
 
-const privacyLabels: Record<User['privacyLevel'], string> = {
-  STRUCTURED_ONLY: 'Chỉ thông tin có cấu trúc',
-  TEXT_AND_EMBEDDINGS: 'Nội dung & tìm kiếm',
-  ENCRYPTED_COPY: 'Bản gốc được mã hóa',
-};
-
 type ProfileErrors = Partial<Record<'displayName' | 'timezone', string>>;
 
 export function ProfileSettings({ user }: { user: User }) {
@@ -66,9 +60,9 @@ export function ProfileSettings({ user }: { user: User }) {
           {errors.timezone && <p className="field-error" id="settings-timezone-error">{errors.timezone}</p>}
         </div>
       </div>
-      <dl className="settings-readonly"><div><dt>Địa chỉ email</dt><dd>{user.email}</dd></div><div><dt>Mức lưu trữ</dt><dd>{privacyLabels[user.privacyLevel]}</dd></div></dl>
+      <dl className="settings-readonly"><div><dt>Địa chỉ email</dt><dd>{user.email}</dd></div></dl>
       <div className="profile-bottom">
-        <p role="status">{message ? <><Icon name="check" size={16} /><span>{message}</span></> : <span>Email chưa thể thay đổi. Mức lưu trữ sẽ chỉnh được khi có chức năng tài liệu.</span>}</p>
+        <p role="status">{message ? <><Icon name="check" size={16} /><span>{message}</span></> : <span>Email chưa thể thay đổi.</span>}</p>
         <button type="submit" className="button-primary button-compact" disabled={saving || !dirty}>{saving ? 'Đang lưu…' : 'Lưu thay đổi'}</button>
       </div>
     </form>

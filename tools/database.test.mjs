@@ -17,7 +17,7 @@ before(async () => {
   db = new PGlite();
   const dirs = (await readdir(MIGRATIONS, { withFileTypes: true }))
     .filter((d) => d.isDirectory()).map((d) => d.name).sort();
-  assert.equal(dirs.length, 4);
+  assert.equal(dirs.length, 7);
   for (const dir of dirs) await db.exec(await readFile(new URL(`${dir}/migration.sql`, MIGRATIONS), 'utf8'));
   await db.exec(`INSERT INTO "DocumentType" ("code","name","pathTemplate","fieldSchema")
                  VALUES ('RENTAL_CONTRACT','Hợp đồng thuê nhà','Hợp đồng/Thuê nhà/{year}','{"type":"object"}')`);
@@ -78,6 +78,11 @@ async function seedUser(tag) {
 test('migrations create the 19 CP1 tables including email challenges', async () => {
   const { count } = await one(`SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'public'`);
   assert.equal(count, 19);
+});
+
+test('accounts default to level 3 (ENCRYPTED_COPY)', async () => {
+  const row = await one(`INSERT INTO "User" ("email","passwordHash") VALUES ('default@example.com','x') RETURNING "privacyLevel"`);
+  assert.equal(row.privacyLevel, 'ENCRYPTED_COPY');
 });
 
 test('privacy enum is ordered so LEAST() gives the effective level', async () => {
@@ -254,3 +259,79 @@ test('job idempotency key is unique', async () => {
   const a = await seedUser('a');
   await rejects(`INSERT INTO "AIJob" ("userId","kind","idempotencyKey") VALUES ($1,'EMBED','extract:a')`, [a.user], 'AIJob_idempotencyKey_key');
 });
+
+const versionSql = `INSERT INTO "DocumentVersion" ("userId","documentId","number","sha256","byteSize","mimeType","originalFilename","source") VALUES ($1,$2,$3,$4,$5,'application/pdf',$6,'WEB_UPLOAD')`;
+const copySql = `INSERT INTO "FileCopy" ("userId","documentId","versionId","kind","state","storageKey","contentType","byteSize","sha256","encryptionKeyRef","expiresAt","deleteRequestedAt","deletedAt")
+                 VALUES ($1,$2,$3,$4,$5,$6,'application/octet-stream',$7,$8,$9,$10,$11,$12)`;
+
+test('documents need a title; versions need a safe file name and a hex SHA-256', async () => {
+  const a = await seedUser('a');
+  await rejects(`INSERT INTO "Document" ("userId","title","source") VALUES ($1,'  ','WEB_UPLOAD')`, [a.user], 'Document_title_check');
+  for (const [name, sha, size, constraint] of [
+    ['../evil.pdf', hex('b'), 1, 'DocumentVersion_filename_check'],
+    ['dir\\evil.pdf', hex('b'), 1, 'DocumentVersion_filename_check'],
+    ['trailing.', hex('b'), 1, 'DocumentVersion_filename_check'],
+    ['ok.pdf', 'A'.repeat(64), 1, 'DocumentVersion_sha256_check'],
+    ['ok.pdf', hex('b'), -1, 'DocumentVersion_byteSize_check'],
+  ]) await rejects(versionSql, [a.user, a.doc, 9, sha, size, name], constraint);
+  await rejects(versionSql, [a.user, a.doc, 0, hex('b'), 1, 'ok.pdf'], 'DocumentVersion_number_check');
+  await db.query(versionSql, [a.user, a.doc, 9, hex('b'), 1, 'Hợp đồng thuê nhà (bản ký).pdf']);
+});
+
+test('a document version is an immutable snapshot', async () => {
+  const a = await seedUser('a');
+  for (const change of [`"sha256" = '${hex('f')}'`, `"byteSize" = 1`, `"number" = 7`]) {
+    await rejects(`UPDATE "DocumentVersion" SET ${change} WHERE "id" = $1`, [a.version], /immutable/);
+  }
+  await db.query(`UPDATE "DocumentVersion" SET "parseState" = 'PROCESSING' WHERE "id" = $1`, [a.version]);
+  await rejects(`UPDATE "DocumentVersion" SET "parseState" = 'UNSUPPORTED' WHERE "id" = $1`, [a.version], 'DocumentVersion_parse_error_check');
+});
+
+test('file copies: relative keys only, encrypted copies carry a wrapped key and never expire', async () => {
+  const a = await seedUser('a');
+  const base = (overrides) => {
+    const row = { kind: 'ENCRYPTED_COPY', state: 'UPLOADING', key: 'encrypted/a/1', size: 10, sha: null, ref: 'v1.k.x', expires: null, req: null, del: null, ...overrides };
+    return [a.user, a.doc, a.version, row.kind, row.state, row.key, row.size, row.sha, row.ref, row.expires, row.req, row.del];
+  };
+  for (const key of ['/abs/path', 's3://bucket/x', 'https://x/y', 'a/../b', 'a//b', 'C:/x']) {
+    await rejects(copySql, base({ key }), 'FileCopy_storageKey_check');
+  }
+  await rejects(copySql, base({ ref: null }), 'FileCopy_encryption_check');
+  await rejects(copySql, base({ expires: new Date() }), 'FileCopy_retention_check');
+  await rejects(copySql, base({ state: 'AVAILABLE' }), 'FileCopy_content_check');
+  await rejects(copySql, base({ state: 'DELETED', req: new Date() }), 'FileCopy_deletion_check');
+  await rejects(copySql, base({ state: 'DELETE_PENDING' }), 'FileCopy_deletion_check');
+  await db.query(copySql, base({ state: 'AVAILABLE', sha: hex('c') }));
+  await db.query(copySql, base({ kind: 'WEB_SOURCE', key: 'web-source/a/1', ref: null, expires: new Date() }));
+});
+
+test('only one live copy per version and kind; deleted copies keep their history', async () => {
+  const a = await seedUser('a');
+  const row = (key, state, extra = []) => [a.user, a.doc, a.version, 'ENCRYPTED_COPY', state, key, 10, hex('c'), 'v1.k.x', null, ...extra];
+  await db.query(copySql, row('encrypted/a/1', 'AVAILABLE', [null, null]));
+  await rejects(copySql, row('encrypted/a/2', 'UPLOADING', [null, null]), 'FileCopy_one_live_per_version_kind_key');
+  await db.query(`UPDATE "FileCopy" SET "state" = 'DELETED', "deleteRequestedAt" = now(), "deletedAt" = now() WHERE "storageKey" = 'encrypted/a/1'`);
+  await db.query(copySql, row('encrypted/a/2', 'UPLOADING', [null, null]));
+});
+
+test('jobs: running needs a lease, terminal states need finishedAt, attempts stay within bounds', async () => {
+  const a = await seedUser('a');
+  const job = (key, columns, values) => db.query(`INSERT INTO "AIJob" ("userId","kind","idempotencyKey"${columns}) VALUES ($1,'PURGE',$2${values})`, [a.user, key]);
+  await rejects(`INSERT INTO "AIJob" ("userId","kind","versionId","idempotencyKey") VALUES ($1,'PARSE',$2,'v-only')`, [a.user, a.version], 'AIJob_target_check');
+  await rejects(`INSERT INTO "AIJob" ("userId","kind","status","idempotencyKey") VALUES ($1,'PURGE','RUNNING','r')`, [a.user], 'AIJob_lease_check');
+  await rejects(`INSERT INTO "AIJob" ("userId","kind","status","idempotencyKey") VALUES ($1,'PURGE','SUCCEEDED','s')`, [a.user], 'AIJob_finished_check');
+  await rejects(`INSERT INTO "AIJob" ("userId","kind","finishedAt","idempotencyKey") VALUES ($1,'PURGE',now(),'f')`, [a.user], 'AIJob_finished_check');
+  await rejects(`INSERT INTO "AIJob" ("userId","kind","attempts","maxAttempts","idempotencyKey") VALUES ($1,'PURGE',6,5,'n')`, [a.user], 'AIJob_attempts_check');
+  await rejects(`INSERT INTO "AIJob" ("userId","kind","payload","idempotencyKey") VALUES ($1,'PURGE','[]','p')`, [a.user], 'AIJob_payload_check');
+  await job('ok-running', ',"status","leaseOwner","leaseUntil","attempts"', `,'RUNNING','w1',now() + interval '1 minute',1`);
+  await job('ok-done', ',"status","finishedAt"', `,'CANCELLED',now()`);
+});
+
+test('at most one waiting purge per user; finished purges do not block a new one', async () => {
+  const a = await seedUser('a');
+  await db.query(`INSERT INTO "AIJob" ("userId","kind","idempotencyKey") VALUES ($1,'PURGE','p1')`, [a.user]);
+  await rejects(`INSERT INTO "AIJob" ("userId","kind","idempotencyKey") VALUES ($1,'PURGE','p2')`, [a.user], 'AIJob_one_waiting_purge_per_user_key');
+  await db.query(`UPDATE "AIJob" SET "status" = 'SUCCEEDED', "finishedAt" = now() WHERE "idempotencyKey" = 'p1'`);
+  await db.query(`INSERT INTO "AIJob" ("userId","kind","idempotencyKey") VALUES ($1,'PURGE','p2')`, [a.user]);
+});
+

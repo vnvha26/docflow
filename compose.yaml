@@ -27,6 +27,21 @@ services:
     volumes:
       - mailpitdata:/data
 
+  # MinIO stopped publishing community images in Oct 2025; Chainguard rebuilds it from source.
+  # The app only speaks S3, so another S3-compatible server can replace this service.
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: docflow
+      MINIO_ROOT_PASSWORD: docflow_local_only
+    ports:
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - miniodata:/data
+
 volumes:
   pgdata:
   mailpitdata:
+  miniodata:

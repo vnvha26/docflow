@@ -7,7 +7,9 @@ export function Brand({ inverse = false }: { inverse?: boolean }) {
   </Link>;
 }
 
-export function Icon({ name, size = 20 }: { name: 'arrow' | 'eye' | 'eye-off' | 'shield' | 'mail' | 'lock' | 'user' | 'logout' | 'check' | 'chevron'; size?: number }) {
+export type IconName = 'arrow' | 'eye' | 'eye-off' | 'shield' | 'mail' | 'lock' | 'user' | 'logout' | 'check' | 'chevron' | 'file' | 'upload' | 'download' | 'folder';
+
+export function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
   const paths = {
     arrow: <><path d="M5 12h14m-6-6 6 6-6 6" /></>,
     eye: <><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" /><circle cx="12" cy="12" r="3" /></>,
@@ -19,6 +21,10 @@ export function Icon({ name, size = 20 }: { name: 'arrow' | 'eye' | 'eye-off' | 
     logout: <><path d="M10 4H5v16h5m4-12 4 4-4 4m-5-4h12" /></>,
     check: <path d="m5 12 4 4L19 6" />,
     chevron: <path d="m7 10 5 5 5-5" />,
+    file: <><path d="M7 3h7l5 5v13H7z" /><path d="M14 3v5h5M10 13h6m-6 4h4" /></>,
+    upload: <><path d="M12 16V4m-5 5 5-5 5 5" /><path d="M5 15v4h14v-4" /></>,
+    download: <><path d="M12 4v12m-5-5 5 5 5-5" /><path d="M5 15v4h14v-4" /></>,
+    folder: <><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /></>,
   };
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
 }

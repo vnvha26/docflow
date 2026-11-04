@@ -38,6 +38,11 @@ export class ApiError extends Error {
   }
 }
 
+export interface RequestOptions {
+  exclusive?: boolean;
+  asUser?: string;
+}
+
 export class StaleSessionError extends Error {
   constructor() { super('Phiên đã thay đổi. Vui lòng thử lại.'); }
 }
@@ -94,7 +99,7 @@ export class AuthClient {
 
   async #raw(path: string, init: RequestInit = {}, token?: string | null): Promise<Response> {
     const headers = new Headers(init.headers);
-    if (init.body) headers.set('Content-Type', 'application/json');
+    if (typeof init.body === 'string') headers.set('Content-Type', 'application/json');
     if (token) headers.set('Authorization', `Bearer ${token}`);
     try {
       return await this.#fetch(`/api${path}`, { ...init, headers, credentials: 'include' });
@@ -221,13 +226,32 @@ export class AuthClient {
     return session.user;
   }
 
-  async request<T>(path: string, init: RequestInit = {}, options: { exclusive?: boolean } = {}): Promise<T> {
+  async request<T>(path: string, init: RequestInit = {}, options: RequestOptions = {}): Promise<T> {
+    const epoch = this.#epoch;
+    const result = await this.#decode<T>(await this.#authorized(path, init, options));
+    if (epoch !== this.#epoch) throw new StaleSessionError();
+    return result;
+  }
+
+  async download(path: string): Promise<{ blob: Blob; fileName: string | null }> {
+    const epoch = this.#epoch;
+    const response = await this.#authorized(path, {});
+    if (!response.ok) await this.#decode<never>(response);
+    let blob: Blob;
+    try { blob = await response.blob(); }
+    catch { throw new ApiError('Tệp tải về không đầy đủ hoặc đã bị hỏng. Vui lòng thử lại.'); }
+    if (epoch !== this.#epoch) throw new StaleSessionError();
+    return { blob, fileName: fileNameFrom(response.headers.get('Content-Disposition')) };
+  }
+
+  async #authorized(path: string, init: RequestInit, options: RequestOptions = {}): Promise<Response> {
     if (this.#loggingOut) throw new StaleSessionError();
+    if (options.asUser !== undefined && this.#snapshot.user?.id !== options.asUser) throw new StaleSessionError();
     // Only the network call is locked; refresh() below takes the lock itself.
     const send = (bearer: string | null) => options.exclusive ? this.#exclusiveRaw(path, init, bearer) : this.#raw(path, init, bearer);
     const epoch = this.#epoch;
     const token = this.#token;
-    const owner = this.#snapshot.user?.id ?? null;
+    const owner = options.asUser ?? this.#snapshot.user?.id ?? null;
     let response = await send(token);
     if (epoch !== this.#epoch) throw new StaleSessionError();
     if (response.status === 401) {
@@ -243,13 +267,11 @@ export class AuthClient {
         this.#publish(null, true);
       }
     }
-    const result = await this.#decode<T>(response);
-    if (epoch !== this.#epoch) throw new StaleSessionError();
-    return result;
+    return response;
   }
 
   /** Keep the shared session snapshot in sync after the user edits their account. */
-  async updateAccount(input: { displayName?: string; timezone?: string }): Promise<User> {
+  async updateAccount(input: { displayName?: string; timezone?: string; privacyLevel?: User['privacyLevel'] }): Promise<User> {
     const user = await this.request<User>('/account', { method: 'PATCH', body: JSON.stringify(input) });
     this.#publish(user);
     return user;
@@ -304,6 +326,15 @@ export class AuthClient {
       this.#loggingOut = false;
     }
   }
+}
+
+export function fileNameFrom(header: string | null): string | null {
+  if (!header) return null;
+  const encoded = /filename\*=UTF-8''([^;]+)/i.exec(header)?.[1];
+  if (encoded) {
+    try { return decodeURIComponent(encoded.trim()); } catch {}
+  }
+  return /filename="([^"]*)"/i.exec(header)?.[1] ?? null;
 }
 
 export const authClient = new AuthClient();

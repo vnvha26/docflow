@@ -1,0 +1,13 @@
+.header-left { display: flex; align-items: center; gap: 34px; min-width: 0; }
+.app-nav { display: flex; gap: 4px; background: #f0f2ea; border: 1px solid #e6eadf; border-radius: 10px; padding: 4px; }
+.app-nav a { display: flex; align-items: center; gap: 7px; padding: 8px 14px; border-radius: 7px; font-size: 11px; color: #6f7f66; font-weight: 500; }
+.app-nav a:hover { color: #234a37; }
+.app-nav a.active { background: #fffefb; color: #234a37; box-shadow: 0 2px 4px #293a290a; font-weight: 600; }
+@media (max-width: 760px) {
+  .header-left { gap: 14px; }
+  .app-nav a { padding: 8px 10px; font-size: 11px; }
+  .app-nav a svg { display: none; }
+}
+@media (max-width: 420px) {
+  .account-header .brand > span:last-child { display: none; }
+}

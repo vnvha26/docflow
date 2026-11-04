@@ -4,8 +4,8 @@ import { spawn } from 'node:child_process';
 const npm = process.env.npm_execpath;
 if (!npm) throw new Error('Start DocFlow with npm run dev.');
 
-const children = ['apps/api', 'apps/web'].map((workspace) =>
-  spawn(process.execPath, [npm, 'run', 'dev', '--workspace', workspace], {
+const children = [['apps/api', 'dev'], ['apps/api', 'dev:worker'], ['apps/web', 'dev']].map(([workspace, script]) =>
+  spawn(process.execPath, [npm, 'run', script, '--workspace', workspace], {
     stdio: 'inherit',
     env: process.env,
     windowsHide: true,

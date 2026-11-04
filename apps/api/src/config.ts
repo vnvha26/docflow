@@ -11,6 +11,29 @@ export interface MailConfig {
   pass?: string;
 }
 
+export interface StorageConfig {
+  endpoint?: string;
+  region: string;
+  bucket: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  forcePathStyle: boolean;
+  createBucket: boolean;
+}
+
+export interface Kek { id: string; key: Buffer }
+
+export interface FilesConfig {
+  keks: Kek[];
+  webSourceTtlMs: number;
+  encryptedQuotaBytes: number;
+}
+
+export interface WorkerConfig {
+  pollMs: number;
+  maintenanceMs: number;
+}
+
 export interface ApiConfig {
   databaseUrl: string;
   jwtSecret: string;
@@ -18,6 +41,32 @@ export interface ApiConfig {
   port: number;
   production: boolean;
   mail?: MailConfig;
+  storage: StorageConfig;
+  files: FilesConfig;
+  worker: WorkerConfig;
+}
+
+const KEK_ID = /^[a-z0-9][a-z0-9-]{0,31}$/;
+
+export function parseKeks(value: string | undefined): Kek[] {
+  if (!value?.trim() || /replace-with/.test(value)) throw new Error('FILE_KEKS chưa được cấu hình; chạy npm run setup để tạo khóa mã hóa tệp cục bộ.');
+  const keks = value.split(',').map((entry) => entry.trim()).filter(Boolean).map((entry) => {
+    const separator = entry.indexOf(':');
+    const id = entry.slice(0, separator);
+    const key = Buffer.from(entry.slice(separator + 1), 'base64');
+    if (separator < 1 || !KEK_ID.test(id) || key.length !== 32 || key.toString('base64') !== entry.slice(separator + 1)) {
+      throw new Error('FILE_KEKS phải có dạng id:<32 byte base64>, ngăn cách bằng dấu phẩy.');
+    }
+    return { id, key };
+  });
+  if (new Set(keks.map((kek) => kek.id)).size !== keks.length) throw new Error('FILE_KEKS có id bị trùng.');
+  return keks;
+}
+
+function positiveNumber(value: string | undefined, fallback: number, name: string): number {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isFinite(parsed) || parsed <= 0) throw new Error(`${name} phải là số dương.`);
+  return parsed;
 }
 
 export function readConfig(env: NodeJS.ProcessEnv): ApiConfig {
@@ -46,6 +95,30 @@ export function readConfig(env: NodeJS.ProcessEnv): ApiConfig {
   if (Boolean(env.SMTP_USER) !== Boolean(env.SMTP_PASS)) throw new Error('SMTP_USER và SMTP_PASS phải được cấu hình cùng nhau.');
   const from = env.MAIL_FROM?.trim() || 'DocFlow <no-reply@docflow.local>';
   if (/[\r\n]/.test(from) || !from.includes('@')) throw new Error('MAIL_FROM không hợp lệ.');
+  const storage: StorageConfig = {
+    endpoint: env.S3_ENDPOINT?.trim() || (production ? undefined : 'http://127.0.0.1:9000'),
+    region: env.S3_REGION?.trim() || 'us-east-1',
+    bucket: env.S3_BUCKET?.trim() || 'docflow',
+    accessKeyId: env.S3_ACCESS_KEY?.trim() || (production ? '' : 'docflow'),
+    secretAccessKey: env.S3_SECRET_KEY?.trim() || (production ? '' : 'docflow_local_only'),
+    forcePathStyle: env.S3_FORCE_PATH_STYLE !== 'false',
+    createBucket: !production,
+  };
+  if (production && (!storage.accessKeyId || !storage.secretAccessKey || !env.S3_BUCKET?.trim())) {
+    throw new Error('Production cần cấu hình S3_BUCKET, S3_ACCESS_KEY và S3_SECRET_KEY.');
+  }
+  if (storage.endpoint) {
+    try { new URL(storage.endpoint); } catch { throw new Error('S3_ENDPOINT phải là URL hợp lệ.'); }
+  }
+  const files: FilesConfig = {
+    keks: parseKeks(env.FILE_KEKS),
+    webSourceTtlMs: positiveNumber(env.WEB_SOURCE_TTL_HOURS, 24, 'WEB_SOURCE_TTL_HOURS') * 3_600_000,
+    encryptedQuotaBytes: Math.floor(positiveNumber(env.ENCRYPTED_QUOTA_MB, 1024, 'ENCRYPTED_QUOTA_MB') * 1024 * 1024),
+  };
+  const worker: WorkerConfig = {
+    pollMs: positiveNumber(env.WORKER_POLL_MS, 2_000, 'WORKER_POLL_MS'),
+    maintenanceMs: positiveNumber(env.WORKER_MAINTENANCE_MS, 5 * 60_000, 'WORKER_MAINTENANCE_MS'),
+  };
   return {
     databaseUrl: env.DATABASE_URL,
     jwtSecret: env.JWT_SECRET,
@@ -57,6 +130,9 @@ export function readConfig(env: NodeJS.ProcessEnv): ApiConfig {
       secure: env.SMTP_SECURE === 'true', from,
       ...(env.SMTP_USER ? { user: env.SMTP_USER, pass: env.SMTP_PASS } : {}),
     },
+    storage,
+    files,
+    worker,
   };
 }
 

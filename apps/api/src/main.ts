@@ -22,13 +22,14 @@ async function bootstrap(): Promise<void> {
   app.enableCors({
     origin: config.webOrigin,
     credentials: true,
-    methods: ['GET', 'POST', 'PATCH', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+    exposedHeaders: ['Content-Disposition'],
     allowedHeaders: ['Content-Type', 'Authorization'],
   });
   app.use(cookieParser());
   app.use((request: Request, response: Response, next: NextFunction) => {
     response.setHeader('X-Content-Type-Options', 'nosniff');
-    if (request.path.startsWith('/api/auth') || request.path.startsWith('/api/account')) response.setHeader('Cache-Control', 'no-store');
+    if (/^\/api\/(auth|account|documents)(\/|$)/.test(request.path)) response.setHeader('Cache-Control', 'no-store');
     next();
   });
   app.useGlobalPipes(new ValidationPipe({

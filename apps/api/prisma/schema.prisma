@@ -131,7 +131,7 @@ model User {
   displayName        String?            @db.VarChar(100)
   timezone           String             @default("Asia/Ho_Chi_Minh") @db.VarChar(64)
   locale             String             @default("vi") @db.VarChar(16)
-  privacyLevel       PrivacyLevel       @default(TEXT_AND_EMBEDDINGS)
+  privacyLevel       PrivacyLevel       @default(ENCRYPTED_COPY)
   notificationDetail NotificationDetail @default(MINIMAL)
   revision           BigInt             @default(1)
   createdAt          DateTime           @default(now()) @db.Timestamptz(3)

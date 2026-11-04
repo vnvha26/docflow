@@ -8,9 +8,11 @@
     "dev": "node tools/dev.mjs",
     "dev:api": "npm run dev -w apps/api",
     "dev:web": "npm run dev -w apps/web",
+    "dev:worker": "npm run dev:worker -w apps/api",
     "build": "npm run build --workspaces --if-present",
     "test": "npm run test --workspaces --if-present && npm run db:test",
     "test:auth": "npm run build -w apps/api && node --test tools/auth.integration.test.mjs",
+    "test:documents": "npm run build -w apps/api && node --test tools/documents.integration.test.mjs",
     "db:generate": "npm run db:generate -w apps/api",
     "db:migrate": "npm run db:migrate -w apps/api",
     "db:test": "node --test tools/database.test.mjs"

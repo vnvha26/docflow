@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ApiError, AuthClient, StaleSessionError } from './api.ts';
+import { ApiError, AuthClient, fileNameFrom, StaleSessionError } from './api.ts';
 import type { Exclusive, User } from './api.ts';
 import { clearChallenge, pendingChallenge, readChallenge, saveChallenge } from './challenge.ts';
 
@@ -354,4 +354,73 @@ test('logout still runs when the in-flight password change fails', async () => {
   await logout;
   assert.equal(loggedOutWith, 'Bearer old-token');
   assert.equal(client.getSnapshot().status, 'anonymous');
+});
+
+test('an upload queued for one account is never sent after the tab switches to another account', async () => {
+  const other: User = { ...user, id: 'u-2', email: 'khac@example.com' };
+  const uploads: (string | null)[] = [];
+  let refreshes = 0;
+  const client = newClient(async (url, init) => {
+    if (url === '/api/auth/refresh') {
+      refreshes++;
+      return refreshes === 1 ? session('token-a') : Response.json({ accessToken: 'token-b', expiresIn: 900, user: other });
+    }
+    if (url === '/api/documents') {
+      uploads.push(new Headers(init?.headers).get('Authorization'));
+      return Response.json({ document: { id: 'd-1' }, duplicate: false }, { status: 201 });
+    }
+    return unauthorized();
+  });
+  await client.restore();
+  const upload = () => {
+    const form = new FormData();
+    form.append('file', new Blob(['x']), 'a.txt');
+    return client.request('/documents', { method: 'POST', body: form }, { asUser: user.id });
+  };
+  await upload();
+  assert.deepEqual(uploads, ['Bearer token-a']);
+  await assert.rejects(client.request('/auth/me'), StaleSessionError);
+  assert.equal(client.getSnapshot().user?.id, 'u-2');
+  await assert.rejects(upload(), StaleSessionError);
+  assert.deepEqual(uploads, ['Bearer token-a'], 'the file chosen under A never reaches B');
+});
+
+test('uploads send FormData without a JSON content type; downloads refresh once and read the UTF-8 file name', async () => {
+  const seen: { url: string; type: string | null; auth: string | null }[] = [];
+  let downloads = 0;
+  const client = newClient(async (url, init) => {
+    const headers = new Headers(init?.headers);
+    seen.push({ url: String(url), type: headers.get('Content-Type'), auth: headers.get('Authorization') });
+    if (url === '/api/auth/refresh') return session(seen.filter((entry) => entry.url === '/api/auth/refresh').length === 1 ? 'first' : 'second');
+    if (url === '/api/documents') {
+      assert.ok(init?.body instanceof FormData);
+      return Response.json({ document: { id: 'd-1' }, duplicate: false }, { status: 201 });
+    }
+    downloads++;
+    if (downloads === 1) return unauthorized();
+    return new Response('nội dung', { headers: {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Content-Disposition': `attachment; filename="Bien ban.txt"; filename*=UTF-8''Bi%C3%AAn%20b%E1%BA%A3n.txt`,
+    } });
+  });
+  await client.restore();
+  const form = new FormData();
+  form.append('file', new Blob(['x']), 'a.txt');
+  await client.request('/documents', { method: 'POST', body: form });
+  assert.equal(seen.find((entry) => entry.url === '/api/documents')?.type, null, 'the browser sets the multipart boundary');
+  const file = await client.download('/documents/d-1/original');
+  assert.equal(file.fileName, 'Biên bản.txt');
+  assert.equal(await file.blob.text(), 'nội dung');
+  assert.deepEqual(seen.filter((entry) => entry.url.endsWith('/original')).map((entry) => entry.auth), ['Bearer first', 'Bearer second']);
+});
+
+test('file names fall back to the ASCII form and failed downloads surface the server message', async () => {
+  assert.equal(fileNameFrom('attachment; filename="report.pdf"'), 'report.pdf');
+  assert.equal(fileNameFrom(`attachment; filename="x.pdf"; filename*=UTF-8''%E0%A4%A`), 'x.pdf');
+  assert.equal(fileNameFrom(null), null);
+  const client = newClient(async (url) => url === '/api/auth/refresh'
+    ? session('token')
+    : Response.json({ message: 'Tài liệu này không có bản gốc để tải.' }, { status: 404 }));
+  await client.restore();
+  await assert.rejects(client.download('/documents/x/original'), (error: unknown) => error instanceof ApiError && error.status === 404 && /bản gốc/.test(error.message));
 });
