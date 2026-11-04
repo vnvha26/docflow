@@ -2,12 +2,12 @@ import {
   Body, Controller, Get, HttpCode, Inject, Param, ParseUUIDPipe, Post, Req, Res, UseGuards,
 } from '@nestjs/common';
 import {
-  ApiAcceptedResponse, ApiBearerAuth, ApiBody, ApiConflictResponse, ApiCookieAuth,
+  ApiAcceptedResponse, ApiBadRequestResponse, ApiBearerAuth, ApiBody, ApiConflictResponse, ApiCookieAuth,
   ApiNoContentResponse, ApiNotFoundResponse, ApiOkResponse, ApiOperation, ApiParam, ApiTags, ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
 import { CookieOptions, Response } from 'express';
 import { API_CONFIG, ApiConfig } from '../config';
-import { ChallengeIdDto, EmptyAuthDto, ForgotPasswordDto, LoginDto, RegisterDto, ResetPasswordDto, VerifyEmailDto } from './auth.dto';
+import { ChallengeIdDto, ChangePasswordDto, EmptyAuthDto, ForgotPasswordDto, LoginDto, RegisterDto, ResetPasswordDto, VerifyEmailDto } from './auth.dto';
 import { AccessTokenGuard, AuthOriginGuard, AuthRateLimitGuard, bearerToken } from './auth.guards';
 import { AuthService } from './auth.service';
 import { AuthRequest, AuthResponse, ChallengeResponse, IssuedAuth, PublicSession, PublicUser, REFRESH_COOKIE } from './auth.types';
@@ -172,6 +172,24 @@ export class AuthController {
   revokeSession(@Param('id', new ParseUUIDPipe()) id: string, @Req() request: AuthRequest): Promise<void> {
     const { user, sessionId } = request.auth!;
     return this.auth.revokeSession(user.id, sessionId, id);
+  }
+
+  @Post('change-password')
+  @HttpCode(200)
+  @UseGuards(AccessTokenGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Đổi mật khẩu khi đang đăng nhập. Thu hồi mọi phiên cũ và cấp phiên mới cho thiết bị hiện tại.' })
+  @ApiOkResponse({ schema: authSchema })
+  @ApiBadRequestResponse({ description: 'Mật khẩu hiện tại sai hoặc mật khẩu mới không hợp lệ (fieldErrors).' })
+  @ApiConflictResponse({ description: 'Mật khẩu vừa được đổi ở nơi khác.' })
+  @ApiUnauthorizedResponse()
+  async changePassword(
+    @Body() body: ChangePasswordDto,
+    @Req() request: AuthRequest,
+    @Res({ passthrough: true }) response: Response,
+  ): Promise<AuthResponse> {
+    const { user, sessionId } = request.auth!;
+    return this.issue(await this.auth.changePassword(user.id, sessionId, body, request.get('user-agent')), response);
   }
 
   @Post('logout')

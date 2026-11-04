@@ -1,15 +1,12 @@
-import { Controller, Get, Module } from '@nestjs/common';
-import { ApiOkResponse, ApiTags } from '@nestjs/swagger';
+import { Module } from '@nestjs/common';
+import { AccountModule } from './account/account.module';
 import { AuthModule } from './auth/auth.module';
 import { SettingsModule } from './config';
+import { DatabaseModule } from './database/database.module';
+import { HealthController } from './health/health.controller';
 
-@ApiTags('Health')
-@Controller('health')
-class HealthController {
-  @Get()
-  @ApiOkResponse({ schema: { type: 'object', properties: { status: { type: 'string', example: 'ok' } } } })
-  health() { return { status: 'ok' }; }
-}
-
-@Module({ imports: [SettingsModule, AuthModule], controllers: [HealthController] })
+@Module({
+  imports: [SettingsModule, DatabaseModule, AuthModule, AccountModule],
+  controllers: [HealthController],
+})
 export class AppModule {}

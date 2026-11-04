@@ -1,10 +1,12 @@
-import { Inject, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
+import {
+  BadRequestException, ConflictException, Inject, Injectable, NotFoundException, UnauthorizedException,
+} from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { Prisma } from '@prisma/client';
 import { createHash, randomBytes } from 'node:crypto';
 import { API_CONFIG, ApiConfig } from '../config';
-import { PrismaService } from '../prisma.service';
-import { LoginDto, normalizeEmail, RegisterDto, ResetPasswordDto, VerifyEmailDto } from './auth.dto';
+import { PrismaService } from '../database/prisma.service';
+import { ChangePasswordDto, LoginDto, normalizeEmail, RegisterDto, ResetPasswordDto, VerifyEmailDto } from './auth.dto';
 import { EmailChallengeService, lockAuthEmail } from './email-challenge.service';
 import { PasswordService } from './password.service';
 import {
@@ -14,6 +16,13 @@ import {
 
 const INVALID_LOGIN = 'Email hoặc mật khẩu không đúng.';
 const INVALID_SESSION = 'Phiên đăng nhập không hợp lệ hoặc đã hết hạn.';
+const WRONG_CURRENT_PASSWORD = 'Mật khẩu hiện tại không đúng.';
+const SAME_PASSWORD = 'Mật khẩu mới phải khác mật khẩu hiện tại.';
+
+// 400 + fieldErrors (not 401): the web client treats 401 as an expired access token.
+function fieldError(field: string, message: string): BadRequestException {
+  return new BadRequestException({ statusCode: 400, message, fieldErrors: { [field]: message } });
+}
 
 export function hashRefreshToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
@@ -73,6 +82,50 @@ export class AuthService {
         throw new UnauthorizedException(INVALID_LOGIN);
       }
       const { passwordHash: _passwordHash, emailVerifiedAt: _verifiedAt, ...publicUser } = current;
+      return this.createSession(publicUser, transaction, userAgent);
+    });
+  }
+
+  /**
+   * A5: verify the current password, store the new hash and revoke every existing
+   * session (this one included). The caller gets a fresh session so this device
+   * stays signed in while all other devices must log in again.
+   */
+  async changePassword(userId: string, sessionId: string, input: ChangePasswordDto, userAgent?: string): Promise<IssuedAuth> {
+    if (input.currentPassword === input.newPassword) throw fieldError('newPassword', SAME_PASSWORD);
+    const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { email: true, passwordHash: true } });
+    if (!user) throw new UnauthorizedException(INVALID_SESSION);
+    if (!await this.passwords.verify(user.passwordHash, input.currentPassword)) {
+      throw fieldError('currentPassword', WRONG_CURRENT_PASSWORD);
+    }
+    // Argon2 runs outside the transaction so the email lock is held only briefly.
+    const passwordHash = await this.passwords.hash(input.newPassword);
+    return this.prisma.$transaction(async (transaction) => {
+      await lockAuthEmail(transaction, user.email);
+      const now = new Date();
+      const own = await transaction.session.updateMany({
+        where: { id: sessionId, userId, revokedAt: null, expiresAt: { gt: now } },
+        data: { revokedAt: now },
+      });
+      // A reset or another password change revoked this session while Argon2 was running.
+      if (own.count !== 1) throw new UnauthorizedException(INVALID_SESSION);
+      const current = await transaction.user.findUnique({
+        where: { id: userId }, select: { ...PUBLIC_USER_SELECT, passwordHash: true },
+      });
+      if (!current || current.passwordHash !== user.passwordHash) {
+        throw new ConflictException('Mật khẩu vừa được thay đổi ở nơi khác. Vui lòng đăng nhập lại.');
+      }
+      await transaction.session.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: now } });
+      // Outstanding reset codes were issued for the old password; they must not outlive it.
+      await transaction.emailChallenge.updateMany({
+        where: { email: current.email, purpose: 'RESET_PASSWORD', consumedAt: null },
+        data: { consumedAt: now },
+      });
+      await transaction.user.update({
+        where: { id: userId },
+        data: { passwordHash, passwordChangedAt: now, revision: { increment: 1 } },
+      });
+      const { passwordHash: _passwordHash, ...publicUser } = current;
       return this.createSession(publicUser, transaction, userAgent);
     });
   }

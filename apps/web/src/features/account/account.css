@@ -1,0 +1,89 @@
+.session-note {
+  margin: 14px 0 18px;
+  color: #67745d;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.session-list ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.session-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 20px;
+  flex-wrap: wrap;
+  padding: 15px 0;
+  border-top: 1px solid #edf0e6;
+}
+
+.session-label {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 14px;
+  color: #365441;
+}
+
+.session-current {
+  padding: 3px 8px;
+  border-radius: 12px;
+  background: #edf4e6;
+  color: #46643b;
+  font-size: 11px;
+}
+
+.session-info p {
+  margin: 5px 0 0;
+  font-size: 12px;
+  color: #67745d;
+}
+
+.session-card .button-secondary,
+.session-card .profile-bottom > p {
+  font-size: 12px;
+}
+
+.session-card .profile-bottom > p {
+  color: #46643b;
+}
+
+.session-card .profile-bottom > button {
+  margin-left: auto;
+}
+
+/* Account settings forms */
+.settings-form { margin-top: 22px; }
+.settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 28px; }
+.settings-grid-three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.settings-form .form-field { margin-bottom: 18px; }
+.select-wrap select {
+  height: 48px; width: 100%; appearance: none; border: 1px solid #dfe5d8; background: #fffefb;
+  border-radius: 9px; padding: 0 40px 0 14px; color: #314b37; font-size: 12px; outline: none;
+  transition: border-color .16s, box-shadow .16s; text-overflow: ellipsis;
+}
+.select-wrap select:focus { border-color: #789b7c; box-shadow: 0 0 0 3px #a1b99024; }
+.select-wrap select:disabled { background: #f1f2eb; }
+.has-error .select-wrap select { border-color: #cd8069; }
+.select-chevron { position: absolute; right: 14px; top: 50%; transform: translateY(-50%); color: #96a18e; display: flex; pointer-events: none; }
+.text-button { border: 0; background: transparent; padding: 0; color: #527140; font-size: inherit; font-weight: 550; text-align: left; }
+.text-button:hover:not(:disabled) { text-decoration: underline; }
+.profile-card .settings-readonly { margin: 4px 0 22px; }
+.button-primary.button-compact { width: auto; min-height: 40px; margin-top: 0; padding: 0 20px; font-size: 11px; white-space: nowrap; }
+.profile-bottom > p[role="status"] { min-height: 18px; }
+.profile-card + .profile-card { margin-top: 20px; }
+
+@media (max-width: 900px) {
+  .settings-grid-three { grid-template-columns: 1fr; }
+}
+@media (max-width: 760px) {
+  .settings-grid { grid-template-columns: 1fr; }
+  .select-wrap select { height: 51px; font-size: 13px; }
+  .button-primary.button-compact { width: 100%; min-height: 46px; font-size: 12px; }
+  .profile-bottom { align-items: stretch; }
+}

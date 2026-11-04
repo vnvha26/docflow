@@ -6,7 +6,7 @@ import { EmailChallenge, EmailChallengePurpose, Prisma } from '@prisma/client';
 import { createHmac, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { API_CONFIG, ApiConfig } from '../config';
-import { PrismaService } from '../prisma.service';
+import { PrismaService } from '../database/prisma.service';
 import { normalizeEmail, RegisterDto, ResetPasswordDto, VerifyEmailDto } from './auth.dto';
 import { ChallengeResponse, IssuedAuth, PUBLIC_USER_SELECT, PublicUser } from './auth.types';
 import { MailService } from './mail.service';

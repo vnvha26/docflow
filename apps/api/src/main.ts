@@ -9,7 +9,7 @@ import { resolve } from 'node:path';
 import { NextFunction, Request, Response } from 'express';
 import { AppModule } from './app.module';
 import { API_CONFIG, ApiConfig } from './config';
-import { SafeExceptionFilter } from './http-exception.filter';
+import { SafeExceptionFilter } from './common/http-exception.filter';
 
 loadDotenv({ path: resolve(__dirname, '../.env'), quiet: true });
 
@@ -22,13 +22,13 @@ async function bootstrap(): Promise<void> {
   app.enableCors({
     origin: config.webOrigin,
     credentials: true,
-    methods: ['GET', 'POST', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PATCH', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
   });
   app.use(cookieParser());
   app.use((request: Request, response: Response, next: NextFunction) => {
     response.setHeader('X-Content-Type-Options', 'nosniff');
-    if (request.path.startsWith('/api/auth')) response.setHeader('Cache-Control', 'no-store');
+    if (request.path.startsWith('/api/auth') || request.path.startsWith('/api/account')) response.setHeader('Cache-Control', 'no-store');
     next();
   });
   app.useGlobalPipes(new ValidationPipe({

@@ -1,12 +1,26 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ApiError, AuthClient, StaleSessionError } from './api.ts';
-import type { User } from './api.ts';
+import type { Exclusive, User } from './api.ts';
 import { clearChallenge, pendingChallenge, readChallenge, saveChallenge } from './challenge.ts';
 
 const user: User = { id: 'u-1', email: 'ban@example.com', displayName: 'Minh An', timezone: 'Asia/Ho_Chi_Minh', privacyLevel: 'TEXT_AND_EMBEDDINGS' };
 const session = (token: string) => Response.json({ accessToken: token, expiresIn: 900, user });
 const unauthorized = () => Response.json({ message: 'Phiên đã hết hạn.' }, { status: 401 });
+/** One tab's view of navigator.locks: exclusive, FIFO, not re-entrant. */
+function tabLock(): Exclusive {
+  let tail: Promise<unknown> = Promise.resolve();
+  return <T,>(run: () => Promise<T>) => {
+    const result = tail.then(run);
+    tail = result.catch(() => undefined);
+    return result;
+  };
+}
+/** Browser without Web Locks (old browser, or plain HTTP on a non-localhost host). */
+const noLocks: Exclusive = (run) => run();
+// Explicit locks keep results independent of whether this Node version ships navigator.locks.
+const newClient = (fetcher: typeof fetch, lock: Exclusive = tabLock()) => new AuthClient(fetcher, lock);
+
 const deferred = <T,>() => {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((done) => { resolve = done; });
@@ -16,7 +30,7 @@ const deferred = <T,>() => {
 test('registration requests email verification without authenticating; only a correct code creates a session', async () => {
   const challenge = { challengeId: 'registration-1', email: user.email, expiresIn: 600, resendAfter: 60, message: 'Mã xác minh đã được gửi.' };
   let protectedToken: string | null = null;
-  const client = new AuthClient(async (url, init) => {
+  const client = newClient(async (url, init) => {
     assert.equal(init?.credentials, 'include');
     if (url === '/api/auth/refresh') return unauthorized();
     if (url === '/api/auth/register') {
@@ -40,7 +54,7 @@ test('registration requests email verification without authenticating; only a co
 });
 
 test('wrong email code reports an inline field error and never authenticates', async () => {
-  const client = new AuthClient(async (url) => url === '/api/auth/refresh' ? unauthorized() : Response.json({ message: 'Mã chưa đúng.', fieldErrors: { code: 'Mã chưa đúng.' } }, { status: 400 }));
+  const client = newClient(async (url) => url === '/api/auth/refresh' ? unauthorized() : Response.json({ message: 'Mã chưa đúng.', fieldErrors: { code: 'Mã chưa đúng.' } }, { status: 400 }));
   await client.restore();
   await assert.rejects(client.verifyEmail({ challengeId: 'registration-1', code: '000000' }), (error: unknown) => error instanceof ApiError && error.fieldErrors.code === 'Mã chưa đúng.');
   assert.equal(client.getSnapshot().status, 'anonymous');
@@ -48,7 +62,7 @@ test('wrong email code reports an inline field error and never authenticates', a
 
 test('password recovery uses the generic challenge contract, resend replaces the id, and reset never signs in', async () => {
   const seen: [string, unknown][] = [];
-  const client = new AuthClient(async (url, init) => {
+  const client = newClient(async (url, init) => {
     if (url === '/api/auth/refresh') return unauthorized();
     seen.push([String(url), JSON.parse(String(init?.body))]);
     if (url === '/api/auth/reset-password') return Response.json({ message: 'Mật khẩu đã được đặt lại.' });
@@ -90,7 +104,7 @@ test('challenge storage resumes expiry and cooldown without persisting passwords
 test('restoring twice shares one refresh and keeps credentials in the HttpOnly-cookie flow', async () => {
   let calls = 0;
   const pending = deferred<Response>();
-  const client = new AuthClient(async (url, init) => {
+  const client = newClient(async (url, init) => {
     assert.equal(url, '/api/auth/refresh');
     assert.equal(init?.credentials, 'include');
     assert.equal(new Headers(init?.headers).get('Authorization'), null);
@@ -110,7 +124,7 @@ test('concurrent expired protected requests rotate refresh once and retry with t
   let refreshCalls = 0;
   const refreshResponse = deferred<Response>();
   const requests: string[] = [];
-  const client = new AuthClient(async (url, init) => {
+  const client = newClient(async (url, init) => {
     if (url === '/api/auth/login') return session('expired');
     if (url === '/api/auth/refresh') { refreshCalls++; return refreshResponse.promise; }
     const authorization = new Headers(init?.headers).get('Authorization')!;
@@ -131,7 +145,7 @@ test('an old 401 arriving after another request refreshed does not rotate again'
   let protectedCalls = 0;
   let refreshCalls = 0;
   const late401 = deferred<Response>();
-  const client = new AuthClient(async (url, init) => {
+  const client = newClient(async (url, init) => {
     if (url === '/api/auth/login') return session('old');
     if (url === '/api/auth/refresh') { refreshCalls++; return session('new'); }
     protectedCalls++;
@@ -149,7 +163,7 @@ test('an old 401 arriving after another request refreshed does not rotate again'
 test('a rejected retry ends the session without an infinite refresh loop', async () => {
   let refreshCalls = 0;
   let protectedCalls = 0;
-  const client = new AuthClient(async (url) => {
+  const client = newClient(async (url) => {
     if (url === '/api/auth/login') return session('old');
     if (url === '/api/auth/refresh') { refreshCalls++; return session('new'); }
     protectedCalls++; return unauthorized();
@@ -161,14 +175,37 @@ test('a rejected retry ends the session without an infinite refresh loop', async
   assert.deepEqual(client.getSnapshot(), { status: 'anonymous', user: null, expired: true });
 });
 
-test('a refresh in progress cannot sign a user back in after logout', async () => {
+test('with Web Locks, logout waits for an in-flight refresh, then revokes the session; the refresh cannot sign back in', async () => {
   const pending = deferred<Response>();
-  const client = new AuthClient(async (url) => {
+  const logoutTokens: (string | null)[] = [];
+  const client = newClient(async (url, init) => {
+    if (url === '/api/auth/login') return session('old');
+    if (url === '/api/auth/refresh') return pending.promise;
+    if (url === '/api/auth/logout') { logoutTokens.push(new Headers(init?.headers).get('Authorization')); return new Response(null, { status: 204 }); }
+    throw new Error(`Unexpected ${url}`);
+  });
+  await client.authenticate('login', { email: user.email, password: 'long-password' });
+  const refresh = client.refresh();
+  const rejection = assert.rejects(refresh, StaleSessionError);
+  const logout = client.logout();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(logoutTokens, [], 'logout must wait for the refresh holding the session lock');
+  // The server answers the refresh independently of logout; only then can logout run.
+  pending.resolve(session('stale'));
+  await rejection;
+  await logout;
+  assert.deepEqual(logoutTokens, ['Bearer old']);
+  assert.equal(client.getSnapshot().status, 'anonymous');
+});
+
+test('without Web Locks, a refresh response arriving after logout cannot sign the user back in', async () => {
+  const pending = deferred<Response>();
+  const client = newClient(async (url) => {
     if (url === '/api/auth/login') return session('old');
     if (url === '/api/auth/refresh') return pending.promise;
     if (url === '/api/auth/logout') return new Response(null, { status: 204 });
     throw new Error(`Unexpected ${url}`);
-  });
+  }, noLocks);
   await client.authenticate('login', { email: user.email, password: 'long-password' });
   const refresh = client.refresh();
   const rejection = assert.rejects(refresh, StaleSessionError);
@@ -180,7 +217,7 @@ test('a refresh in progress cannot sign a user back in after logout', async () =
 
 test('logout refreshes an expired access token before revoking the session', async () => {
   const calls: string[] = [];
-  const client = new AuthClient(async (url, init) => {
+  const client = newClient(async (url, init) => {
     if (url === '/api/auth/login') return session('old');
     calls.push(`${url} ${new Headers(init?.headers).get('Authorization') || ''}`.trim());
     if (url === '/api/auth/refresh') return session('new');
@@ -194,7 +231,7 @@ test('logout refreshes an expired access token before revoking the session', asy
 });
 
 test('a network error does not claim server-side logout succeeded', async () => {
-  const client = new AuthClient(async (url) => {
+  const client = newClient(async (url) => {
     if (url === '/api/auth/login') return session('old');
     throw new TypeError('Network unavailable');
   });
@@ -205,7 +242,7 @@ test('a network error does not claim server-side logout succeeded', async () => 
 
 test('protected data arriving after logout is discarded', async () => {
   const pending = deferred<Response>();
-  const client = new AuthClient(async (url) => {
+  const client = newClient(async (url) => {
     if (url === '/api/auth/login') return session('old');
     if (url === '/api/auth/logout') return new Response(null, { status: 204 });
     return pending.promise;
@@ -216,4 +253,105 @@ test('protected data arriving after logout is discarded', async () => {
   await client.logout();
   pending.resolve(Response.json(user));
   await rejection;
+});
+
+test('changing the password swaps to the new session token; a wrong current password keeps the old one', async () => {
+  const authorizations: (string | null)[] = [];
+  const client = newClient(async (url, init) => {
+    if (url === '/api/auth/refresh') return session('old-token');
+    if (url === '/api/auth/change-password') {
+      const body = JSON.parse(String(init?.body));
+      if (body.currentPassword !== 'current secret phrase') {
+        return Response.json({ message: 'Mật khẩu hiện tại không đúng.', fieldErrors: { currentPassword: 'Mật khẩu hiện tại không đúng.' } }, { status: 400 });
+      }
+      return session('new-token');
+    }
+    authorizations.push(new Headers(init?.headers).get('Authorization'));
+    return Response.json(user);
+  });
+  await client.restore();
+  await assert.rejects(client.changePassword({ currentPassword: 'wrong phrase', newPassword: 'a new secret phrase' }),
+    (error: unknown) => error instanceof ApiError && error.status === 400 && error.fieldErrors.currentPassword === 'Mật khẩu hiện tại không đúng.');
+  assert.equal(client.getSnapshot().status, 'authenticated');
+  await client.request('/auth/me');
+  assert.deepEqual(await client.changePassword({ currentPassword: 'current secret phrase', newPassword: 'a new secret phrase' }), user);
+  await client.request('/auth/me');
+  assert.deepEqual(authorizations, ['Bearer old-token', 'Bearer new-token']);
+});
+
+test('updating the account publishes the saved user to every subscriber', async () => {
+  const updated = { ...user, timezone: 'Europe/Paris' };
+  const client = newClient(async (url, init) => {
+    if (url === '/api/auth/refresh') return session('token');
+    assert.equal(url, '/api/account');
+    assert.equal(init?.method, 'PATCH');
+    assert.deepEqual(JSON.parse(String(init?.body)), { timezone: 'Europe/Paris' });
+    return Response.json(updated);
+  });
+  await client.restore();
+  let notified = 0;
+  client.subscribe(() => { notified++; });
+  await client.updateAccount({ timezone: 'Europe/Paris' });
+  assert.equal(client.getSnapshot().user?.timezone, 'Europe/Paris');
+  assert.equal(notified, 1);
+});
+
+test('a request is never replayed for another account after a shared-cookie refresh switches users', async () => {
+  const other: User = { ...user, id: 'u-2', email: 'khac@example.com' };
+  const patches: (string | null)[] = [];
+  let refreshes = 0;
+  const client = newClient(async (url, init) => {
+    if (url === '/api/auth/refresh') {
+      refreshes++;
+      // First refresh restores account A; the second sees the cookie another tab replaced with B.
+      return refreshes === 1 ? session('token-a') : Response.json({ accessToken: 'token-b', expiresIn: 900, user: other });
+    }
+    patches.push(new Headers(init?.headers).get('Authorization'));
+    return unauthorized();
+  });
+  await client.restore();
+  await assert.rejects(client.updateAccount({ timezone: 'Europe/Paris' }), StaleSessionError);
+  assert.deepEqual(patches, ['Bearer token-a']);
+  assert.equal(client.getSnapshot().user?.id, 'u-2');
+});
+
+test('logout waits for an in-flight password change and revokes the session it created', async () => {
+  const changed = deferred<Response>();
+  const calls: [string, string | null][] = [];
+  const client = newClient(async (url, init) => {
+    calls.push([String(url), new Headers(init?.headers).get('Authorization')]);
+    if (url === '/api/auth/refresh') return session('old-token');
+    if (url === '/api/auth/change-password') return changed.promise;
+    if (url === '/api/auth/logout') return new Response(null, { status: 204 });
+    return Response.json(user);
+  });
+  await client.restore();
+  const change = client.changePassword({ currentPassword: 'current secret phrase', newPassword: 'a new secret phrase' });
+  const logout = client.logout();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.ok(!calls.some(([url]) => url === '/api/auth/logout'), 'logout must not run before the password change settles');
+  changed.resolve(session('new-token'));
+  await change;
+  await logout;
+  assert.deepEqual(calls.find(([url]) => url === '/api/auth/logout'), ['/api/auth/logout', 'Bearer new-token']);
+  assert.equal(client.getSnapshot().status, 'anonymous');
+});
+
+test('logout still runs when the in-flight password change fails', async () => {
+  const changed = deferred<Response>();
+  let loggedOutWith: string | null = null;
+  const client = newClient(async (url, init) => {
+    if (url === '/api/auth/refresh') return session('old-token');
+    if (url === '/api/auth/change-password') return changed.promise;
+    loggedOutWith = new Headers(init?.headers).get('Authorization');
+    return new Response(null, { status: 204 });
+  });
+  await client.restore();
+  const change = client.changePassword({ currentPassword: 'wrong phrase', newPassword: 'a new secret phrase' });
+  const logout = client.logout();
+  changed.resolve(Response.json({ message: 'Mật khẩu hiện tại không đúng.', fieldErrors: { currentPassword: 'x' } }, { status: 400 }));
+  await assert.rejects(change, ApiError);
+  await logout;
+  assert.equal(loggedOutWith, 'Bearer old-token');
+  assert.equal(client.getSnapshot().status, 'anonymous');
 });

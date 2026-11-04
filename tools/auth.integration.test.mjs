@@ -804,4 +804,128 @@ describe('auth over HTTP with PostgreSQL and local SMTP delivery', {
       currentPassword = replacement;
     });
   });
+
+  describe('account settings and password change', { concurrency: false }, () => {
+    let address;
+    let current;
+    const original = ' Account settings password 2026! ';
+
+    before(async () => {
+      await restartApi();
+      const account = await pendingAccount('settings');
+      address = account.address;
+      current = await verify(account.challengeId, account.mail.code);
+      assertAuthResult(current, 200, address);
+    });
+
+    const settingsLogin = (candidate) => request('/api/auth/login', {
+      method: 'POST', body: { email: address, password: candidate },
+    });
+
+    test('account endpoints require a Bearer token and return only public fields', async () => {
+      assert.equal((await request('/api/account')).status, 401);
+      assert.equal((await request('/api/account', { method: 'PATCH', body: { timezone: 'Europe/Paris' } })).status, 401);
+      const result = await request('/api/account', { token: current.body.accessToken });
+      assert.equal(result.status, 200);
+      assert.equal(result.body.email, address);
+      assert.equal(result.body.timezone, 'Asia/Ho_Chi_Minh');
+      assertPrivateResponse(result.body);
+      assert.equal(result.headers.get('cache-control'), 'no-store');
+    });
+
+    test('PATCH updates time zone and display name for the signed-in user only', async () => {
+      const result = await request('/api/account', {
+        method: 'PATCH', token: current.body.accessToken, body: { timezone: 'Europe/Paris', displayName: '  Settings User  ' },
+      });
+      assert.equal(result.status, 200);
+      assert.equal(result.body.timezone, 'Europe/Paris');
+      assert.equal(result.body.displayName, 'Settings User');
+      const stored = await db.user.findUniqueOrThrow({ where: { email: address } });
+      assert.equal(stored.timezone, 'Europe/Paris');
+      assert.equal(stored.revision, 2n);
+      const owner = await db.user.findUniqueOrThrow({ where: { email } });
+      assert.equal(owner.timezone, 'Asia/Ho_Chi_Minh');
+      assert.equal((await request('/api/auth/me', { token: current.body.accessToken })).body.timezone, 'Europe/Paris');
+      const cleared = await request('/api/account', { method: 'PATCH', token: current.body.accessToken, body: { displayName: '' } });
+      assert.equal(cleared.body.displayName, null);
+    });
+
+    test('PATCH rejects invalid zones, unknown or empty bodies and cross-origin browsers', async (t) => {
+      const cases = [
+        ['UTC offset', { timezone: '+07:00' }, 'timezone'],
+        ['unknown zone', { timezone: 'Mars/Olympus_Mons' }, 'timezone'],
+        ['null zone', { timezone: null }, 'timezone'],
+        ['privacy level is not editable here', { privacyLevel: 'ENCRYPTED_COPY' }, 'privacyLevel'],
+        ['email is not editable', { email: 'someone@example.test' }, 'email'],
+      ];
+      for (const [label, body, field] of cases) {
+        await t.test(label, async () => {
+          const result = await request('/api/account', { method: 'PATCH', token: current.body.accessToken, body });
+          assert.equal(result.status, 400);
+          assert.equal(typeof result.body.fieldErrors[field], 'string');
+        });
+      }
+      assert.equal((await request('/api/account', { method: 'PATCH', token: current.body.accessToken, body: {} })).status, 400);
+      const foreign = await request('/api/account', {
+        method: 'PATCH', token: current.body.accessToken, body: { timezone: 'UTC' }, requestOrigin: 'https://evil.example',
+      });
+      assert.equal(foreign.status, 403);
+      assert.equal((await db.user.findUniqueOrThrow({ where: { email: address } })).timezone, 'Europe/Paris');
+    });
+
+    test('CORS preflight allows PATCH from the web origin', async () => {
+      const response = await fetch(`${baseUrl}/api/account`, {
+        method: 'OPTIONS', signal: AbortSignal.timeout(5_000),
+        headers: { origin, 'access-control-request-method': 'PATCH', 'access-control-request-headers': 'authorization,content-type' },
+      });
+      assert.ok(response.status === 204 || response.status === 200);
+      assert.match(response.headers.get('access-control-allow-methods') ?? '', /PATCH/);
+    });
+
+    test('a wrong current password is a 400 field error and revokes nothing', async () => {
+      const result = await request('/api/auth/change-password', {
+        method: 'POST', token: current.body.accessToken,
+        body: { currentPassword: 'Not the right password', newPassword: 'Unused replacement 2026!' },
+      });
+      assert.equal(result.status, 400);
+      assert.equal(typeof result.body.fieldErrors.currentPassword, 'string');
+      assert.equal(result.cookie, null);
+      assert.equal((await request('/api/auth/me', { token: current.body.accessToken })).status, 200);
+    });
+
+    test('change password revokes every old session, keeps this device signed in and swaps passwords', async () => {
+      const other = await settingsLogin(password);
+      assertAuthResult(other, 200, address);
+      const result = await request('/api/auth/change-password', {
+        method: 'POST', token: current.body.accessToken, cookie: current.cookie,
+        body: { currentPassword: password, newPassword: original },
+      });
+      assertAuthResult(result, 200, address);
+      assertPrivateResponse(result.body);
+      const user = await db.user.findUniqueOrThrow({ where: { email: address } });
+      assert.match(user.passwordHash, /^\$argon2id\$v=19\$/);
+      const active = await db.session.findMany({ where: { userId: user.id, revokedAt: null } });
+      assert.equal(active.length, 1);
+      assert.equal(active[0].refreshTokenHash, sha256(rawRefresh(result.cookie)));
+      for (const session of [current, other]) {
+        assert.equal((await request('/api/auth/me', { token: session.body.accessToken })).status, 401);
+        assert.equal((await request('/api/auth/refresh', { method: 'POST', cookie: session.cookie })).status, 401);
+      }
+      assert.equal((await request('/api/auth/me', { token: result.body.accessToken })).status, 200);
+      assertAuthResult(await request('/api/auth/refresh', { method: 'POST', cookie: result.cookie }), 200, address);
+      assert.equal((await settingsLogin(password)).status, 401);
+      assertAuthResult(await settingsLogin(original), 200, address);
+    });
+
+    test('change password requires authentication and rejects cross-origin browsers', async () => {
+      const body = { currentPassword: original, newPassword: 'Yet another password 2026!' };
+      assert.equal((await request('/api/auth/change-password', { method: 'POST', body })).status, 401);
+      const session = await settingsLogin(original);
+      const foreign = await request('/api/auth/change-password', {
+        method: 'POST', token: session.body.accessToken, body, requestOrigin: 'https://evil.example',
+      });
+      assert.equal(foreign.status, 403);
+      assert.equal((await request('/api/auth/me', { token: session.body.accessToken })).status, 200);
+    });
+  });
 });

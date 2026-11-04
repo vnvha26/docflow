@@ -59,3 +59,15 @@ export class ResetPasswordDto extends VerifyEmailDto {
   @Length(12, 128, { message: 'Mật khẩu phải có từ 12 đến 128 ký tự.' })
   password!: string;
 }
+
+export class ChangePasswordDto {
+  @ApiProperty({ maxLength: 128, format: 'password' })
+  @IsString({ message: 'Mật khẩu hiện tại phải là chuỗi ký tự.' })
+  @Length(1, 128, { message: 'Nhập mật khẩu hiện tại.' })
+  currentPassword!: string;
+
+  @ApiProperty({ minLength: 12, maxLength: 128, format: 'password' })
+  @IsString({ message: 'Mật khẩu mới phải là chuỗi ký tự.' })
+  @Length(12, 128, { message: 'Mật khẩu mới phải có từ 12 đến 128 ký tự.' })
+  newPassword!: string;
+}

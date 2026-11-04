@@ -1,11 +1,11 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const apiRoot = fileURLToPath(new URL('../apps/api/', import.meta.url));
-const testSource = new URL('../apps/api/test/auth.test.ts', import.meta.url);
-if (!existsSync(testSource)) {
+const testDir = new URL('../apps/api/test/', import.meta.url);
+if (!existsSync(testDir)) {
   console.log('Skipping local API unit tests: apps/api/test/ is not included in this checkout.');
 } else {
   const require = createRequire(new URL('../apps/api/package.json', import.meta.url));
@@ -15,5 +15,7 @@ if (!existsSync(testSource)) {
     if (result.status !== 0) process.exit(result.status ?? 1);
   };
   run([require.resolve('typescript/bin/tsc'), '-p', 'tsconfig.test.json']);
-  run(['--test', '.test-dist/test/auth.test.js']);
+  const files = readdirSync(testDir).filter((name) => name.endsWith('.test.ts')).sort()
+    .map((name) => `.test-dist/test/${name.replace(/\.ts$/, '.js')}`);
+  run(['--test', ...files]);
 }

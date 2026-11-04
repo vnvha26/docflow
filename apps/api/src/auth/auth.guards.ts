@@ -56,7 +56,7 @@ export class AuthRateLimitGuard implements CanActivate {
     if (request.method !== 'POST') return true;
     const action = request.path.split('/').filter(Boolean).at(-1);
     const rule = ['register', 'forgot-password', 'resend-code'].includes(action ?? '') ? { limit: 10, window: 15 * 60_000 }
-      : ['login', 'verify-email', 'reset-password'].includes(action ?? '') ? { limit: 20, window: 15 * 60_000 }
+      : ['login', 'verify-email', 'reset-password', 'change-password'].includes(action ?? '') ? { limit: 20, window: 15 * 60_000 }
         : { limit: 60, window: 60_000 };
     const now = Date.now();
     if (now - this.lastCleanup > 60_000) {

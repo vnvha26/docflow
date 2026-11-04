@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react';
-import { authClient, StaleSessionError } from '../lib/api';
-import { Icon } from './Brand';
-import './SessionPanel.css';
+import { authClient, StaleSessionError } from '../../lib/api';
+import { Icon } from '../../components/Brand';
 
 interface LoginSession {
   id: string;
