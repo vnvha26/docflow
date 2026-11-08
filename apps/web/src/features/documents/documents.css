@@ -33,6 +33,11 @@
 .document-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .tag { display: inline-flex; align-items: center; gap: 4px; font-size: 9px; padding: 3px 8px; border-radius: 999px; background: #f1f4ea; color: #6b7a5f; }
 .tag-secure { background: #e8f0e1; color: #4c6c42; }
+.tag-waiting { background: #f4f1e6; color: #7a6a3f; }
+.tag-done { background: #e8f0e1; color: #4c6c42; }
+.tag-problem { background: #f8e9e4; color: #9a4a36; }
+.spinner-tiny { width: 9px; height: 9px; border-width: 1.5px; border-color: #e3d9bd; border-top-color: #7a6a3f; margin: 0; flex-shrink: 0; }
+.document-info .document-problem { margin: 6px 0 0; font-size: 11px; line-height: 1.5; color: #9a4a36; }
 .document-actions { display: flex; gap: 8px; flex-shrink: 0; }
 .document-actions .button-secondary { gap: 6px; }
 @media (max-width: 760px) {

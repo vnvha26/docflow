@@ -58,6 +58,44 @@ const docx = () => zip([
   { name: '[Content_Types].xml', data: Buffer.from('<?xml version="1.0"?><Types/>') },
   { name: 'word/document.xml', data: Buffer.from(`<w:document>${randomUUID()}</w:document>`) },
 ]);
+const brokenDocx = () => zip([
+  { name: '[Content_Types].xml', data: Buffer.from('<?xml version="1.0"?><Types/>') },
+  { name: 'word/document.xml', data: Buffer.from(`<w:document><w:p>${randomUUID()}`) },
+]);
+const W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+const docxWith = (paragraphs) => zip([
+  { name: '[Content_Types].xml', data: Buffer.from('<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>') },
+  { name: '_rels/.rels', data: Buffer.from('<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>') },
+  { name: 'word/document.xml', data: Buffer.from(`<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="${W}"><w:body>${paragraphs.map((paragraph) => `<w:p><w:r><w:t>${paragraph}</w:t></w:r></w:p>`).join('')}</w:body></w:document>`, 'utf8') },
+]);
+
+function textPdf(pages) {
+  const objects = [];
+  const add = (body) => objects.push(body);
+  add('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>');
+  const pagesId = 1 + pages.length * 2 + 2;
+  const kids = [];
+  for (const lines of pages) {
+    const ops = lines.length ? `BT /F1 12 Tf 72 720 Td 14 TL ${lines.map((line) => `(${line}) Tj T*`).join(' ')} ET` : '';
+    add(`<< /Length ${Buffer.byteLength(ops, 'latin1')} >>\nstream\n${ops}\nendstream`);
+    const content = objects.length;
+    add(`<< /Type /Page /Parent ${pagesId} 0 R /MediaBox [0 0 612 792] /Contents ${content} 0 R /Resources << /Font << /F1 1 0 R >> >> >>`);
+    kids.push(objects.length);
+  }
+  add(`<< /Type /Catalog /Pages ${pagesId} 0 R >>`);
+  const catalog = objects.length;
+  add(`<< /Type /Pages /Kids [${kids.map((kid) => `${kid} 0 R`).join(' ')}] /Count ${kids.length} >>`);
+  let out = '%PDF-1.4\n';
+  const offsets = [];
+  objects.forEach((body, index) => {
+    offsets.push(Buffer.byteLength(out, 'latin1'));
+    out += `${index + 1} 0 obj\n${body}\nendobj\n`;
+  });
+  const xref = Buffer.byteLength(out, 'latin1');
+  out += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n${offsets.map((offset) => `${String(offset).padStart(10, '0')} 00000 n \n`).join('')}`;
+  out += `trailer\n<< /Size ${objects.length + 1} /Root ${catalog} 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(out, 'latin1');
+}
 const pdf = (bytes = 2048) => Buffer.concat([Buffer.from('%PDF-1.7\n'), randomBytes(bytes), Buffer.from('\n%%EOF\n')]);
 const text = (body = `Hợp đồng thuê nhà — tiền cọc 16.000.000 VNĐ. ${randomUUID()}\n`) => Buffer.from(body, 'utf8');
 
@@ -86,7 +124,7 @@ const childEnv = (port) => ({
   ...process.env, NODE_ENV: 'test', DATABASE_URL: databaseUrl, ...(port ? { PORT: String(port) } : {}), WEB_ORIGIN: origin,
   JWT_SECRET: 'docflow-documents-integration-secret-32-chars', FILE_KEKS: fileKeks,
   S3_ENDPOINT: s3.endpoint, S3_ACCESS_KEY: s3.accessKeyId, S3_SECRET_KEY: s3.secretAccessKey, S3_BUCKET: s3.bucket,
-  ENCRYPTED_QUOTA_MB: '1', WEB_SOURCE_TTL_HOURS: '24', WORKER_POLL_MS: '100', WORKER_MAINTENANCE_MS: '400',
+  ENCRYPTED_QUOTA_MB: '1', WEB_SOURCE_MAX_DAYS: '30', WORKER_POLL_MS: '100', WORKER_MAINTENANCE_MS: '400',
 });
 
 function startWorker() {
@@ -189,6 +227,15 @@ async function objectExists(key) {
   catch (error) { if (error.$metadata?.httpStatusCode === 404) return false; throw error; }
 }
 
+async function parsed(user, documentId, timeout = 20_000) {
+  let document;
+  await eventually(async () => {
+    document = (await request(`/api/documents/${documentId}`, { token: user.token })).body;
+    return !['PENDING', 'PROCESSING'].includes(document.status);
+  }, 'the worker should finish parsing', timeout);
+  return document;
+}
+
 const copyDeleted = (id) => async () => (await db.fileCopy.findUniqueOrThrow({ where: { id } })).state === 'DELETED';
 const compiled = (path) => import(new URL(`../apps/api/dist/${path}`, import.meta.url).href);
 
@@ -240,7 +287,9 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal(await documentCount(users.a), 0);
   });
 
-  test('level 2 keeps only an encrypted temporary copy, and the original cannot be downloaded', async () => {
+  test('level 2 keeps only an encrypted temporary copy, and the original cannot be downloaded', async (t) => {
+    await stopWorker();
+    t.after(() => { if (!worker || worker.exitCode !== null) startWorker(); });
     const content = text();
     const result = await upload(users.a, { name: 'Ghi chú thuê nhà.txt', data: content, type: 'text/plain' });
     assert.equal(result.status, 201);
@@ -260,7 +309,7 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal(copy.state, 'AVAILABLE');
     assert.match(copy.storageKey, new RegExp(`^web-source/${users.a.id}/[0-9a-f-]{36}$`));
     assert.match(copy.encryptionKeyRef, new RegExp(`^w1\\.${kekId}\\.`));
-    assert.ok(Math.abs(copy.expiresAt.getTime() - (Date.now() + 24 * 3_600_000)) < 60_000, 'expires in about 24 hours');
+    assert.ok(Math.abs(copy.expiresAt.getTime() - (Date.now() + 30 * 86_400_000)) < 60_000, 'kept at most 30 days');
     const stored = await object(copy.storageKey);
     assert.equal(stored.length, Number(copy.byteSize));
     assert.equal(sha256(stored), copy.sha256);
@@ -269,6 +318,18 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal((await request(`/api/documents/${document.id}/original`, { token: users.a.token })).status, 404);
     const detail = await request(`/api/documents/${document.id}`, { token: users.a.token });
     assert.deepEqual(detail.body, document);
+    startWorker();
+    const done = await parsed(users.a, document.id);
+    assert.equal(done.status, 'SUCCEEDED');
+    assert.equal(done.problem, null);
+    const chunks = await db.documentChunk.findMany({ where: { documentId: document.id }, orderBy: { ordinal: 'asc' } });
+    assert.equal(chunks.length, 1);
+    assert.equal(chunks[0].content, content.toString('utf8').trim());
+    const after = await db.documentVersion.findUniqueOrThrow({ where: { id: version.id } });
+    assert.equal(after.parserVersion, 'p2');
+    assert.equal(after.charCount, chunks[0].content.length);
+    await eventually(copyDeleted(copy.id), 'the temporary copy goes once the text is kept');
+    assert.equal(await objectExists(copy.storageKey), false);
   });
 
   test('identical content is deduplicated per user, including concurrent uploads', async () => {
@@ -334,6 +395,207 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal(fresh.status, 201);
     assert.notEqual(fresh.body.document.id, stale.document.id);
     assert.ok(Date.now() - started < 5_000, 'no waiting on an abandoned upload');
+  });
+
+  test('B4: PDF, DOCX and TXT are read by the worker; text is kept only from level 2, temporary copies go once processed', async () => {
+    const level2 = await createUser('parse-2');
+    const level1 = await createUser('parse-1', 'STRUCTURED_ONLY');
+    const level3 = await createUser('parse-3', 'ENCRYPTED_COPY');
+    const pdfDoc = (await upload(level2, { name: 'thue-nha.pdf', data: textPdf([['Hop dong thue nha so 12', 'Tien coc 16.000.000 VND'], ['Thoi han 12 thang']]) })).body.document;
+    const docxDoc = (await upload(level2, { name: 'bao-hanh.docx', data: docxWith(['Phiếu bảo hành', 'Bảo hành 12 tháng kể từ ngày giao hàng.']) })).body.document;
+    const privateDoc = (await upload(level1, { name: 'rieng.txt', data: text() })).body.document;
+    const originalDoc = (await upload(level3, { name: 'goc.txt', data: text() })).body.document;
+
+    assert.equal((await parsed(level2, pdfDoc.id)).status, 'SUCCEEDED');
+    const pdfVersion = await db.documentVersion.findFirstOrThrow({ where: { documentId: pdfDoc.id } });
+    assert.equal(pdfVersion.pageCount, 2);
+    const pdfChunks = await db.documentChunk.findMany({ where: { documentId: pdfDoc.id }, orderBy: { ordinal: 'asc' } });
+    assert.match(pdfChunks.map((chunk) => chunk.content).join(' '), /Tien coc 16\.000\.000 VND[\s\S]*Thoi han 12 thang/);
+    assert.equal(pdfChunks[0].pageFrom, 1);
+    assert.equal(pdfChunks.at(-1).pageTo, 2);
+    const [pdfCopy] = await copiesOf(pdfDoc.id);
+    await eventually(copyDeleted(pdfCopy.id), 'level 2: the temporary copy is deleted after parsing');
+
+    assert.equal((await parsed(level2, docxDoc.id)).status, 'SUCCEEDED');
+    const docxText = (await db.documentChunk.findMany({ where: { documentId: docxDoc.id } })).map((chunk) => chunk.content).join(' ');
+    assert.match(docxText, /Phiếu bảo hành\s+Bảo hành 12 tháng kể từ ngày giao hàng\./);
+
+    assert.equal((await parsed(level1, privateDoc.id)).status, 'SUCCEEDED');
+    assert.equal(await db.documentChunk.count({ where: { documentId: privateDoc.id } }), 0, 'level 1 keeps no text');
+    assert.ok((await db.documentVersion.findFirstOrThrow({ where: { documentId: privateDoc.id } })).charCount > 0);
+    const [privateCopy] = await copiesOf(privateDoc.id);
+    assert.equal(privateCopy.state, 'AVAILABLE', 'level 1 keeps the encrypted source for extraction, at most 30 days');
+
+    assert.equal((await parsed(level3, originalDoc.id)).status, 'SUCCEEDED');
+    assert.ok(await db.documentChunk.count({ where: { documentId: originalDoc.id } }) > 0);
+    const [original] = await copiesOf(originalDoc.id);
+    assert.equal(original.kind, 'ENCRYPTED_COPY');
+    assert.equal(original.state, 'AVAILABLE');
+    assert.equal((await request(`/api/documents/${originalDoc.id}/original`, { token: level3.token })).status, 200);
+    assert.equal(await db.aIJob.count({ where: { documentId: { in: [pdfDoc.id, docxDoc.id, privateDoc.id, originalDoc.id] }, kind: 'PARSE', status: { not: 'SUCCEEDED' } } }), 0);
+  });
+
+  test('B4: short notes and one-line PDFs are text, and emoji on a chunk boundary are stored intact', async () => {
+    const user = await createUser('parse-short');
+    const emoji = String.fromCodePoint(0x1F600);
+    const cases = [
+      ['hen.txt', Buffer.from('Hẹn trả cọc 30/11.', 'utf8'), 'Hẹn trả cọc 30/11.'],
+      ['mot-dong.pdf', textPdf([['Hen tra coc 30/11']]), 'Hen tra coc 30/11'],
+      ['emoji.txt', Buffer.from(`${'a'.repeat(1_199)}${emoji}${'b'.repeat(600)}`, 'utf8'), `${'a'.repeat(1_199)}${emoji}`],
+    ];
+    for (const [name, data, expected] of cases) {
+      const doc = (await upload(user, { name, data })).body.document;
+      const done = await parsed(user, doc.id);
+      assert.equal(done.status, 'SUCCEEDED', `${name}: ${done.problem}`);
+      const chunks = await db.documentChunk.findMany({ where: { documentId: doc.id }, orderBy: { ordinal: 'asc' } });
+      assert.ok(chunks.length > 0, name);
+      assert.ok(chunks.map((chunk) => chunk.content).join('').includes(expected.trim()), name);
+    }
+  });
+
+  test('B4: scans, legacy Vietnamese fonts and damaged files are kept with a reason instead of failing silently', async () => {
+    const user = await createUser('parse-bad');
+    const tcvn3 = 'Hîp ®ång thuª nhµ sè 12, tiÒn cäc. '.repeat(12);
+    const cases = [
+      ['scan.pdf', textPdf([[]]), 'NO_TEXT_LAYER'],
+      ['tcvn3.txt', Buffer.from(tcvn3, 'utf8'), 'LEGACY_VIETNAMESE_FONT'],
+      ['hong.pdf', pdf(4096), 'FILE_DAMAGED'],
+    ];
+    for (const [name, data, code] of cases) {
+      const doc = (await upload(user, { name, data })).body.document;
+      const done = await parsed(user, doc.id);
+      assert.equal(done.status, 'UNSUPPORTED', name);
+      assert.equal(done.problem, code, name);
+      assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), 0);
+      const [copy] = await copiesOf(doc.id);
+      await eventually(copyDeleted(copy.id), `${name}: an unusable temporary copy is not kept`);
+    }
+  });
+
+  test('B4: a newer parser version re-reads files it could not read before, while the stored copy still exists', async () => {
+    const user = await createUser('parse-version', 'ENCRYPTED_COPY');
+    const doc = (await upload(user, { name: 'scan-cu.pdf', data: textPdf([[]]) })).body.document;
+    assert.equal((await parsed(user, doc.id)).status, 'UNSUPPORTED');
+    const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: doc.id } });
+    assert.equal(version.parserVersion, 'p2');
+    await db.documentVersion.update({ where: { id: version.id }, data: { parserVersion: 'p1' } });
+    await eventually(async () => (await db.aIJob.count({ where: { versionId: version.id, kind: 'PARSE' } })) === 2, 'an older result is queued again');
+    const again = await parsed(user, doc.id);
+    assert.equal(again.status, 'UNSUPPORTED');
+    assert.equal(again.problem, 'NO_TEXT_LAYER');
+    assert.equal((await db.documentVersion.findUniqueOrThrow({ where: { id: version.id } })).parserVersion, 'p2');
+    await delay(1_500);
+    assert.equal(await db.aIJob.count({ where: { versionId: version.id, kind: 'PARSE' } }), 2, 'a current result is not read again');
+  });
+
+  test('B4: documents uploaded before parsing existed are picked up; a lost source fails, and uploading the file again revives it', async (t) => {
+    const user = await createUser('parse-backfill');
+    await stopWorker();
+    t.after(() => { if (!worker || worker.exitCode !== null) startWorker(); });
+    const waiting = (await upload(user, { name: 'cu.txt', data: text() })).body.document;
+    const lostContent = text();
+    const lost = (await upload(user, { name: 'mat.txt', data: lostContent })).body.document;
+    await db.aIJob.deleteMany({ where: { documentId: { in: [waiting.id, lost.id] } } });
+    const [lostCopy] = await copiesOf(lost.id);
+    await db.fileCopy.update({ where: { id: lostCopy.id }, data: { state: 'DELETE_PENDING', deleteRequestedAt: new Date() } });
+    await db.documentVersion.updateMany({ where: { documentId: lost.id }, data: { createdAt: new Date(Date.now() - 2 * 3_600_000) } });
+    startWorker();
+    assert.equal((await parsed(user, waiting.id)).status, 'SUCCEEDED', 'housekeeping queues documents that never got a job');
+    const failed = await parsed(user, lost.id);
+    assert.equal(failed.status, 'FAILED');
+    assert.equal(failed.problem, 'SOURCE_UNAVAILABLE');
+    const again = await upload(user, { name: 'mat.txt', data: lostContent });
+    assert.equal(again.status, 201);
+    assert.equal(again.body.duplicate, false);
+    assert.equal(again.body.document.id, lost.id, 'the same document gets its file back');
+    assert.equal((await parsed(user, lost.id)).status, 'SUCCEEDED');
+    assert.equal(await db.documentVersion.count({ where: { documentId: lost.id } }), 1);
+    const duplicate = await upload(user, { name: 'mat.txt', data: lostContent });
+    assert.equal(duplicate.status, 200);
+    assert.equal(duplicate.body.duplicate, true);
+  });
+
+  test('B4: a document that failed to parse while its file is still stored is retried by uploading the same file again', async () => {
+    const user = await createUser('parse-retry', 'ENCRYPTED_COPY');
+    const content = text();
+    const doc = (await upload(user, { name: 'thu-lai.txt', data: content })).body.document;
+    assert.equal((await parsed(user, doc.id)).status, 'SUCCEEDED');
+    await db.documentChunk.deleteMany({ where: { documentId: doc.id } });
+    await db.documentVersion.updateMany({ where: { documentId: doc.id }, data: { parseState: 'FAILED', parseErrorCode: 'SOURCE_UNREADABLE' } });
+    const failed = (await request(`/api/documents/${doc.id}`, { token: user.token })).body;
+    assert.equal(failed.status, 'FAILED');
+    assert.equal(failed.problem, 'SOURCE_UNREADABLE');
+    const again = await upload(user, { name: 'thu-lai.txt', data: content });
+    assert.equal(again.status, 200);
+    assert.equal(again.body.duplicate, true);
+    assert.equal(again.body.document.id, doc.id);
+    assert.equal(again.body.document.status, 'PENDING');
+    assert.equal((await parsed(user, doc.id)).status, 'SUCCEEDED');
+    assert.ok(await db.documentChunk.count({ where: { documentId: doc.id } }) > 0);
+    assert.equal(await db.fileCopy.count({ where: { documentId: doc.id } }), 1, 'no second copy of the file');
+  });
+
+  const deadParseJob = (user, documentId, versionId) => db.aIJob.create({
+    data: {
+      userId: user.id, kind: 'PARSE', documentId, versionId, status: 'DEAD', attempts: 3, maxAttempts: 3,
+      lastErrorCode: 'PARSER_CRASHED', idempotencyKey: `parse:${versionId}:old:${randomUUID()}`,
+      createdAt: new Date(Date.now() - 3_600_000), finishedAt: new Date(Date.now() - 3_600_000),
+    },
+  });
+
+  test('B4 review: an old dead job does not fail a version that a newer parser or a fresh job is re-reading', async () => {
+    const user = users.c;
+    const doc = (await upload(user, { name: 'scan-chet.pdf', data: textPdf([[]]) })).body.document;
+    assert.equal((await parsed(user, doc.id)).status, 'UNSUPPORTED');
+    const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: doc.id } });
+    await deadParseJob(user, doc.id, version.id);
+    await db.documentVersion.update({ where: { id: version.id }, data: { parserVersion: 'p1' } });
+    await eventually(async () => (await db.aIJob.count({ where: { versionId: version.id, kind: 'PARSE', status: { not: 'DEAD' } } })) === 2,
+      'the older result is queued again');
+    const again = await parsed(user, doc.id);
+    assert.equal(again.status, 'UNSUPPORTED', 'an old dead job must not turn the re-read into FAILED');
+    assert.equal(again.problem, 'NO_TEXT_LAYER');
+    assert.equal((await db.documentVersion.findUniqueOrThrow({ where: { id: version.id } })).parserVersion, 'p2');
+  });
+
+  test('B4 review: a version whose file is being uploaded again is not failed by an old dead job', async () => {
+    const user = users.c;
+    const doc = (await upload(user, { name: 'dang-tai.txt', data: text() })).body.document;
+    assert.equal((await parsed(user, doc.id)).status, 'SUCCEEDED');
+    const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: doc.id } });
+    const [copy] = await copiesOf(doc.id);
+    await deadParseJob(user, doc.id, version.id);
+    await db.fileCopy.update({ where: { id: copy.id }, data: { state: 'UPLOADING', createdAt: new Date() } });
+    await db.documentVersion.update({ where: { id: version.id }, data: { parseState: 'PENDING', parseErrorCode: null } });
+    await delay(1_500);
+    const during = await db.documentVersion.findUniqueOrThrow({ where: { id: version.id } });
+    assert.equal(during.parseState, 'PENDING', 'housekeeping waits for the upload instead of reusing the old error');
+    await db.documentVersion.update({ where: { id: version.id }, data: { parseState: 'SUCCEEDED' } });
+    await db.fileCopy.update({ where: { id: copy.id }, data: { state: 'AVAILABLE' } });
+  });
+
+  test('B4 review: uploading a lost file again keeps the document\'s own lower level (no encrypted original, no quota)', async () => {
+    const user = users.c;
+    const content = text();
+    const doc = (await upload(user, { name: 'muc-rieng.txt', data: content })).body.document;
+    assert.equal((await parsed(user, doc.id)).status, 'SUCCEEDED');
+    const lowered = await request(`/api/documents/${doc.id}`, { method: 'PATCH', token: user.token, body: { privacyLevel: 'STRUCTURED_ONLY' } });
+    assert.equal(lowered.status, 200);
+    const [original] = await copiesOf(doc.id);
+    await eventually(copyDeleted(original.id), 'the original is removed when the document goes to level 1');
+    await db.documentVersion.updateMany({ where: { documentId: doc.id }, data: { parseState: 'FAILED', parseErrorCode: 'SOURCE_UNAVAILABLE' } });
+    const before = (await request('/api/documents/usage', { token: user.token })).body.encryptedBytes;
+    const again = await upload(user, { name: 'muc-rieng.txt', data: content });
+    assert.equal(again.status, 201);
+    assert.equal(again.body.document.id, doc.id);
+    assert.equal(again.body.document.privacyLevel, 'STRUCTURED_ONLY');
+    assert.equal(again.body.document.originalAvailable, false);
+    const revived = (await copiesOf(doc.id)).filter((copy) => copy.id !== original.id);
+    assert.equal(revived.length, 1);
+    assert.equal(revived[0].kind, 'WEB_SOURCE', 'a level-1 document never gets an encrypted original back');
+    assert.equal((await request('/api/documents/usage', { token: user.token })).body.encryptedBytes, before);
+    assert.equal((await parsed(user, doc.id)).status, 'SUCCEEDED');
+    assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), 0);
   });
 
   test('the type comes from the bytes; size, emptiness and the multipart shape are enforced', async (t) => {
@@ -411,7 +673,9 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.match(disposition, /filename="Bien ban ban giao\.txt"; filename\*=UTF-8''Bi%C3%AAn%20b%E1%BA%A3n%20b%C3%A0n%20giao\.txt/);
   });
 
-  test('files up to 50 MiB are accepted and stored encrypted', async () => {
+  test('files up to 50 MiB are accepted and stored encrypted', async (t) => {
+    await stopWorker();
+    t.after(() => { if (!worker || worker.exitCode !== null) startWorker(); });
     const user = await createUser('large');
     const content = pdf(50 * MiB - 64);
     const result = await upload(user, { name: 'lon.pdf', data: content, type: 'application/pdf' });
@@ -422,6 +686,11 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     const stored = await object(copy.storageKey);
     assert.ok(stored.length > content.length, 'ciphertext with header and tags');
     assert.equal(stored.includes(content.subarray(1_000_000, 1_000_064)), false);
+    startWorker();
+    const done = await parsed(user, result.body.document.id, 60_000);
+    assert.equal(done.status, 'UNSUPPORTED');
+    assert.equal(done.problem, 'FILE_DAMAGED');
+    await eventually(copyDeleted(copy.id), 'an unreadable temporary copy is not kept', 30_000);
   });
 
   test('tampered ciphertext and swapped key references never yield plaintext', async () => {
@@ -490,6 +759,85 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal((await request(`/api/documents/${doc.id}/original`, { method: 'DELETE', token: users.c.token })).status, 404);
   });
 
+  test('B5: deleting a document hides it everywhere, purges its text and copies, keeps the record, and the file can be uploaded again', async () => {
+    const body = text();
+    const doc = (await upload(users.c, { name: 'xoa-tai-lieu.txt', data: body })).body.document;
+    assert.equal((await parsed(users.c, doc.id)).status, 'SUCCEEDED');
+    const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: doc.id } });
+    const [copy] = await copiesOf(doc.id);
+    assert.ok(await db.documentChunk.count({ where: { documentId: doc.id } }) > 0);
+    const metadata = await db.extractedMetadata.create({ data: {
+      userId: users.c.id, documentId: doc.id, versionId: version.id, modelId: 'test', promptVersion: 'p1', schemaVersion: 1,
+      summary: 'Hợp đồng thuê nhà.', fields: { deposit: '16000000' }, evidence: { deposit: { quote: 'tiền cọc', charStart: 0, charEnd: 8 } },
+    } });
+    const extract = await db.aIJob.create({ data: { userId: users.c.id, kind: 'EXTRACT', documentId: doc.id, versionId: version.id, idempotencyKey: `extract:${doc.id}` } });
+    const usageBefore = (await request('/api/documents/usage', { token: users.c.token })).body.encryptedBytes;
+
+    assert.equal((await request(`/api/documents/${doc.id}`, { method: 'DELETE', token: users.a.token })).status, 404, 'other users cannot delete it');
+    assert.equal((await request(`/api/documents/${doc.id}`, { method: 'DELETE', token: users.c.token, requestOrigin: 'https://evil.example' })).status, 403);
+    const removed = await request(`/api/documents/${doc.id}`, { method: 'DELETE', token: users.c.token });
+    assert.equal(removed.status, 204);
+
+    for (const [path, method] of [['', 'GET'], ['/original', 'GET'], ['/preview', 'GET'], ['', 'DELETE'], ['/original', 'DELETE']]) {
+      assert.equal((await request(`/api/documents/${doc.id}${path}`, { method, token: users.c.token })).status, 404, `${method} ${path || '/'} is locked`);
+    }
+    assert.equal((await request(`/api/documents/${doc.id}`, { method: 'PATCH', token: users.c.token, body: { privacyLevel: null } })).status, 404);
+    const listed = (await request('/api/documents?limit=50', { token: users.c.token })).body.items;
+    assert.equal(listed.some((item) => item.id === doc.id), false, 'the list no longer shows it');
+
+    const row = await db.document.findUniqueOrThrow({ where: { id: doc.id } });
+    assert.ok(row.deletedAt, 'the record stays, marked deleted');
+    assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), 0, 'text is purged at once');
+    const purged = await db.extractedMetadata.findUniqueOrThrow({ where: { id: metadata.id } });
+    assert.equal(purged.summary, null);
+    assert.deepEqual(purged.fields, { deposit: '16000000' }, 'structured data stays');
+    assert.deepEqual(purged.evidence, { deposit: { charStart: 0, charEnd: 8 } });
+    assert.equal((await db.aIJob.findUniqueOrThrow({ where: { id: extract.id } })).status, 'CANCELLED');
+    assert.notEqual((await db.fileCopy.findUniqueOrThrow({ where: { id: copy.id } })).state, 'AVAILABLE');
+    assert.equal((await request('/api/documents/usage', { token: users.c.token })).body.encryptedBytes, usageBefore - Number(copy.byteSize), 'quota is freed at once');
+    await eventually(copyDeleted(copy.id), 'the worker should delete the stored copy');
+    assert.equal(await objectExists(copy.storageKey), false);
+    await assert.rejects(db.documentChunk.create({ data: {
+      userId: users.c.id, documentId: doc.id, versionId: version.id, ordinal: 0, content: 'sống lại?', charStart: 0, charEnd: 9, chunkerVersion: 'c1',
+    } }), /text cannot be stored/);
+
+    const again = await upload(users.c, { name: 'xoa-tai-lieu.txt', data: body });
+    assert.equal(again.status, 201, 'the same file can be uploaded again as a new document');
+    assert.notEqual(again.body.document.id, doc.id);
+    assert.equal((await parsed(users.c, again.body.document.id)).status, 'SUCCEEDED');
+  });
+
+  test('B5: a document deleted while its parse job waits is never parsed back', async () => {
+    const doc = (await upload(users.a, { name: 'xoa-khi-dang-doc.txt', data: text() })).body.document;
+    assert.equal((await request(`/api/documents/${doc.id}`, { method: 'DELETE', token: users.a.token })).status, 204);
+    const jobs = await db.aIJob.findMany({ where: { documentId: doc.id, kind: 'PARSE' } });
+    assert.ok(jobs.length > 0);
+    for (const job of jobs) assert.ok(['CANCELLED', 'SUCCEEDED'].includes(job.status), `parse job is ${job.status}`);
+    for (const copy of await copiesOf(doc.id)) await eventually(copyDeleted(copy.id), 'the temporary copy should be deleted');
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), 0);
+  });
+
+  test('DOCX preview: level 3 owners get escaped HTML under a sandbox policy; other files, levels and users get 404', async () => {
+    const docx = (await upload(users.c, { name: 'xem-truoc.docx', data: docxWith(['Hợp đồng thuê nhà', '&lt;script&gt;alert(1)&lt;/script&gt;', randomUUID()]) })).body.document;
+    const preview = await request(`/api/documents/${docx.id}/preview`, { token: users.c.token });
+    assert.equal(preview.status, 200);
+    assert.match(preview.headers.get('content-type'), /^text\/html; charset=utf-8/);
+    assert.match(preview.headers.get('content-security-policy'), /default-src 'none'.*sandbox/);
+    assert.equal(preview.headers.get('cache-control'), 'private, no-store');
+    const html = preview.raw.toString('utf8');
+    assert.ok(html.includes('<p>Hợp đồng thuê nhà</p>'));
+    assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'));
+    assert.doesNotMatch(html, /<script/);
+    assert.equal((await request(`/api/documents/${docx.id}/preview`, { token: users.a.token })).status, 404, 'other users');
+    const txt = (await upload(users.c, { name: 'khong-phai-docx.txt', data: text() })).body.document;
+    assert.equal((await request(`/api/documents/${txt.id}/preview`, { token: users.c.token })).status, 404, 'only DOCX');
+    const level2 = (await upload(users.a, { name: 'muc-2.docx', data: docxWith(['Mức 2', randomUUID()]) })).body.document;
+    assert.equal((await request(`/api/documents/${level2.id}/preview`, { token: users.a.token })).status, 404, 'no original below level 3');
+    const broken = (await upload(users.c, { name: 'hong.docx', data: brokenDocx() })).body.document;
+    assert.equal((await request(`/api/documents/${broken.id}/preview`, { token: users.c.token })).status, 422);
+  });
+
   test('P6 3→2: lowering the account level drops every original in the same request; the worker deletes the blobs', async () => {
     const user = await createUser('downgrade3', 'ENCRYPTED_COPY');
     const docs = [];
@@ -515,7 +863,8 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     const user = await createUser('downgrade2');
     const doc = (await upload(user, { name: 'hop-dong.txt', data: text() })).body.document;
     const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: doc.id } });
-    await db.documentChunk.create({ data: { userId: user.id, documentId: doc.id, versionId: version.id, ordinal: 0, content: 'Tiền cọc 16.000.000', charStart: 0, charEnd: 19, chunkerVersion: 'v1' } });
+    assert.equal((await parsed(user, doc.id)).status, 'SUCCEEDED');
+    assert.ok(await db.documentChunk.count({ where: { documentId: doc.id } }) > 0, 'level 2 keeps the text');
     const metadata = await db.extractedMetadata.create({ data: {
       userId: user.id, documentId: doc.id, versionId: version.id, modelId: 'test', promptVersion: 'p1', schemaVersion: 1,
       summary: 'Hợp đồng thuê nhà 12 tháng.', fields: { deposit: '16000000' },

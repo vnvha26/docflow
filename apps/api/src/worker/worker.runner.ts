@@ -5,13 +5,16 @@ import { API_CONFIG, ApiConfig } from '../config';
 import { ClaimedJob, JobQueue } from '../jobs/job-queue.service';
 import { PrivacyPolicyChangedError, RetentionService } from '../retention/retention.service';
 import { MaintenanceService } from '../retention/maintenance.service';
+import { ParseService } from '../parsing/parse.service';
 
 type Handler = (job: ClaimedJob) => Promise<void>;
+type DeadHandler = (job: ClaimedJob, code: string) => Promise<void>;
 
 @Injectable()
 export class WorkerRunner {
   private readonly logger = new Logger(WorkerRunner.name);
   private readonly handlers: Partial<Record<JobKind, Handler>>;
+  private readonly onDead: Partial<Record<JobKind, DeadHandler>>;
   private stopping = false;
   private wake: AbortController | null = null;
 
@@ -19,10 +22,15 @@ export class WorkerRunner {
     @Inject(JobQueue) private readonly jobs: JobQueue,
     @Inject(RetentionService) private readonly retention: RetentionService,
     @Inject(MaintenanceService) private readonly maintenance: MaintenanceService,
+    @Inject(ParseService) private readonly parser: ParseService,
     @Inject(API_CONFIG) private readonly config: ApiConfig,
   ) {
     this.handlers = {
       PURGE: (job) => this.retention.purgeUser(job.userId),
+      PARSE: (job) => this.parser.handle(job),
+    };
+    this.onDead = {
+      PARSE: (job, code) => this.parser.markFailed(job, code),
     };
   }
 
@@ -42,12 +50,13 @@ export class WorkerRunner {
         : error instanceof Error && /^[A-Z_]{3,64}$/.test(error.message) ? error.message : 'HANDLER_FAILED';
       const outcome = await this.jobs.fail(job, code).catch(() => 'lost' as const);
       if (outcome !== 'retry') this.logger.warn(`Job ${job.kind} ${job.id}: ${code} (${outcome}).`);
+      if (outcome === 'dead') await this.onDead[job.kind]?.(job, code).catch(() => undefined);
     }
   }
 
   async tick(): Promise<number> {
     await this.jobs.reapExpired();
-    const claimed = await this.jobs.claim(Object.keys(this.handlers) as JobKind[]);
+    const claimed = await this.jobs.claim(Object.keys(this.handlers) as JobKind[], 1);
     for (const job of claimed) await this.runJob(job);
     return claimed.length;
   }

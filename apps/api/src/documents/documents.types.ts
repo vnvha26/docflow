@@ -11,6 +11,7 @@ export interface DocumentSummary {
   typeCode: string | null;
   privacyLevel: PrivacyLevel;
   status: ParseState;
+  problem: string | null;
   file: { name: string; mimeType: string; byteSize: number };
   privacyOverride: PrivacyLevel | null;
   originalAvailable: boolean;

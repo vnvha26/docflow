@@ -8,6 +8,7 @@ import { JobQueue } from '../jobs/job-queue.service';
 import { ObjectStorage } from '../storage/object-storage';
 
 const TEXT_JOBS: JobKind[] = ['SUMMARIZE', 'EMBED'];
+const DOCUMENT_JOBS: JobKind[] = ['PARSE', 'CLASSIFY', 'EXTRACT', 'SUMMARIZE', 'EMBED'];
 
 export class PrivacyPolicyChangedError extends ConflictException {
   constructor() { super('Mức lưu trữ của tài liệu đã thay đổi; dữ liệu này không còn được giữ.'); }
@@ -25,13 +26,14 @@ export class RetentionService {
     @Inject(JobQueue) private readonly jobs: JobQueue,
   ) {}
 
-  async assertMayStore(transaction: Prisma.TransactionClient, userId: string, documentId: string, minimum: PrivacyLevel): Promise<void> {
+  async assertMayStore(transaction: Prisma.TransactionClient, userId: string, documentId: string, minimum: PrivacyLevel): Promise<PrivacyLevel> {
     await lockUserFiles(transaction, userId);
     const rows = await transaction.$queryRaw<{ level: PrivacyLevel }[]>`
       SELECT LEAST(u."privacyLevel", COALESCE(d."privacyLevel", u."privacyLevel")) AS level
       FROM "Document" d JOIN "User" u ON u."id" = d."userId"
       WHERE d."id" = ${documentId}::uuid AND d."userId" = ${userId}::uuid AND d."deletedAt" IS NULL`;
     if (!rows[0] || RANK[rows[0].level] < RANK[minimum]) throw new PrivacyPolicyChangedError();
+    return rows[0].level;
   }
 
   async enforceAccount(transaction: Prisma.TransactionClient, userId: string, previous: PrivacyLevel, next: PrivacyLevel): Promise<void> {
@@ -71,6 +73,24 @@ export class RetentionService {
     });
   }
 
+  async deleteDocument(userId: string, documentId: string): Promise<void> {
+    await this.prisma.$transaction(async (transaction) => {
+      await lockUserFiles(transaction, userId);
+      const deleted = await transaction.document.updateMany({
+        where: { id: documentId, userId, deletedAt: null },
+        data: { deletedAt: new Date(), revision: { increment: 1 } },
+      });
+      if (deleted.count === 0) throw new NotFoundException('Không tìm thấy tài liệu.');
+      const copies = await transaction.fileCopy.updateMany({
+        where: { userId, documentId, state: { in: ['UPLOADING', 'AVAILABLE'] } },
+        data: { state: 'DELETE_PENDING', deleteRequestedAt: new Date(), revision: { increment: 1 } },
+      });
+      await this.jobs.cancel(transaction, { userId, kinds: DOCUMENT_JOBS, documentId });
+      const text = await this.purgeText(transaction, userId);
+      if (copies.count > 0 || text > 0) await this.queuePurge(transaction, userId);
+    });
+  }
+
   private async enforce(transaction: Prisma.TransactionClient, userId: string, documentId?: string): Promise<void> {
     const onlyDocument = documentId ? Prisma.sql`AND d."id" = ${documentId}::uuid` : Prisma.empty;
     const originals = await transaction.$executeRaw`
@@ -91,7 +111,7 @@ export class RetentionService {
 
   async purgeText(db: Prisma.TransactionClient, userId: string): Promise<number> {
     const level1 = Prisma.sql`d."userId" = ${userId}::uuid
-      AND LEAST(u."privacyLevel", COALESCE(d."privacyLevel", u."privacyLevel")) = 'STRUCTURED_ONLY'`;
+      AND (d."deletedAt" IS NOT NULL OR LEAST(u."privacyLevel", COALESCE(d."privacyLevel", u."privacyLevel")) = 'STRUCTURED_ONLY')`;
     const chunks = await db.$executeRaw`
       DELETE FROM "DocumentChunk" c USING "Document" d JOIN "User" u ON u."id" = d."userId"
       WHERE c."documentId" = d."id" AND ${level1}`;

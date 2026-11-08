@@ -17,7 +17,7 @@ before(async () => {
   db = new PGlite();
   const dirs = (await readdir(MIGRATIONS, { withFileTypes: true }))
     .filter((d) => d.isDirectory()).map((d) => d.name).sort();
-  assert.equal(dirs.length, 7);
+  assert.equal(dirs.length, 9);
   for (const dir of dirs) await db.exec(await readFile(new URL(`${dir}/migration.sql`, MIGRATIONS), 'utf8'));
   await db.exec(`INSERT INTO "DocumentType" ("code","name","pathTemplate","fieldSchema")
                  VALUES ('RENTAL_CONTRACT','Hợp đồng thuê nhà','Hợp đồng/Thuê nhà/{year}','{"type":"object"}')`);
@@ -335,3 +335,43 @@ test('at most one waiting purge per user; finished purges do not block a new one
   await db.query(`INSERT INTO "AIJob" ("userId","kind","idempotencyKey") VALUES ($1,'PURGE','p2')`, [a.user]);
 });
 
+test('parsed text: chunks are non-empty ranges with consistent pages; a parsed version records its parser and size', async () => {
+  const a = await seedUser('a');
+  const chunk = (ordinal, content, start, end, pageFrom = null, pageTo = null) => db.query(
+    `INSERT INTO "DocumentChunk" ("userId","documentId","versionId","ordinal","content","charStart","charEnd","pageFrom","pageTo","chunkerVersion")
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'c1')`, [a.user, a.doc, a.version, ordinal, content, start, end, pageFrom, pageTo]);
+  await chunk(1, 'Tiền cọc', 30, 38, 1, 2);
+  for (const [values, constraint] of [
+    [[2, 'x', 5, 5], 'DocumentChunk_range_check'],
+    [[2, '', 5, 9], 'DocumentChunk_range_check'],
+    [[2, 'quá dài', 0, 3], 'DocumentChunk_range_check'],
+    [[2, 'x', -1, 0], 'DocumentChunk_range_check'],
+    [[2, 'x', 0, 1, 2, null], 'DocumentChunk_pages_check'],
+    [[2, 'x', 0, 1, 3, 2], 'DocumentChunk_pages_check'],
+    [[2, 'x', 0, 1, 0, 1], 'DocumentChunk_pages_check'],
+  ]) {
+    const [ordinal, content, start, end, pageFrom = null, pageTo = null] = values;
+    await rejects(`INSERT INTO "DocumentChunk" ("userId","documentId","versionId","ordinal","content","charStart","charEnd","pageFrom","pageTo","chunkerVersion")
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'c1')`, [a.user, a.doc, a.version, ordinal, content, start, end, pageFrom, pageTo], constraint);
+  }
+  await rejects(`UPDATE "DocumentVersion" SET "parseState" = 'SUCCEEDED' WHERE "id" = $1`, [a.version], 'DocumentVersion_parse_result_check');
+  await rejects(`UPDATE "DocumentVersion" SET "parseState" = 'SUCCEEDED', "parserVersion" = 'p1', "charCount" = 10, "parseErrorCode" = 'X' WHERE "id" = $1`,
+    [a.version], 'DocumentVersion_parse_result_check');
+  await db.query(`UPDATE "DocumentVersion" SET "parseState" = 'SUCCEEDED', "parserVersion" = 'p1', "charCount" = 10, "pageCount" = 2 WHERE "id" = $1`, [a.version]);
+  await db.query(`UPDATE "DocumentVersion" SET "parseState" = 'UNSUPPORTED', "parseErrorCode" = 'NO_TEXT_LAYER', "charCount" = NULL WHERE "id" = $1`, [a.version]);
+});
+
+test('a deleted document stays deleted and never receives new text or live stored copies', async () => {
+  const a = await seedUser('a');
+  const live = [a.user, a.doc, a.version, 'ENCRYPTED_COPY', 'AVAILABLE', 'encrypted/a/live', 10, hex('c'), 'v1.k.x', null, null, null];
+  await db.query(copySql, live);
+  await db.query(`UPDATE "Document" SET "deletedAt" = now() WHERE "id" = $1`, [a.doc]);
+  await rejects(`UPDATE "Document" SET "deletedAt" = NULL WHERE "id" = $1`, [a.doc], /cannot be restored/);
+  await rejects(`INSERT INTO "DocumentChunk" ("userId","documentId","versionId","ordinal","content","charStart","charEnd","chunkerVersion")
+                 VALUES ($1,$2,$3,9,'sống lại?',0,9,'c1')`, [a.user, a.doc, a.version], /text cannot be stored/);
+  await rejects(copySql, [a.user, a.doc, a.version, 'WEB_SOURCE', 'UPLOADING', 'web-source/a/new', 10, null, null, new Date(), null, null], /live stored copy/);
+  await db.query(`UPDATE "FileCopy" SET "state" = 'DELETE_PENDING', "deleteRequestedAt" = now() WHERE "storageKey" = 'encrypted/a/live'`);
+  await rejects(`UPDATE "FileCopy" SET "state" = 'AVAILABLE', "deleteRequestedAt" = NULL WHERE "storageKey" = 'encrypted/a/live'`, [], /live stored copy/);
+  await db.query(`UPDATE "FileCopy" SET "state" = 'DELETED', "deletedAt" = now() WHERE "storageKey" = 'encrypted/a/live'`);
+  await db.query(`UPDATE "Document" SET "title" = 'Đã xóa' WHERE "id" = $1`, [a.doc]);
+});

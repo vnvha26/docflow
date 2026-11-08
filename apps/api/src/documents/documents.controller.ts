@@ -4,9 +4,9 @@ import {
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import {
-  ApiAcceptedResponse, ApiBearerAuth, ApiBody, ApiConflictResponse, ApiConsumes, ApiCreatedResponse, ApiNotFoundResponse, ApiOkResponse, ApiOperation,
-  ApiPayloadTooLargeResponse, ApiProduces, ApiTags, ApiTooManyRequestsResponse, ApiUnauthorizedResponse,
-  ApiUnsupportedMediaTypeResponse,
+  ApiAcceptedResponse, ApiBearerAuth, ApiBody, ApiConflictResponse, ApiConsumes, ApiCreatedResponse, ApiNoContentResponse, ApiNotFoundResponse,
+  ApiOkResponse, ApiOperation, ApiPayloadTooLargeResponse, ApiProduces, ApiTags, ApiTooManyRequestsResponse, ApiUnauthorizedResponse,
+  ApiUnprocessableEntityResponse, ApiUnsupportedMediaTypeResponse,
 } from '@nestjs/swagger';
 import { Response } from 'express';
 import { memoryStorage } from 'multer';
@@ -103,6 +103,31 @@ export class DocumentsController {
     const userId = request.auth!.user.id;
     await this.retention.setDocumentLevel(userId, id, body.privacyLevel);
     return this.documents.get(userId, id);
+  }
+
+  @Delete(':id')
+  @HttpCode(204)
+  @ApiOperation({ summary: 'B5: xóa mềm tài liệu. Ẩn khỏi danh sách, khóa mọi đường dẫn, xóa nội dung chữ ngay; bản lưu được worker xóa sau đó.' })
+  @ApiNoContentResponse()
+  @ApiNotFoundResponse({ description: 'Không phải tài liệu của bạn hoặc đã bị xóa.' })
+  async remove(@Param('id', new ParseUUIDPipe()) id: string, @Req() request: AuthRequest): Promise<void> {
+    await this.retention.deleteDocument(request.auth!.user.id, id);
+  }
+
+  @Get(':id/preview')
+  @ApiOperation({ summary: 'Bản xem HTML của tệp DOCX (chỉ mức 3 còn bản gốc). Không giữ bố cục trang như Word.' })
+  @ApiProduces('text/html')
+  @ApiOkResponse({ schema: { type: 'string' } })
+  @ApiNotFoundResponse({ description: 'Không phải DOCX của bạn, không ở mức 3 hoặc không còn bản gốc.' })
+  @ApiUnprocessableEntityResponse({ description: 'Không tạo được bản xem cho tệp này.' })
+  async preview(@Param('id', new ParseUUIDPipe()) id: string, @Req() request: AuthRequest, @Res() response: Response): Promise<void> {
+    const html = await this.documents.preview(request.auth!.user.id, id);
+    response.status(200).set({
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'private, no-store',
+      'Content-Security-Policy': "default-src 'none'; img-src data:; style-src 'unsafe-inline'; sandbox",
+      'X-Content-Type-Options': 'nosniff',
+    }).send(html);
   }
 
   @Delete(':id/original')

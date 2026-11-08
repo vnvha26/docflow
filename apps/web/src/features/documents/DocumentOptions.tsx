@@ -7,11 +7,12 @@ interface Props {
   document: DocumentSummary;
   accountLevel: PrivacyLevel;
   onChange: (next: DocumentSummary) => void;
+  onRemove: () => void;
 }
 
-export function DocumentOptions({ document, accountLevel, onChange }: Props) {
+export function DocumentOptions({ document, accountLevel, onChange, onRemove }: Props) {
   const [choice, setChoice] = useState<PrivacyLevel | 'ACCOUNT'>(document.privacyOverride ?? 'ACCOUNT');
-  const [pending, setPending] = useState<'level' | 'delete' | null>(null);
+  const [pending, setPending] = useState<'level' | 'delete' | 'remove' | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const target: PrivacyLevel = choice === 'ACCOUNT' ? accountLevel : choice;
@@ -51,6 +52,19 @@ export function DocumentOptions({ document, accountLevel, onChange }: Props) {
     } finally { setSaving(false); }
   }
 
+  async function remove() {
+    setSaving(true); setError('');
+    try {
+      await documentsApi.remove(document.id);
+      onRemove();
+    } catch (failure) {
+      if (failure instanceof StaleSessionError) return;
+      if (failure instanceof ApiError && failure.status === 404) { onRemove(); return; }
+      setError(failure instanceof ApiError ? failure.message : 'Chưa thể xóa tài liệu.');
+      setSaving(false);
+    }
+  }
+
   return <details ref={menu} className="document-menu" onToggle={toggled}>
     <summary aria-label={`Tùy chọn cho ${document.title}`}>Tùy chọn</summary>
     <div className="document-menu-body">
@@ -76,6 +90,15 @@ export function DocumentOptions({ document, accountLevel, onChange }: Props) {
             </div></>
           : <button type="button" className="text-button danger" onClick={() => { setPending('delete'); setError(''); }}>Xóa bản gốc…</button>}
       </div>}
+      <div className="menu-danger">
+        {pending === 'remove'
+          ? <><p>Xóa tài liệu “{document.title}”? Tài liệu biến mất khỏi danh sách, nội dung chữ và mọi bản lưu (kể cả bản gốc mã hóa) bị xóa. Thông tin đã xác nhận và việc cần làm liên kết vẫn được giữ. Không thể hoàn tác.</p>
+            <div className="menu-row">
+              <button type="button" className="button-danger" disabled={saving} onClick={remove}>{saving ? 'Đang xóa…' : 'Xóa tài liệu'}</button>
+              <button type="button" className="text-button" disabled={saving} onClick={() => setPending(null)}>Giữ lại</button>
+            </div></>
+          : <button type="button" className="text-button danger" onClick={() => { setPending('remove'); setError(''); }}>Xóa tài liệu…</button>}
+      </div>
       {error && <p className="field-error" role="alert">{error}</p>}
     </div>
   </details>;

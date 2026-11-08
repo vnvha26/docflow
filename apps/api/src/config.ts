@@ -112,7 +112,7 @@ export function readConfig(env: NodeJS.ProcessEnv): ApiConfig {
   }
   const files: FilesConfig = {
     keks: parseKeks(env.FILE_KEKS),
-    webSourceTtlMs: positiveNumber(env.WEB_SOURCE_TTL_HOURS, 24, 'WEB_SOURCE_TTL_HOURS') * 3_600_000,
+    webSourceTtlMs: positiveNumber(env.WEB_SOURCE_MAX_DAYS, 30, 'WEB_SOURCE_MAX_DAYS') * 86_400_000,
     encryptedQuotaBytes: Math.floor(positiveNumber(env.ENCRYPTED_QUOTA_MB, 1024, 'ENCRYPTED_QUOTA_MB') * 1024 * 1024),
   };
   const worker: WorkerConfig = {

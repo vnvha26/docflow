@@ -4,7 +4,8 @@ import { Link } from 'react-router-dom';
 import { Icon } from '../../components/Brand';
 import { ApiError, StaleSessionError } from '../../lib/api';
 import type { User } from '../../lib/api';
-import { documentsApi, formatBytes, MAX_UPLOAD_MB, precheck, privacyLabels } from '../../lib/documents';
+import { documentsApi, DOCX_MIME, formatBytes, isProcessing, MAX_UPLOAD_MB, precheck, privacyLabels, problemMessage } from '../../lib/documents';
+import { showDocx } from './docx-viewer';
 import type { DocumentSummary, StorageUsage } from '../../lib/documents';
 import { DocumentOptions } from './DocumentOptions';
 import './documents.css';
@@ -13,15 +14,29 @@ interface UploadItem { key: string; name: string; state: 'waiting' | 'uploading'
 
 const dateFormat = new Intl.DateTimeFormat('vi-VN', { dateStyle: 'medium', timeStyle: 'short' });
 const statusLabels: Record<DocumentSummary['status'], string> = {
-  PENDING: 'Chờ xử lý', PROCESSING: 'Đang xử lý', SUCCEEDED: 'Đã xử lý', FAILED: 'Xử lý lỗi', UNSUPPORTED: 'Không đọc được',
+  PENDING: 'Chờ đọc nội dung', PROCESSING: 'Đang đọc nội dung', SUCCEEDED: 'Đã đọc nội dung', FAILED: 'Chưa đọc được', UNSUPPORTED: 'Không đọc được',
 };
+const statusClasses: Record<DocumentSummary['status'], string> = {
+  PENDING: 'tag tag-waiting', PROCESSING: 'tag tag-waiting', SUCCEEDED: 'tag tag-done', FAILED: 'tag tag-problem', UNSUPPORTED: 'tag tag-problem',
+};
+const POLL_FIRST_MS = 2_000;
+const POLL_MAX_MS = 10_000;
+const POLL_BATCH = 20;
+const POLL_PARALLEL = 4;
+const POLL_STOP_MS = 15 * 60_000;
 const typeLabels: Record<string, string> = {
   'application/pdf': 'PDF',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'DOCX',
   'text/plain': 'TXT',
 };
-const viewable = (document: DocumentSummary) => document.file.mimeType === 'application/pdf' || document.file.mimeType === 'text/plain';
+const viewable = (document: DocumentSummary) => ['application/pdf', 'text/plain', DOCX_MIME].includes(document.file.mimeType);
 const failureMessage = (failure: unknown, fallback: string) => failure instanceof Error ? failure.message : fallback;
+
+async function inGroups<T, R>(items: readonly T[], size: number, run: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = [];
+  for (let start = 0; start < items.length; start += size) results.push(...await Promise.all(items.slice(start, start + size).map(run)));
+  return results;
+}
 
 async function forViewing(blob: Blob, mimeType: string): Promise<Blob> {
   if (mimeType !== 'text/plain') return blob;
@@ -70,6 +85,31 @@ export function DocumentsPage({ user }: { user: User }) {
     refreshUsage();
     return () => { active = false; };
   }, [user.id, refreshUsage]);
+
+  const processingIds = documents.filter(isProcessing).slice(0, POLL_BATCH).map((item) => item.id).join(',');
+
+  useEffect(() => {
+    if (!processingIds) return;
+    const ids = processingIds.split(',');
+    let active = true;
+    let wait = POLL_FIRST_MS;
+    const stopAt = Date.now() + POLL_STOP_MS;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      const fresh = await inGroups(ids, POLL_PARALLEL, (id) => documentsApi.get(id).catch((failure: unknown) =>
+        failure instanceof ApiError && failure.status === 404 ? 'gone' as const : null));
+      if (!active) return;
+      setDocuments((previous) => previous.flatMap((known) => {
+        const next = fresh[ids.indexOf(known.id)];
+        if (next === 'gone') return [];
+        return [next ?? known];
+      }));
+      wait = Math.min(Math.round(wait * 1.5), POLL_MAX_MS);
+      if (Date.now() < stopAt) timer = setTimeout(poll, wait);
+    };
+    timer = setTimeout(poll, wait);
+    return () => { active = false; clearTimeout(timer); };
+  }, [processingIds]);
 
   async function loadMore() {
     if (!cursor) return;
@@ -128,11 +168,15 @@ export function DocumentsPage({ user }: { user: User }) {
   async function open(item: DocumentSummary, mode: 'view' | 'download') {
     setError(''); setBusyId(item.id);
     const viewer = mode === 'view' ? window.open('', '_blank') : null;
+    if (viewer) viewer.opener = null;
     try {
+      if (viewer && item.file.mimeType === DOCX_MIME) {
+        await showDocx(viewer, item);
+        return;
+      }
       const { blob, fileName } = await documentsApi.original(item.id);
       const url = URL.createObjectURL(viewer ? await forViewing(blob, item.file.mimeType) : blob);
       if (viewer) {
-        viewer.opener = null;
         viewer.location.href = url;
       } else {
         const link = document.createElement('a');
@@ -201,17 +245,19 @@ export function DocumentsPage({ user }: { user: User }) {
             <strong>{item.title}</strong>
             <p>{item.file.name} · {formatBytes(item.file.byteSize)} · <time dateTime={item.createdAt}>{dateFormat.format(new Date(item.createdAt))}</time></p>
             <div className="document-tags">
-              <span className="tag">{statusLabels[item.status]}</span>
+              <span className={statusClasses[item.status]}>{item.status === 'PROCESSING' && <span className="spinner spinner-tiny" />}{statusLabels[item.status]}</span>
               {item.originalAvailable && <span className="tag tag-secure"><Icon name="lock" size={12} />Bản gốc mã hóa</span>}
               {item.originalDeleting && <span className="tag">Đang xóa bản gốc…</span>}
               {item.privacyOverride && <span className="tag">Mức riêng: {privacyLabels[item.privacyLevel]}</span>}
             </div>
+            {problemMessage(item) && <p className="document-problem">{problemMessage(item)}</p>}
           </div>
           <div className="document-actions">
             {item.originalAvailable && viewable(item) && <button type="button" className="button-secondary" onClick={() => open(item, 'view')} disabled={busyId !== null}><Icon name="eye" size={15} />Xem</button>}
             {item.originalAvailable && <button type="button" className="button-secondary" onClick={() => open(item, 'download')} disabled={busyId !== null}>{busyId === item.id ? 'Đang tải…' : <><Icon name="download" size={15} />Tải bản gốc</>}</button>}
             <DocumentOptions document={item} accountLevel={user.privacyLevel}
-              onChange={(next) => { setDocuments((previous) => previous.map((known) => known.id === next.id ? next : known)); refreshUsage(); }} />
+              onChange={(next) => { setDocuments((previous) => previous.map((known) => known.id === next.id ? next : known)); refreshUsage(); }}
+              onRemove={() => { setDocuments((previous) => previous.filter((known) => known.id !== item.id)); refreshUsage(); }} />
           </div>
         </li>)}
       </ul>
