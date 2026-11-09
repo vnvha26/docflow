@@ -1,7 +1,4 @@
 import { authClient } from './api';
-import type { User } from './api';
-
-export type PrivacyLevel = User['privacyLevel'];
 
 export type DocumentStatus = 'PENDING' | 'PROCESSING' | 'SUCCEEDED' | 'FAILED' | 'UNSUPPORTED';
 
@@ -10,28 +7,22 @@ export interface DocumentSummary {
   title: string;
   createdAt: string;
   typeCode: string | null;
-  privacyLevel: PrivacyLevel;
   status: DocumentStatus;
   problem: string | null;
   file: { name: string; mimeType: string; byteSize: number };
-  privacyOverride: PrivacyLevel | null;
   originalAvailable: boolean;
   originalDeleting: boolean;
-}
-
-export const LEVEL_ORDER: PrivacyLevel[] = ['STRUCTURED_ONLY', 'TEXT_AND_EMBEDDINGS', 'ENCRYPTED_COPY'];
-export const isLower = (next: PrivacyLevel, current: PrivacyLevel) => LEVEL_ORDER.indexOf(next) < LEVEL_ORDER.indexOf(current);
-
-export function lossesOf(next: PrivacyLevel, current: PrivacyLevel): string[] {
-  const losses: string[] = [];
-  if (current === 'ENCRYPTED_COPY' && next !== 'ENCRYPTED_COPY') losses.push('Bản gốc đã mã hóa bị xóa vĩnh viễn; nâng lại mức 3 sau này không khôi phục được.');
-  if (next === 'STRUCTURED_ONLY' && current !== 'STRUCTURED_ONLY') losses.push('Nội dung chữ, tóm tắt và đoạn trích dẫn nguyên văn bị xóa; chỉ giữ thông tin có cấu trúc và việc cần làm.');
-  return losses;
+  updatedAt: string;
+  pageCount: number | null;
+  summary: string | null;
+  detailsDeleted: boolean;
 }
 
 export const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 
-export const isProcessing =(document: Pick<DocumentSummary, 'status'>) => document.status === 'PENDING' || document.status === 'PROCESSING';
+export const isProcessing = (document: Pick<DocumentSummary, 'status'>) => document.status === 'PENDING' || document.status === 'PROCESSING';
+
+export const isChanging = (document: Pick<DocumentSummary, 'status' | 'originalDeleting'>) => isProcessing(document) || document.originalDeleting;
 
 const problemMessages: Record<string, string> = {
   NO_TEXT_LAYER: 'PDF này là ảnh scan, không có lớp chữ. Hãy dùng bản PDF xuất từ Word hoặc chạy nhận dạng chữ (OCR) trước khi tải lên.',
@@ -46,7 +37,8 @@ const problemMessages: Record<string, string> = {
   SOURCE_UNAVAILABLE: 'Bản tạm của tệp không còn nên chưa đọc được. Hãy tải lại đúng tệp này để xử lý tiếp.',
 };
 
-export function problemMessage(document: Pick<DocumentSummary, 'status' | 'problem'>): string | null {
+export function problemMessage(document: Pick<DocumentSummary, 'status' | 'problem'> & Partial<Pick<DocumentSummary, 'detailsDeleted'>>): string | null {
+  if (document.detailsDeleted) return null;
   if (document.status !== 'FAILED' && document.status !== 'UNSUPPORTED') return null;
   return (document.problem && problemMessages[document.problem])
     ?? (document.status === 'FAILED' ? 'Chưa đọc được tệp do lỗi tạm thời. Tải lại đúng tệp này để thử lại.' : 'Không đọc được nội dung tệp này.');
@@ -58,11 +50,27 @@ export const MAX_UPLOAD_MB = 50;
 export const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
 export const ACCEPTED_EXTENSIONS = ['pdf', 'docx', 'txt'];
 
-export const privacyLabels: Record<PrivacyLevel, string> = {
-  STRUCTURED_ONLY: 'Chỉ thông tin có cấu trúc',
-  TEXT_AND_EMBEDDINGS: 'Nội dung & tìm kiếm',
-  ENCRYPTED_COPY: 'Bản gốc được mã hóa',
+const typeLabels: Record<string, string> = {
+  'application/pdf': 'PDF',
+  [DOCX_MIME]: 'DOCX',
+  'text/plain': 'TXT',
 };
+
+export const fileTypeLabel = (document: Pick<DocumentSummary, 'file'>) => typeLabels[document.file.mimeType] ?? 'TỆP';
+
+const statusLabels: Record<DocumentStatus, string> = {
+  PENDING: 'Chờ đọc nội dung', PROCESSING: 'Đang đọc nội dung', SUCCEEDED: 'Đã đọc nội dung', FAILED: 'Chưa đọc được', UNSUPPORTED: 'Không đọc được',
+};
+
+export function infoLine(document: Pick<DocumentSummary, 'file' | 'pageCount' | 'status' | 'detailsDeleted'>): string {
+  const parts = [fileTypeLabel(document)];
+  if (document.pageCount) parts.push(`${document.pageCount.toLocaleString('vi-VN')} trang`);
+  parts.push(document.detailsDeleted ? 'Đã xóa bản chi tiết' : statusLabels[document.status]);
+  return parts.join(' · ');
+}
+
+export const canViewOriginal = (document: Pick<DocumentSummary, 'file' | 'originalAvailable'>) =>
+  document.originalAvailable && ['application/pdf', 'text/plain', DOCX_MIME].includes(document.file.mimeType);
 
 export function precheck(file: File): string | null {
   const extension = file.name.split('.').pop()?.toLowerCase() ?? '';
@@ -107,7 +115,7 @@ export const documentsApi = {
   deleteOriginal(id: string) {
     return authClient.request<DocumentSummary>(`/documents/${encodeURIComponent(id)}/original`, { method: 'DELETE' });
   },
-  setLevel(id: string, privacyLevel: PrivacyLevel | null) {
-    return authClient.request<DocumentSummary>(`/documents/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ privacyLevel }) });
+  deleteDetails(id: string) {
+    return authClient.request<DocumentSummary>(`/documents/${encodeURIComponent(id)}/details`, { method: 'DELETE' });
   },
 };

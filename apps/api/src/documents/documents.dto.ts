@@ -1,7 +1,6 @@
-import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { PrivacyLevel } from '@prisma/client';
+import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsEnum, IsInt, IsOptional, IsString, Matches, Max, MaxLength, Min, ValidateIf } from 'class-validator';
+import { IsInt, IsOptional, IsString, Matches, Max, MaxLength, Min } from 'class-validator';
 
 export class UploadDocumentDto {
   @ApiPropertyOptional({ maxLength: 255, description: 'Mặc định là tên tệp (bỏ phần mở rộng).' })
@@ -26,12 +25,3 @@ export class ListDocumentsQuery {
   limit?: number;
 }
 
-export class UpdateDocumentDto {
-  @ApiProperty({
-    enum: PrivacyLevel, nullable: true,
-    description: 'P2: mức riêng của tài liệu, không cao hơn mức tài khoản; null = theo tài khoản. Hạ mức sẽ xóa dữ liệu không còn được giữ.',
-  })
-  @ValidateIf((_object: object, value: unknown) => value !== null)
-  @IsEnum(PrivacyLevel, { message: 'Mức lưu trữ không hợp lệ.' })
-  privacyLevel!: PrivacyLevel | null;
-}

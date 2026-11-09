@@ -1,7 +1,7 @@
 .session-note {
   margin: 14px 0 18px;
   color: #67745d;
-  font-size: 13px;
+  font-size: 15px;
   line-height: 1.5;
 }
 
@@ -26,7 +26,7 @@
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
-  font-size: 14px;
+  font-size: 15.5px;
   color: #365441;
 }
 
@@ -35,18 +35,18 @@
   border-radius: 12px;
   background: #edf4e6;
   color: #46643b;
-  font-size: 11px;
+  font-size: 13px;
 }
 
 .session-info p {
   margin: 5px 0 0;
-  font-size: 12px;
+  font-size: 14px;
   color: #67745d;
 }
 
 .session-card .button-secondary,
 .session-card .profile-bottom > p {
-  font-size: 12px;
+  font-size: 14px;
 }
 
 .session-card .profile-bottom > p {
@@ -64,7 +64,7 @@
 .settings-form .form-field { margin-bottom: 18px; }
 .select-wrap select {
   height: 48px; width: 100%; appearance: none; border: 1px solid #dfe5d8; background: #fffefb;
-  border-radius: 9px; padding: 0 40px 0 14px; color: #314b37; font-size: 12px; outline: none;
+  border-radius: 9px; padding: 0 40px 0 14px; color: #314b37; font-size: 14px; outline: none;
   transition: border-color .16s, box-shadow .16s; text-overflow: ellipsis;
 }
 .select-wrap select:focus { border-color: #789b7c; box-shadow: 0 0 0 3px #a1b99024; }
@@ -74,7 +74,7 @@
 .text-button { border: 0; background: transparent; padding: 0; color: #527140; font-size: inherit; font-weight: 550; text-align: left; }
 .text-button:hover:not(:disabled) { text-decoration: underline; }
 .profile-card .settings-readonly { margin: 4px 0 22px; }
-.button-primary.button-compact { width: auto; min-height: 40px; margin-top: 0; padding: 0 20px; font-size: 11px; white-space: nowrap; }
+.button-primary.button-compact { width: auto; min-height: 40px; margin-top: 0; padding: 0 20px; font-size: 13px; white-space: nowrap; }
 .profile-bottom > p[role="status"] { min-height: 18px; }
 .profile-card + .profile-card { margin-top: 20px; }
 
@@ -83,28 +83,11 @@
 }
 @media (max-width: 760px) {
   .settings-grid { grid-template-columns: 1fr; }
-  .select-wrap select { height: 51px; font-size: 13px; }
-  .button-primary.button-compact { width: 100%; min-height: 46px; font-size: 12px; }
+  .select-wrap select { height: 51px; font-size: 15px; }
+  .button-primary.button-compact { width: 100%; min-height: 46px; font-size: 14px; }
   .profile-bottom { align-items: stretch; }
 }
 
 .page-heading { margin: 4px 0 6px; }
 .page-heading h1 { font-size: 34px; letter-spacing: -1.3px; font-weight: 550; color: #254e35; margin: 10px 0 0; }
 .page-heading h1 > span { color: #8d9e6f; }
-.privacy-options { border: 0; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
-.privacy-option { position: relative; display: flex; gap: 10px; border: 1px solid #e0e7d6; border-radius: 12px; padding: 16px; background: #fffefb; cursor: pointer; transition: border-color .15s, background .15s; }
-.privacy-option:hover { border-color: #c9d7bd; }
-.privacy-option.selected { border-color: #789b7c; background: #f5f8ef; box-shadow: 0 0 0 3px #a1b99020; }
-.privacy-option input { margin: 2px 0 0; accent-color: #255540; flex-shrink: 0; }
-.privacy-option-body { display: grid; gap: 4px; min-width: 0; }
-.privacy-option-title { font-size: 12px; font-weight: 600; color: #2f4a33; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-.privacy-option-title em { font-style: normal; font-size: 9px; font-weight: 550; padding: 2px 7px; border-radius: 999px; background: #e3ecd9; color: #4c6c42; }
-.privacy-option-summary { font-size: 10px; color: #6b8157; font-weight: 550; }
-.privacy-option-detail { font-size: 10px; color: #84907a; line-height: 1.6; }
-.privacy-warning { margin: 16px 0 0; border: 1px solid #ead9b4; background: #fdf8ec; border-radius: 10px; padding: 14px 16px; font-size: 11px; color: #6f5d32; line-height: 1.7; }
-.privacy-warning p { margin: 0; }
-.privacy-warning ul { margin: 6px 0 10px; padding-left: 18px; }
-.confirm-check { display: flex; gap: 8px; align-items: flex-start; font-weight: 550; color: #5b4c25; cursor: pointer; }
-.confirm-check input { margin-top: 3px; accent-color: #255540; }
-#privacy .field-hint { margin-top: 12px; }
-@media (max-width: 900px) { .privacy-options { grid-template-columns: 1fr; } }

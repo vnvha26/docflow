@@ -3,12 +3,11 @@ import { JobKind, Prisma, PrivacyLevel } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { lockUserFiles } from '../database/locks';
 import { PrismaService } from '../database/prisma.service';
-import { isLowerPrivacy } from '../documents/privacy';
 import { JobQueue } from '../jobs/job-queue.service';
 import { ObjectStorage } from '../storage/object-storage';
 
-const TEXT_JOBS: JobKind[] = ['SUMMARIZE', 'EMBED'];
 const DOCUMENT_JOBS: JobKind[] = ['PARSE', 'CLASSIFY', 'EXTRACT', 'SUMMARIZE', 'EMBED'];
+const DETAIL_JOBS: JobKind[] = ['PARSE', 'SUMMARIZE', 'EMBED'];
 
 export class PrivacyPolicyChangedError extends ConflictException {
   constructor() { super('Mức lưu trữ của tài liệu đã thay đổi; dữ liệu này không còn được giữ.'); }
@@ -36,26 +35,23 @@ export class RetentionService {
     return rows[0].level;
   }
 
-  async enforceAccount(transaction: Prisma.TransactionClient, userId: string, previous: PrivacyLevel, next: PrivacyLevel): Promise<void> {
-    if (!isLowerPrivacy(next, previous)) return;
-    await this.enforce(transaction, userId);
-  }
-
-  async setDocumentLevel(userId: string, documentId: string, level: PrivacyLevel | null): Promise<void> {
+  async deleteDetails(userId: string, documentId: string): Promise<void> {
     await this.prisma.$transaction(async (transaction) => {
       await lockUserFiles(transaction, userId);
-      const document = await transaction.document.findFirst({
-        where: { id: documentId, userId, deletedAt: null }, select: { id: true, user: { select: { privacyLevel: true } } },
-      });
+      const document = await transaction.document.findFirst({ where: { id: documentId, userId, deletedAt: null }, select: { id: true } });
       if (!document) throw new NotFoundException('Không tìm thấy tài liệu.');
-      if (level && isLowerPrivacy(document.user.privacyLevel, level)) {
-        throw new ConflictException({
-          statusCode: 409, message: 'Mức của tài liệu không được cao hơn mức của tài khoản.',
-          fieldErrors: { privacyLevel: 'Mức của tài liệu không được cao hơn mức của tài khoản.' },
-        });
-      }
-      await transaction.document.update({ where: { id: documentId }, data: { privacyLevel: level, revision: { increment: 1 } } });
-      await this.enforce(transaction, userId, documentId);
+      await transaction.document.update({ where: { id: documentId }, data: { privacyLevel: 'STRUCTURED_ONLY', revision: { increment: 1 } } });
+      const copies = await transaction.fileCopy.updateMany({
+        where: { userId, documentId, state: { in: ['UPLOADING', 'AVAILABLE'] } },
+        data: { state: 'DELETE_PENDING', deleteRequestedAt: new Date(), revision: { increment: 1 } },
+      });
+      await this.jobs.cancel(transaction, { userId, kinds: DETAIL_JOBS, documentId });
+      await transaction.documentVersion.updateMany({
+        where: { documentId, parseState: { in: ['PENDING', 'PROCESSING'] } },
+        data: { parseState: 'FAILED', parseErrorCode: 'DETAILS_DELETED' },
+      });
+      const text = await this.purgeText(transaction, userId);
+      if (copies.count > 0 || text > 0) await this.queuePurge(transaction, userId);
     });
   }
 
@@ -69,6 +65,7 @@ export class RetentionService {
         data: { state: 'DELETE_PENDING', deleteRequestedAt: new Date(), revision: { increment: 1 } },
       });
       if (changed.count === 0) throw new NotFoundException('Tài liệu này không có bản gốc để xóa.');
+      await transaction.document.update({ where: { id: documentId }, data: { revision: { increment: 1 } } });
       await this.queuePurge(transaction, userId);
     });
   }
@@ -86,27 +83,17 @@ export class RetentionService {
         data: { state: 'DELETE_PENDING', deleteRequestedAt: new Date(), revision: { increment: 1 } },
       });
       await this.jobs.cancel(transaction, { userId, kinds: DOCUMENT_JOBS, documentId });
+      await transaction.extractedMetadata.updateMany({
+        where: { documentId },
+        data: { fields: {}, evidence: {}, summary: null, confirmedFields: Prisma.DbNull, revision: { increment: 1 } },
+      });
+      await transaction.obligation.updateMany({
+        where: { documentId, status: { in: ['ACTIVE', 'NEEDS_REVIEW'] } },
+        data: { status: 'CANCELLED', revision: { increment: 1 } },
+      });
       const text = await this.purgeText(transaction, userId);
       if (copies.count > 0 || text > 0) await this.queuePurge(transaction, userId);
     });
-  }
-
-  private async enforce(transaction: Prisma.TransactionClient, userId: string, documentId?: string): Promise<void> {
-    const onlyDocument = documentId ? Prisma.sql`AND d."id" = ${documentId}::uuid` : Prisma.empty;
-    const originals = await transaction.$executeRaw`
-      UPDATE "FileCopy" c
-      SET "state" = 'DELETE_PENDING', "deleteRequestedAt" = now(), "revision" = c."revision" + 1, "updatedAt" = now()
-      FROM "Document" d JOIN "User" u ON u."id" = d."userId"
-      WHERE c."documentId" = d."id" AND d."userId" = ${userId}::uuid ${onlyDocument}
-        AND c."kind" = 'ENCRYPTED_COPY' AND c."state" IN ('UPLOADING', 'AVAILABLE')
-        AND LEAST(u."privacyLevel", COALESCE(d."privacyLevel", u."privacyLevel")) <> 'ENCRYPTED_COPY'`;
-    const textDocuments = await transaction.$queryRaw<{ id: string }[]>`
-      SELECT d."id" FROM "Document" d JOIN "User" u ON u."id" = d."userId"
-      WHERE d."userId" = ${userId}::uuid ${onlyDocument}
-        AND LEAST(u."privacyLevel", COALESCE(d."privacyLevel", u."privacyLevel")) = 'STRUCTURED_ONLY'`;
-    for (const { id } of textDocuments) await this.jobs.cancel(transaction, { userId, kinds: TEXT_JOBS, documentId: id });
-    const text = await this.purgeText(transaction, userId);
-    if (originals > 0 || text > 0) await this.queuePurge(transaction, userId);
   }
 
   async purgeText(db: Prisma.TransactionClient, userId: string): Promise<number> {

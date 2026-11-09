@@ -856,7 +856,7 @@ describe('auth over HTTP with PostgreSQL and local SMTP delivery', {
         ['UTC offset', { timezone: '+07:00' }, 'timezone'],
         ['unknown zone', { timezone: 'Mars/Olympus_Mons' }, 'timezone'],
         ['null zone', { timezone: null }, 'timezone'],
-        ['unknown privacy level', { privacyLevel: 'EVERYTHING' }, 'privacyLevel'],
+        ['the storage level is not editable', { privacyLevel: 'ENCRYPTED_COPY' }, 'privacyLevel'],
         ['email is not editable', { email: 'someone@example.test' }, 'email'],
       ];
       for (const [label, body, field] of cases) {

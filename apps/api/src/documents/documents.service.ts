@@ -39,12 +39,13 @@ interface Duplicate {
 interface Reserved { kind: FileCopyKind; key: string; documentId: string; versionId: string; revived: boolean }
 type Plan = { duplicateOf: string } | Reserved;
 const SUMMARY_SELECT = {
-  id: true, title: true, createdAt: true, typeCode: true, privacyLevel: true,
+  id: true, title: true, createdAt: true, updatedAt: true, typeCode: true, privacyLevel: true,
   user: { select: { privacyLevel: true } },
   versions: {
     orderBy: { number: 'desc' }, take: 1,
-    select: { id: true, originalFilename: true, mimeType: true, byteSize: true, parseState: true, parseErrorCode: true },
+    select: { id: true, originalFilename: true, mimeType: true, byteSize: true, parseState: true, parseErrorCode: true, pageCount: true, updatedAt: true },
   },
+  extractedMetadata: { where: { summary: { not: null } }, orderBy: { createdAt: 'desc' }, take: 1, select: { summary: true } },
   fileCopies: { where: { kind: 'ENCRYPTED_COPY', state: { in: ['AVAILABLE', 'DELETE_PENDING'] } }, select: { versionId: true, state: true } },
 } satisfies Prisma.DocumentSelect;
 type SummaryRow = Prisma.DocumentGetPayload<{ select: typeof SUMMARY_SELECT }>;
@@ -52,15 +53,19 @@ type SummaryRow = Prisma.DocumentGetPayload<{ select: typeof SUMMARY_SELECT }>;
 function toSummary(row: SummaryRow): DocumentSummary {
   const version = row.versions[0];
   const privacyLevel = effectivePrivacy(row.user.privacyLevel, row.privacyLevel);
+  const detailsDeleted = row.privacyLevel === 'STRUCTURED_ONLY';
   return {
-    id: row.id, title: row.title, createdAt: row.createdAt, typeCode: row.typeCode, privacyLevel,
+    id: row.id, title: row.title, createdAt: row.createdAt, typeCode: row.typeCode,
     status: version.parseState,
-    problem: version.parseState === 'FAILED' || version.parseState === 'UNSUPPORTED' ? version.parseErrorCode : null,
+    problem: !detailsDeleted && (version.parseState === 'FAILED' || version.parseState === 'UNSUPPORTED') ? version.parseErrorCode : null,
     file: { name: version.originalFilename, mimeType: version.mimeType, byteSize: Number(version.byteSize) },
-    privacyOverride: row.privacyLevel,
     originalAvailable: privacyLevel === 'ENCRYPTED_COPY'
       && row.fileCopies.some((copy) => copy.versionId === version.id && copy.state === 'AVAILABLE'),
     originalDeleting: row.fileCopies.some((copy) => copy.versionId === version.id && copy.state === 'DELETE_PENDING'),
+    updatedAt: row.updatedAt > version.updatedAt ? row.updatedAt : version.updatedAt,
+    pageCount: version.pageCount,
+    summary: privacyLevel === 'STRUCTURED_ONLY' ? null : row.extractedMetadata[0]?.summary ?? null,
+    detailsDeleted,
   };
 }
 

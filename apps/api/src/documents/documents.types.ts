@@ -1,4 +1,4 @@
-import { ParseState, PrivacyLevel } from '@prisma/client';
+import { ParseState } from '@prisma/client';
 
 export const MAX_UPLOAD_MB = 50;
 export const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
@@ -9,14 +9,17 @@ export interface DocumentSummary {
   title: string;
   createdAt: Date;
   typeCode: string | null;
-  privacyLevel: PrivacyLevel;
   status: ParseState;
   problem: string | null;
   file: { name: string; mimeType: string; byteSize: number };
-  privacyOverride: PrivacyLevel | null;
   originalAvailable: boolean;
   originalDeleting: boolean;
+  updatedAt: Date;
+  pageCount: number | null;
+  summary: string | null;
+  detailsDeleted: boolean;
 }
+
 
 export interface UploadResult {
   document: DocumentSummary;

@@ -1,24 +1,47 @@
 import { useEffect, useRef, useState } from 'react';
+import { Icon } from '../../components/Brand';
 import { ApiError, StaleSessionError } from '../../lib/api';
-import { documentsApi, LEVEL_ORDER, lossesOf, privacyLabels } from '../../lib/documents';
-import type { DocumentSummary, PrivacyLevel } from '../../lib/documents';
+import { documentsApi, isProcessing } from '../../lib/documents';
+import type { DocumentSummary } from '../../lib/documents';
+import { openOriginal } from './original-file';
+
+type Layer = 'original' | 'details' | 'all';
 
 interface Props {
   document: DocumentSummary;
-  accountLevel: PrivacyLevel;
   onChange: (next: DocumentSummary) => void;
   onRemove: () => void;
 }
 
-export function DocumentOptions({ document, accountLevel, onChange, onRemove }: Props) {
-  const [choice, setChoice] = useState<PrivacyLevel | 'ACCOUNT'>(document.privacyOverride ?? 'ACCOUNT');
-  const [pending, setPending] = useState<'level' | 'delete' | 'remove' | null>(null);
+const LAYERS: Record<Layer, { label: string; action: string; lost: string; kept: string }> = {
+  original: {
+    label: 'Xóa bản gốc…', action: 'Xóa bản gốc',
+    lost: 'Tệp gốc đã mã hóa. Sau này không xem hay tải lại được tệp này nữa.',
+    kept: 'Dòng thông tin, tóm tắt, nội dung đã đọc, việc cần làm và nhắc hạn.',
+  },
+  details: {
+    label: 'Xóa bản chi tiết…', action: 'Xóa bản chi tiết',
+    lost: 'Tệp gốc, nội dung đã đọc và tóm tắt.',
+    kept: 'Dòng thông tin (loại, ngày hết hạn, số tiền…), việc cần làm và nhắc hạn.',
+  },
+  all: {
+    label: 'Xóa toàn bộ…', action: 'Xóa toàn bộ',
+    lost: 'Cả tài liệu: tệp gốc, nội dung, tóm tắt, thông tin, việc cần làm và nhắc hạn của tài liệu này.',
+    kept: 'Không còn gì. Tài liệu biến mất khỏi danh sách.',
+  },
+};
+
+export function DocumentOptions({ document, onChange, onRemove }: Props) {
+  const [pending, setPending] = useState<Layer | null>(null);
   const [saving, setSaving] = useState(false);
+  const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState('');
-  const target: PrivacyLevel = choice === 'ACCOUNT' ? accountLevel : choice;
-  const losses = lossesOf(target, document.privacyLevel);
-  const levelChanged = (document.privacyOverride ?? 'ACCOUNT') !== choice;
   const menu = useRef<HTMLDetailsElement>(null);
+  const available: Layer[] = [
+    ...(document.originalAvailable && !isProcessing(document) ? ['original' as const] : []),
+    ...(!document.detailsDeleted ? ['details' as const] : []),
+    'all',
+  ];
 
   useEffect(() => {
     function close(event: Event) {
@@ -38,67 +61,55 @@ export function DocumentOptions({ document, accountLevel, onChange, onRemove }: 
     }
   }
 
-  async function run(action: () => Promise<DocumentSummary>) {
+  async function download() {
+    setDownloading(true); setError('');
+    try {
+      await openOriginal(document, 'download');
+      if (menu.current) menu.current.open = false;
+    } catch (failure) {
+      if (!(failure instanceof StaleSessionError)) setError(failure instanceof Error ? failure.message : 'Chưa thể tải bản gốc.');
+    } finally { setDownloading(false); }
+  }
+
+  async function confirm(layer: Layer) {
     setSaving(true); setError('');
     try {
-      const next = await action();
+      if (layer === 'all') {
+        await documentsApi.remove(document.id);
+        onRemove();
+        return;
+      }
+      const next = await (layer === 'original' ? documentsApi.deleteOriginal(document.id) : documentsApi.deleteDetails(document.id));
       onChange(next);
       setPending(null);
-      setChoice(next.privacyOverride ?? 'ACCOUNT');
       if (menu.current) menu.current.open = false;
     } catch (failure) {
       if (failure instanceof StaleSessionError) return;
-      setError(failure instanceof ApiError ? (failure.fieldErrors.privacyLevel || failure.message) : 'Chưa thể lưu thay đổi.');
+      if (failure instanceof ApiError && failure.status === 404 && layer === 'all') { onRemove(); return; }
+      setError(failure instanceof ApiError ? failure.message : 'Chưa thể xóa. Vui lòng thử lại.');
     } finally { setSaving(false); }
   }
 
-  async function remove() {
-    setSaving(true); setError('');
-    try {
-      await documentsApi.remove(document.id);
-      onRemove();
-    } catch (failure) {
-      if (failure instanceof StaleSessionError) return;
-      if (failure instanceof ApiError && failure.status === 404) { onRemove(); return; }
-      setError(failure instanceof ApiError ? failure.message : 'Chưa thể xóa tài liệu.');
-      setSaving(false);
-    }
-  }
-
   return <details ref={menu} className="document-menu" onToggle={toggled}>
-    <summary aria-label={`Tùy chọn cho ${document.title}`}>Tùy chọn</summary>
+    <summary aria-label={`Tùy chọn cho ${document.title}`} title="Tùy chọn"><Icon name="more" size={18} /></summary>
     <div className="document-menu-body">
-      <label className="menu-label" htmlFor={`level-${document.id}`}>Mức lưu trữ của tài liệu</label>
-      <select id={`level-${document.id}`} value={choice} disabled={saving} onChange={(event) => { setChoice(event.target.value as PrivacyLevel | 'ACCOUNT'); setPending(null); setError(''); }}>
-        <option value="ACCOUNT">Theo tài khoản ({privacyLabels[accountLevel]})</option>
-        {LEVEL_ORDER.filter((level) => LEVEL_ORDER.indexOf(level) <= LEVEL_ORDER.indexOf(accountLevel)).map((level) =>
-          <option key={level} value={level}>Mức {LEVEL_ORDER.indexOf(level) + 1} · {privacyLabels[level]}</option>)}
-      </select>
-      {pending === 'level' && <ul className="menu-losses">{losses.map((loss) => <li key={loss}>{loss}</li>)}</ul>}
-      {levelChanged && (losses.length && pending !== 'level'
-        ? <button type="button" className="button-secondary" onClick={() => setPending('level')} disabled={saving}>Áp dụng…</button>
-        : <button type="button" className="button-secondary" disabled={saving}
-          onClick={() => run(() => documentsApi.setLevel(document.id, choice === 'ACCOUNT' ? null : choice))}>
-          {saving ? 'Đang lưu…' : losses.length ? 'Xác nhận và xóa' : 'Áp dụng'}
-        </button>)}
-      {document.originalAvailable && <div className="menu-danger">
-        {pending === 'delete'
-          ? <><p>Xóa bản gốc đã mã hóa? Tài liệu và thông tin đã trích xuất vẫn được giữ. Không thể hoàn tác.</p>
-            <div className="menu-row">
-              <button type="button" className="button-danger" disabled={saving} onClick={() => run(() => documentsApi.deleteOriginal(document.id))}>{saving ? 'Đang xóa…' : 'Xóa bản gốc'}</button>
-              <button type="button" className="text-button" disabled={saving} onClick={() => setPending(null)}>Giữ lại</button>
-            </div></>
-          : <button type="button" className="text-button danger" onClick={() => { setPending('delete'); setError(''); }}>Xóa bản gốc…</button>}
-      </div>}
-      <div className="menu-danger">
-        {pending === 'remove'
-          ? <><p>Xóa tài liệu “{document.title}”? Tài liệu biến mất khỏi danh sách, nội dung chữ và mọi bản lưu (kể cả bản gốc mã hóa) bị xóa. Thông tin đã xác nhận và việc cần làm liên kết vẫn được giữ. Không thể hoàn tác.</p>
-            <div className="menu-row">
-              <button type="button" className="button-danger" disabled={saving} onClick={remove}>{saving ? 'Đang xóa…' : 'Xóa tài liệu'}</button>
-              <button type="button" className="text-button" disabled={saving} onClick={() => setPending(null)}>Giữ lại</button>
-            </div></>
-          : <button type="button" className="text-button danger" onClick={() => { setPending('remove'); setError(''); }}>Xóa tài liệu…</button>}
-      </div>
+      {pending
+        ? <div className="menu-confirm">
+          <strong>{LAYERS[pending].action}?</strong>
+          <p><span>Mất vĩnh viễn:</span> {LAYERS[pending].lost}</p>
+          <p><span>Còn lại:</span> {LAYERS[pending].kept}</p>
+          <div className="menu-row">
+            <button type="button" className="button-danger" disabled={saving} onClick={() => confirm(pending)}>{saving ? 'Đang xóa…' : LAYERS[pending].action}</button>
+            <button type="button" className="text-button" disabled={saving} onClick={() => { setPending(null); setError(''); }}>Giữ lại</button>
+          </div>
+        </div>
+        : <>
+          {document.originalAvailable && <button type="button" className="text-button menu-item" onClick={download} disabled={downloading}>
+            {downloading ? 'Đang tải…' : 'Tải bản gốc'}
+          </button>}
+          {available.map((layer) => <button key={layer} type="button" className="text-button danger menu-item"
+          onClick={() => { setPending(layer); setError(''); }}>{LAYERS[layer].label}</button>)}
+        </>}
       {error && <p className="field-error" role="alert">{error}</p>}
     </div>
   </details>;

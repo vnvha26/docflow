@@ -1,10 +1,10 @@
 import {
-  Body, Controller, Delete, Get, HttpCode, Inject, Logger, Param, ParseUUIDPipe, Patch, Post, Query, Req, Res, UploadedFile,
+  Body, Controller, Delete, Get, HttpCode, Inject, Logger, Param, ParseUUIDPipe, Post, Query, Req, Res, UploadedFile,
   UseFilters, UseGuards, UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import {
-  ApiAcceptedResponse, ApiBearerAuth, ApiBody, ApiConflictResponse, ApiConsumes, ApiCreatedResponse, ApiNoContentResponse, ApiNotFoundResponse,
+  ApiAcceptedResponse, ApiBearerAuth, ApiBody, ApiConsumes, ApiCreatedResponse, ApiNoContentResponse, ApiNotFoundResponse,
   ApiOkResponse, ApiOperation, ApiPayloadTooLargeResponse, ApiProduces, ApiTags, ApiTooManyRequestsResponse, ApiUnauthorizedResponse,
   ApiUnprocessableEntityResponse, ApiUnsupportedMediaTypeResponse,
 } from '@nestjs/swagger';
@@ -14,7 +14,7 @@ import { pipeline } from 'node:stream/promises';
 import { AccessTokenGuard, AuthOriginGuard } from '../auth/auth.guards';
 import { AuthRequest } from '../auth/auth.types';
 import { RetentionService } from '../retention/retention.service';
-import { ListDocumentsQuery, UpdateDocumentDto, UploadDocumentDto } from './documents.dto';
+import { ListDocumentsQuery, UploadDocumentDto } from './documents.dto';
 import { DocumentsService, UploadedFile as StoredUpload } from './documents.service';
 import { DocumentSummary, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, StorageUsage, UploadResult } from './documents.types';
 import { contentDisposition } from './file-name';
@@ -26,11 +26,11 @@ const summarySchema = {
   properties: {
     id: { type: 'string', format: 'uuid' }, title: { type: 'string' }, createdAt: { type: 'string', format: 'date-time' },
     typeCode: { type: 'string', nullable: true },
-    privacyLevel: { type: 'string', enum: ['STRUCTURED_ONLY', 'TEXT_AND_EMBEDDINGS', 'ENCRYPTED_COPY'] },
     status: { type: 'string', enum: ['PENDING', 'PROCESSING', 'SUCCEEDED', 'FAILED', 'UNSUPPORTED'] },
     file: { type: 'object', properties: { name: { type: 'string' }, mimeType: { type: 'string' }, byteSize: { type: 'integer' } } },
-    privacyOverride: { type: 'string', nullable: true, enum: ['STRUCTURED_ONLY', 'TEXT_AND_EMBEDDINGS', 'ENCRYPTED_COPY'] },
     originalAvailable: { type: 'boolean' }, originalDeleting: { type: 'boolean' },
+    updatedAt: { type: 'string', format: 'date-time' }, pageCount: { type: 'integer', nullable: true },
+    summary: { type: 'string', nullable: true }, detailsDeleted: { type: 'boolean' },
   },
 };
 
@@ -94,17 +94,6 @@ export class DocumentsController {
     return this.documents.get(request.auth!.user.id, id);
   }
 
-  @Patch(':id')
-  @ApiOperation({ summary: 'P2: đặt mức lưu trữ riêng cho tài liệu (chỉ hạ, không cao hơn tài khoản; null = theo tài khoản).' })
-  @ApiOkResponse({ schema: summarySchema })
-  @ApiConflictResponse({ description: 'Mức cao hơn mức của tài khoản.' })
-  @ApiNotFoundResponse()
-  async update(@Param('id', new ParseUUIDPipe()) id: string, @Body() body: UpdateDocumentDto, @Req() request: AuthRequest): Promise<DocumentSummary> {
-    const userId = request.auth!.user.id;
-    await this.retention.setDocumentLevel(userId, id, body.privacyLevel);
-    return this.documents.get(userId, id);
-  }
-
   @Delete(':id')
   @HttpCode(204)
   @ApiOperation({ summary: 'B5: xóa mềm tài liệu. Ẩn khỏi danh sách, khóa mọi đường dẫn, xóa nội dung chữ ngay; bản lưu được worker xóa sau đó.' })
@@ -128,6 +117,17 @@ export class DocumentsController {
       'Content-Security-Policy': "default-src 'none'; img-src data:; style-src 'unsafe-inline'; sandbox",
       'X-Content-Type-Options': 'nosniff',
     }).send(html);
+  }
+
+  @Delete(':id/details')
+  @HttpCode(202)
+  @ApiOperation({ summary: 'Xóa bản chi tiết: bản gốc, nội dung đã đọc, tóm tắt. Giữ dòng thông tin, việc cần làm và nhắc hạn.' })
+  @ApiAcceptedResponse({ schema: summarySchema })
+  @ApiNotFoundResponse()
+  async deleteDetails(@Param('id', new ParseUUIDPipe()) id: string, @Req() request: AuthRequest): Promise<DocumentSummary> {
+    const userId = request.auth!.user.id;
+    await this.retention.deleteDetails(userId, id);
+    return this.documents.get(userId, id);
   }
 
   @Delete(':id/original')

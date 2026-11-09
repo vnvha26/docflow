@@ -298,7 +298,8 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal(result.body.duplicate, false);
     assert.equal(document.title, 'Ghi chú thuê nhà');
     assert.deepEqual(document.file, { name: 'Ghi chú thuê nhà.txt', mimeType: 'text/plain', byteSize: content.length });
-    assert.equal(document.privacyLevel, 'TEXT_AND_EMBEDDINGS');
+    assert.equal(document.privacyLevel, undefined, 'storage levels are internal');
+    assert.equal(document.privacyOverride, undefined);
     assert.equal(document.status, 'PENDING');
     assert.equal(document.originalAvailable, false);
     const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: document.id } });
@@ -579,8 +580,8 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     const content = text();
     const doc = (await upload(user, { name: 'muc-rieng.txt', data: content })).body.document;
     assert.equal((await parsed(user, doc.id)).status, 'SUCCEEDED');
-    const lowered = await request(`/api/documents/${doc.id}`, { method: 'PATCH', token: user.token, body: { privacyLevel: 'STRUCTURED_ONLY' } });
-    assert.equal(lowered.status, 200);
+    const lowered = await request(`/api/documents/${doc.id}/details`, { method: 'DELETE', token: user.token });
+    assert.equal(lowered.status, 202);
     const [original] = await copiesOf(doc.id);
     await eventually(copyDeleted(original.id), 'the original is removed when the document goes to level 1');
     await db.documentVersion.updateMany({ where: { documentId: doc.id }, data: { parseState: 'FAILED', parseErrorCode: 'SOURCE_UNAVAILABLE' } });
@@ -588,7 +589,7 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     const again = await upload(user, { name: 'muc-rieng.txt', data: content });
     assert.equal(again.status, 201);
     assert.equal(again.body.document.id, doc.id);
-    assert.equal(again.body.document.privacyLevel, 'STRUCTURED_ONLY');
+    assert.equal(again.body.document.detailsDeleted, true);
     assert.equal(again.body.document.originalAvailable, false);
     const revived = (await copiesOf(doc.id)).filter((copy) => copy.id !== original.id);
     assert.equal(revived.length, 1);
@@ -645,7 +646,6 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     const result = await upload(users.c, { name, data: content, type: 'application/pdf' });
     assert.equal(result.status, 201);
     const document = result.body.document;
-    assert.equal(document.privacyLevel, 'ENCRYPTED_COPY');
     assert.equal(document.originalAvailable, true);
     assert.equal(document.file.name, '2026.pdf', 'only the last path segment of a client name is kept');
     const [copy, ...others] = await copiesOf(document.id);
@@ -759,7 +759,7 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal((await request(`/api/documents/${doc.id}/original`, { method: 'DELETE', token: users.c.token })).status, 404);
   });
 
-  test('B5: deleting a document hides it everywhere, purges its text and copies, keeps the record, and the file can be uploaded again', async () => {
+  test('B5: deleting a document hides it everywhere, purges its text, extracted data and copies, keeps a tombstone, and the file can be uploaded again', async () => {
     const body = text();
     const doc = (await upload(users.c, { name: 'xoa-tai-lieu.txt', data: body })).body.document;
     assert.equal((await parsed(users.c, doc.id)).status, 'SUCCEEDED');
@@ -781,7 +781,6 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     for (const [path, method] of [['', 'GET'], ['/original', 'GET'], ['/preview', 'GET'], ['', 'DELETE'], ['/original', 'DELETE']]) {
       assert.equal((await request(`/api/documents/${doc.id}${path}`, { method, token: users.c.token })).status, 404, `${method} ${path || '/'} is locked`);
     }
-    assert.equal((await request(`/api/documents/${doc.id}`, { method: 'PATCH', token: users.c.token, body: { privacyLevel: null } })).status, 404);
     const listed = (await request('/api/documents?limit=50', { token: users.c.token })).body.items;
     assert.equal(listed.some((item) => item.id === doc.id), false, 'the list no longer shows it');
 
@@ -790,8 +789,8 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), 0, 'text is purged at once');
     const purged = await db.extractedMetadata.findUniqueOrThrow({ where: { id: metadata.id } });
     assert.equal(purged.summary, null);
-    assert.deepEqual(purged.fields, { deposit: '16000000' }, 'structured data stays');
-    assert.deepEqual(purged.evidence, { deposit: { charStart: 0, charEnd: 8 } });
+    assert.deepEqual(purged.fields, {}, 'deleting everything leaves no extracted data');
+    assert.deepEqual(purged.evidence, {});
     assert.equal((await db.aIJob.findUniqueOrThrow({ where: { id: extract.id } })).status, 'CANCELLED');
     assert.notEqual((await db.fileCopy.findUniqueOrThrow({ where: { id: copy.id } })).state, 'AVAILABLE');
     assert.equal((await request('/api/documents/usage', { token: users.c.token })).body.encryptedBytes, usageBefore - Number(copy.byteSize), 'quota is freed at once');
@@ -805,6 +804,92 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal(again.status, 201, 'the same file can be uploaded again as a new document');
     assert.notEqual(again.body.document.id, doc.id);
     assert.equal((await parsed(users.c, again.body.document.id)).status, 'SUCCEEDED');
+  });
+
+  test('layers: the summary shows pages, summary and update time; deleting the original, then the details, hides each layer', async () => {
+    const doc = (await upload(users.c, { name: 'ba-lop.pdf', data: textPdf([['Hop dong thue nha'], [`Tien coc 16.000.000 ${randomUUID()}`]]) })).body.document;
+    const read = await parsed(users.c, doc.id);
+    assert.equal(read.status, 'SUCCEEDED');
+    assert.equal(read.pageCount, 2);
+    assert.ok(new Date(read.updatedAt) >= new Date(read.createdAt), 'parsing counts as an update');
+    assert.equal(read.summary, null);
+    assert.equal(read.detailsDeleted, false);
+    const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: doc.id } });
+    await db.extractedMetadata.create({ data: {
+      userId: users.c.id, documentId: doc.id, versionId: version.id, modelId: 'test', promptVersion: 'p1', schemaVersion: 1,
+      summary: 'Hợp đồng thuê 12 tháng, cọc 16 triệu.', fields: { deposit: '16000000' },
+    } });
+    assert.equal((await request(`/api/documents/${doc.id}`, { token: users.c.token })).body.summary, 'Hợp đồng thuê 12 tháng, cọc 16 triệu.');
+
+    const [copy] = await copiesOf(doc.id);
+    const noOriginal = await request(`/api/documents/${doc.id}/original`, { method: 'DELETE', token: users.c.token });
+    assert.equal(noOriginal.status, 202);
+    assert.equal(noOriginal.body.originalAvailable, false);
+    assert.ok(await db.documentChunk.count({ where: { documentId: doc.id } }) > 0, 'text stays after deleting the original');
+    assert.ok(new Date(noOriginal.body.updatedAt) > new Date(read.updatedAt), 'deleting a layer moves the update time');
+    assert.ok(noOriginal.body.summary, 'summary stays after deleting the original');
+
+    assert.equal((await request(`/api/documents/${doc.id}/details`, { method: 'DELETE', token: users.a.token })).status, 404, 'other users cannot');
+    const noDetails = await request(`/api/documents/${doc.id}/details`, { method: 'DELETE', token: users.c.token });
+    assert.equal(noDetails.status, 202);
+    assert.equal(noDetails.body.detailsDeleted, true);
+    assert.equal(noDetails.body.summary, null);
+    assert.equal(noDetails.body.problem, null);
+    assert.equal(noDetails.body.pageCount, 2, 'the info line stays');
+    assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), 0);
+    const { RetentionService, PrivacyPolicyChangedError } = await compiled('retention/retention.service.js');
+    const retention = new RetentionService(db, null, null);
+    await assert.rejects(db.$transaction(async (transaction) => {
+      await retention.assertMayStore(transaction, users.c.id, doc.id, 'TEXT_AND_EMBEDDINGS');
+      await transaction.documentChunk.create({ data: { userId: users.c.id, documentId: doc.id, versionId: version.id, ordinal: 0, content: 'sống lại?', charStart: 0, charEnd: 9, chunkerVersion: 'c1' } });
+    }), PrivacyPolicyChangedError, 'a stale worker cannot write the deleted text back');
+    assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), 0);
+    const raise = await request(`/api/documents/${doc.id}`, { method: 'PATCH', token: users.c.token, body: { privacyLevel: null } });
+    assert.equal(raise.status, 404, 'there is no API to bring a deleted layer back');
+    const metadata = await db.extractedMetadata.findFirstOrThrow({ where: { documentId: doc.id } });
+    assert.equal(metadata.summary, null);
+    assert.deepEqual(metadata.fields, { deposit: '16000000' }, 'structured info stays');
+    await eventually(copyDeleted(copy.id), 'the original blob should be deleted');
+    const listed = (await request('/api/documents?limit=50', { token: users.c.token })).body.items;
+    assert.ok(listed.some((item) => item.id === doc.id), 'the document stays in the list');
+    assert.equal((await request(`/api/documents/${doc.id}/details`, { method: 'DELETE', token: users.c.token })).status, 202, 'repeating is harmless');
+  });
+
+  test('layers: deleting the details while the file waits to be read stops the reading and drops the file', async () => {
+    const doc = (await upload(users.c, { name: 'chua-doc.txt', data: text() })).body.document;
+    const removed = await request(`/api/documents/${doc.id}/details`, { method: 'DELETE', token: users.c.token });
+    assert.equal(removed.status, 202);
+    assert.equal(removed.body.detailsDeleted, true);
+    for (const copy of await copiesOf(doc.id)) await eventually(copyDeleted(copy.id), 'the stored file should be deleted');
+    const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: doc.id } });
+    assert.ok(['FAILED', 'SUCCEEDED'].includes(version.parseState), version.parseState);
+    if (version.parseState === 'FAILED') assert.equal(version.parseErrorCode, 'DETAILS_DELETED');
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), 0);
+    const after = (await request(`/api/documents/${doc.id}`, { token: users.c.token })).body;
+    assert.equal(after.problem, null, 'no "could not read" message for a deliberate deletion');
+    assert.equal(after.status === 'PENDING' || after.status === 'PROCESSING', false, 'the page stops waiting');
+  });
+
+  test('layers: deleting everything also clears the extracted info and cancels the obligations', async () => {
+    const doc = (await upload(users.c, { name: 'xoa-het.txt', data: text() })).body.document;
+    assert.equal((await parsed(users.c, doc.id)).status, 'SUCCEEDED');
+    const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: doc.id } });
+    const metadata = await db.extractedMetadata.create({ data: {
+      userId: users.c.id, documentId: doc.id, versionId: version.id, modelId: 'test', promptVersion: 'p1', schemaVersion: 1,
+      status: 'CONFIRMED', summary: 'Tóm tắt.', fields: { rent: '8000000' }, confirmedFields: { rent: '8000000' }, confirmedAt: new Date(),
+      evidence: { rent: { quote: 'tiền thuê', charStart: 0, charEnd: 9 } },
+    } });
+    const obligation = await db.obligation.create({ data: {
+      userId: users.c.id, documentId: doc.id, versionId: version.id, metadataId: metadata.id, sourceKey: 'rent.monthly', title: 'Tiền thuê nhà',
+    } });
+    assert.equal((await request(`/api/documents/${doc.id}`, { method: 'DELETE', token: users.c.token })).status, 204);
+    const cleared = await db.extractedMetadata.findUniqueOrThrow({ where: { id: metadata.id } });
+    assert.deepEqual(cleared.fields, {});
+    assert.deepEqual(cleared.evidence, {});
+    assert.equal(cleared.confirmedFields, null);
+    assert.equal(cleared.summary, null);
+    assert.equal((await db.obligation.findUniqueOrThrow({ where: { id: obligation.id } })).status, 'CANCELLED');
   });
 
   test('B5: a document deleted while its parse job waits is never parsed back', async () => {
@@ -836,80 +921,6 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal((await request(`/api/documents/${level2.id}/preview`, { token: users.a.token })).status, 404, 'no original below level 3');
     const broken = (await upload(users.c, { name: 'hong.docx', data: brokenDocx() })).body.document;
     assert.equal((await request(`/api/documents/${broken.id}/preview`, { token: users.c.token })).status, 422);
-  });
-
-  test('P6 3→2: lowering the account level drops every original in the same request; the worker deletes the blobs', async () => {
-    const user = await createUser('downgrade3', 'ENCRYPTED_COPY');
-    const docs = [];
-    for (const name of ['a.txt', 'b.txt']) docs.push((await upload(user, { name, data: text() })).body.document);
-    const copies = (await Promise.all(docs.map((doc) => copiesOf(doc.id)))).flat();
-    const changed = await request('/api/account', { method: 'PATCH', token: user.token, body: { privacyLevel: 'TEXT_AND_EMBEDDINGS' } });
-    assert.equal(changed.status, 200);
-    for (const copy of copies) assert.notEqual((await db.fileCopy.findUniqueOrThrow({ where: { id: copy.id } })).state, 'AVAILABLE');
-    for (const doc of docs) {
-      const detail = (await request(`/api/documents/${doc.id}`, { token: user.token })).body;
-      assert.equal(detail.originalAvailable, false);
-      assert.equal(detail.privacyLevel, 'TEXT_AND_EMBEDDINGS');
-    }
-    for (const copy of copies) await eventually(copyDeleted(copy.id), 'originals should be purged');
-    for (const copy of copies) assert.equal(await objectExists(copy.storageKey), false);
-    const purge = await db.aIJob.findFirst({ where: { userId: user.id, kind: 'PURGE' }, orderBy: { createdAt: 'desc' } });
-    await eventually(async () => (await db.aIJob.findUniqueOrThrow({ where: { id: purge.id } })).status === 'SUCCEEDED', 'purge job should succeed');
-    const next = await upload(user, { name: 'sau-khi-ha.txt', data: text() });
-    assert.equal((await copiesOf(next.body.document.id))[0].kind, 'WEB_SOURCE');
-  });
-
-  test('P6 2→1: text is purged at once, text jobs are cancelled, and a stale worker cannot write it back', async () => {
-    const user = await createUser('downgrade2');
-    const doc = (await upload(user, { name: 'hop-dong.txt', data: text() })).body.document;
-    const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: doc.id } });
-    assert.equal((await parsed(user, doc.id)).status, 'SUCCEEDED');
-    assert.ok(await db.documentChunk.count({ where: { documentId: doc.id } }) > 0, 'level 2 keeps the text');
-    const metadata = await db.extractedMetadata.create({ data: {
-      userId: user.id, documentId: doc.id, versionId: version.id, modelId: 'test', promptVersion: 'p1', schemaVersion: 1,
-      summary: 'Hợp đồng thuê nhà 12 tháng.', fields: { deposit: '16000000' },
-      evidence: { deposit: { quote: 'Tiền cọc 16.000.000', charStart: 0, charEnd: 19 } },
-    } });
-    const job = await db.aIJob.create({ data: { userId: user.id, kind: 'SUMMARIZE', documentId: doc.id, versionId: version.id, idempotencyKey: `summarize:${doc.id}` } });
-    const changed = await request('/api/account', { method: 'PATCH', token: user.token, body: { privacyLevel: 'STRUCTURED_ONLY' } });
-    assert.equal(changed.status, 200);
-    assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), 0);
-    const purged = await db.extractedMetadata.findUniqueOrThrow({ where: { id: metadata.id } });
-    assert.equal(purged.summary, null);
-    assert.deepEqual(purged.evidence, { deposit: { charStart: 0, charEnd: 19 } }, 'offsets stay, the quote goes');
-    assert.deepEqual(purged.fields, { deposit: '16000000' }, 'structured data stays');
-    assert.equal((await db.aIJob.findUniqueOrThrow({ where: { id: job.id } })).status, 'CANCELLED');
-    const { RetentionService, PrivacyPolicyChangedError } = await compiled('retention/retention.service.js');
-    const retention = new RetentionService(db, null, null);
-    await assert.rejects(db.$transaction(async (transaction) => {
-      await retention.assertMayStore(transaction, user.id, doc.id, 'TEXT_AND_EMBEDDINGS');
-      await transaction.documentChunk.create({ data: { userId: user.id, documentId: doc.id, versionId: version.id, ordinal: 0, content: 'sống lại?', charStart: 0, charEnd: 9, chunkerVersion: 'v1' } });
-    }), PrivacyPolicyChangedError);
-    assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), 0, 'purged text never comes back');
-    await db.$transaction((transaction) => retention.assertMayStore(transaction, user.id, doc.id, 'STRUCTURED_ONLY'));
-  });
-
-  test('P2: a document can lower its own level (never above the account); null follows the account again', async () => {
-    const user = await createUser('per-document', 'ENCRYPTED_COPY');
-    const doc = (await upload(user, { name: 'rieng.txt', data: text() })).body.document;
-    const [copy] = await copiesOf(doc.id);
-    const lowered = await request(`/api/documents/${doc.id}`, { method: 'PATCH', token: user.token, body: { privacyLevel: 'TEXT_AND_EMBEDDINGS' } });
-    assert.equal(lowered.status, 200);
-    assert.equal(lowered.body.privacyOverride, 'TEXT_AND_EMBEDDINGS');
-    assert.equal(lowered.body.privacyLevel, 'TEXT_AND_EMBEDDINGS');
-    assert.equal(lowered.body.originalAvailable, false);
-    await eventually(copyDeleted(copy.id), 'the document original should be purged');
-    const other = (await upload(user, { name: 'khac.txt', data: text() })).body.document;
-    assert.equal(other.originalAvailable, true, 'other documents keep the account level');
-    assert.equal((await request(`/api/documents/${doc.id}`, { method: 'PATCH', token: user.token, body: {} })).status, 400);
-    assert.equal((await request(`/api/documents/${doc.id}`, { method: 'PATCH', token: users.a.token, body: { privacyLevel: null } })).status, 404);
-    const reset = await request(`/api/documents/${doc.id}`, { method: 'PATCH', token: user.token, body: { privacyLevel: null } });
-    assert.equal(reset.body.privacyOverride, null);
-    assert.equal(reset.body.privacyLevel, 'ENCRYPTED_COPY');
-    assert.equal(reset.body.originalAvailable, false, 'a purged original is not restored by raising the level');
-    await request('/api/account', { method: 'PATCH', token: user.token, body: { privacyLevel: 'TEXT_AND_EMBEDDINGS' } });
-    const tooHigh = await request(`/api/documents/${doc.id}`, { method: 'PATCH', token: user.token, body: { privacyLevel: 'ENCRYPTED_COPY' } });
-    assert.equal(tooHigh.status, 409);
   });
 
   test('housekeeping: expired temporary copies and abandoned uploads are cleaned up', async () => {

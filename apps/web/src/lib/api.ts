@@ -271,7 +271,7 @@ export class AuthClient {
   }
 
   /** Keep the shared session snapshot in sync after the user edits their account. */
-  async updateAccount(input: { displayName?: string; timezone?: string; privacyLevel?: User['privacyLevel'] }): Promise<User> {
+  async updateAccount(input: { displayName?: string; timezone?: string }): Promise<User> {
     const user = await this.request<User>('/account', { method: 'PATCH', body: JSON.stringify(input) });
     this.#publish(user);
     return user;
