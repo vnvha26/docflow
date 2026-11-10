@@ -3,6 +3,7 @@ import { ParseState, Prisma, PrivacyLevel } from '@prisma/client';
 import { Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { FileVault } from '../crypto/file-vault.service';
+import { lockUserFiles } from '../database/locks';
 import { PrismaService } from '../database/prisma.service';
 import { ClaimedJob, JobQueue } from '../jobs/job-queue.service';
 import { PrivacyPolicyChangedError, RetentionService } from '../retention/retention.service';
@@ -49,15 +50,21 @@ export class ParseService {
       select: { id: true, state: true, storageKey: true, encryptionKeyRef: true },
     });
     if (!copy?.encryptionKeyRef) {
-      await this.store(target, { kind: 'failed', code: 'SOURCE_UNAVAILABLE' });
+      await this.store(target, { kind: 'failed', code: 'SOURCE_UNAVAILABLE' }, job);
       return;
     }
     if (copy.state === 'UPLOADING') throw new Error('SOURCE_NOT_READY');
     if (!await this.jobs.extend(job, PARSE_LEASE_SECONDS)) throw new Error('LEASE_LOST');
-    await this.prisma.documentVersion.updateMany({
-      where: { id: target.versionId, parseState: { in: ['PENDING', 'FAILED'] } },
-      data: { parseState: 'PROCESSING', parseErrorCode: null },
+    const started = await this.prisma.$transaction(async (transaction) => {
+      await lockUserFiles(transaction, target.userId);
+      if (!await this.jobs.holds(transaction, job)) return false;
+      await transaction.documentVersion.updateMany({
+        where: { id: target.versionId, parseState: { in: ['PENDING', 'FAILED'] } },
+        data: { parseState: 'PROCESSING', parseErrorCode: null },
+      });
+      return true;
     });
+    if (!started) throw new Error('LEASE_LOST');
     const file = await this.read(copy.storageKey, copy.encryptionKeyRef, { copyId: copy.id, userId: target.userId }, Number(version.byteSize));
     let outcome: Outcome;
     try {
@@ -77,7 +84,7 @@ export class ParseService {
       file.fill(0);
     }
     if (!await this.jobs.extend(job, PARSE_LEASE_SECONDS)) throw new Error('LEASE_LOST');
-    await this.store(target, outcome);
+    await this.store(target, outcome, job);
   }
 
   async markFailed(job: ClaimedJob, code: string): Promise<void> {
@@ -112,7 +119,7 @@ export class ParseService {
     return file;
   }
 
-  private async store(target: Target, outcome: Outcome): Promise<void> {
+  private async store(target: Target, outcome: Outcome, job?: ClaimedJob): Promise<void> {
     const { userId, documentId, versionId } = target;
     const released = await this.prisma.$transaction(async (transaction) => {
       let level: PrivacyLevel;
@@ -122,6 +129,7 @@ export class ParseService {
         if (error instanceof PrivacyPolicyChangedError) return false;
         throw error;
       }
+      if (job && !await this.jobs.holds(transaction, job)) throw new Error('LEASE_LOST');
       const current = await transaction.documentVersion.findFirst({ where: { id: versionId, documentId }, select: { parseState: true } });
       if (!current || DONE.includes(current.parseState)) return false;
       await transaction.documentChunk.deleteMany({ where: { versionId } });

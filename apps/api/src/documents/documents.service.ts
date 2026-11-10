@@ -2,7 +2,7 @@ import {
   ConflictException, HttpException, HttpStatus, Inject, Injectable, Logger, NotFoundException,
   ServiceUnavailableException, UnprocessableEntityException, UnsupportedMediaTypeException,
 } from '@nestjs/common';
-import { FileCopyKind, Prisma, PrivacyLevel } from '@prisma/client';
+import { FileCopyKind, ParseState, Prisma, PrivacyLevel } from '@prisma/client';
 import { createHash, randomUUID } from 'node:crypto';
 import { Readable, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -19,7 +19,7 @@ import { ObjectStorage, storageKey } from '../storage/object-storage';
 import { cleanTitle, sanitizeFileName, titleFromFileName } from './file-name';
 import { detectFileType } from './file-type';
 import { effectivePrivacy } from './privacy';
-import { DocumentSummary, MAX_UPLOAD_BYTES, StorageUsage, TOO_LARGE_MESSAGE, UploadResult } from './documents.types';
+import { DocumentFilters, DocumentStatusFilter, DocumentSummary, DocumentTypeFilter, MAX_UPLOAD_BYTES, StorageUsage, TOO_LARGE_MESSAGE, UploadResult } from './documents.types';
 
 export interface UploadedFile { buffer: Buffer; originalname: string; size: number }
 
@@ -67,6 +67,30 @@ function toSummary(row: SummaryRow): DocumentSummary {
     summary: privacyLevel === 'STRUCTURED_ONLY' ? null : row.extractedMetadata[0]?.summary ?? null,
     detailsDeleted,
   };
+}
+
+const TYPE_MIME: Record<DocumentTypeFilter, string> = {
+  pdf: 'application/pdf',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  txt: 'text/plain',
+};
+const STATUS_STATES: Record<DocumentStatusFilter, ParseState[] | null> = {
+  read: ['SUCCEEDED'], processing: ['PENDING', 'PROCESSING'], problem: ['FAILED', 'UNSUPPORTED'], 'details-deleted': null,
+};
+const DETAILS_KEPT: Prisma.DocumentWhereInput = { OR: [{ privacyLevel: null }, { privacyLevel: { not: 'STRUCTURED_ONLY' } }] };
+
+function versionFilter(filters: DocumentFilters): Prisma.DocumentVersionWhereInput {
+  const states = filters.status ? STATUS_STATES[filters.status] : null;
+  return {
+    ...(filters.type ? { mimeType: TYPE_MIME[filters.type] } : {}),
+    ...(states ? { parseState: { in: states } } : {}),
+  };
+}
+
+function detailsFilter(status?: DocumentStatusFilter): Prisma.DocumentWhereInput[] {
+  if (status === 'details-deleted') return [{ privacyLevel: 'STRUCTURED_ONLY' }];
+  if (status === 'read' || status === 'problem') return [DETAILS_KEPT];
+  return [];
 }
 
 function fieldError(field: string, message: string, status = HttpStatus.BAD_REQUEST): HttpException {
@@ -328,12 +352,15 @@ export class DocumentsService {
     }
   }
 
-  async list(userId: string, cursor?: string, limit = 20): Promise<{ items: DocumentSummary[]; nextCursor: string | null }> {
+  async list(userId: string, cursor?: string, limit = 20, filters: DocumentFilters = {}): Promise<{ items: DocumentSummary[]; nextCursor: string | null }> {
     const after = cursor ? decodeCursor(cursor) : null;
     const rows = await this.prisma.document.findMany({
       where: {
-        userId, deletedAt: null, versions: { some: {} },
-        ...(after ? { OR: [{ createdAt: { lt: after.createdAt } }, { createdAt: after.createdAt, id: { lt: after.id } }] } : {}),
+        userId, deletedAt: null, versions: { some: versionFilter(filters) },
+        AND: [
+          ...(after ? [{ OR: [{ createdAt: { lt: after.createdAt } }, { createdAt: after.createdAt, id: { lt: after.id } }] }] : []),
+          ...detailsFilter(filters.status),
+        ],
       },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,

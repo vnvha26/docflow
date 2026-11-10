@@ -871,6 +871,42 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal(after.status === 'PENDING' || after.status === 'PROCESSING', false, 'the page stops waiting');
   });
 
+  test('layers: details deleted just after the worker checked its lease never leave the document "being read"', async () => {
+    const { JobQueue } = await compiled('jobs/job-queue.service.js');
+    const { ParseService } = await compiled('parsing/parse.service.js');
+    const { RetentionService } = await compiled('retention/retention.service.js');
+    await stopWorker();
+    try {
+      const doc = (await upload(users.c, { name: 'xoa-luc-bat-dau-doc.txt', data: text() })).body.document;
+      const queue = new JobQueue(db);
+      const claimed = await queue.claim(['PARSE'], 50);
+      const job = claimed.find((entry) => entry.documentId === doc.id);
+      assert.ok(job, 'the parse job is claimed');
+      await db.aIJob.updateMany({
+        where: { id: { in: claimed.filter((entry) => entry !== job).map((entry) => entry.id) } },
+        data: { status: 'QUEUED', leaseOwner: null, leaseUntil: null, attempts: { decrement: 1 } },
+      });
+      const jobs = {
+        extend: async (...args) => {
+          const held = await queue.extend(...args);
+          assert.equal((await request(`/api/documents/${doc.id}/details`, { method: 'DELETE', token: users.c.token })).status, 202);
+          return held;
+        },
+        holds: (...args) => queue.holds(...args),
+      };
+      const parser = new ParseService(db, null, null, new RetentionService(db, null, null), jobs);
+      await assert.rejects(parser.handle(job), /LEASE_LOST/);
+      const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: doc.id } });
+      assert.equal(version.parseState, 'FAILED', 'the cancelled job must not mark the version as being read');
+      assert.equal(version.parseErrorCode, 'DETAILS_DELETED');
+      const after = (await request(`/api/documents/${doc.id}`, { token: users.c.token })).body;
+      assert.equal(after.detailsDeleted, true);
+      assert.equal(after.problem, null);
+    } finally {
+      startWorker();
+    }
+  });
+
   test('layers: deleting everything also clears the extracted info and cancels the obligations', async () => {
     const doc = (await upload(users.c, { name: 'xoa-het.txt', data: text() })).body.document;
     assert.equal((await parsed(users.c, doc.id)).status, 'SUCCEEDED');
@@ -990,6 +1026,62 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal(rewrapped.sha256, copy.sha256, 'the stored file itself is untouched');
     const download = await request(`/api/documents/${doc.id}/original`, { token: users.c.token });
     assert.equal(sha256(download.raw), sha256(content));
+  });
+
+  test('B5 filters: by file type and reading status, combined, paginated and only for the owner', async () => {
+    const user = await createUser('filters', 'ENCRYPTED_COPY');
+    const ids = {};
+    for (const [key, file] of [
+      ['pdf', { name: 'doc.pdf', data: textPdf([[`Hop dong ${randomUUID()}`]]) }],
+      ['docx', { name: 'doc.docx', data: docxWith([`Hợp đồng ${randomUUID()}`]) }],
+      ['txt', { name: 'doc.txt', data: text() }],
+      ['broken', { name: 'hong.pdf', data: pdf(4096) }],
+    ]) {
+      ids[key] = (await upload(user, file)).body.document.id;
+      await delay(5);
+    }
+    for (const id of Object.values(ids)) await parsed(user, id, 30_000);
+    assert.equal((await request(`/api/documents/${ids.txt}/details`, { method: 'DELETE', token: user.token })).status, 202);
+    const list = async (query) => {
+      const response = await request(`/api/documents?${query}`, { token: user.token });
+      assert.equal(response.status, 200, query);
+      return response.body.items.map((item) => item.id);
+    };
+    assert.deepEqual(await list('type=pdf'), [ids.broken, ids.pdf]);
+    assert.deepEqual(await list('type=docx'), [ids.docx]);
+    assert.deepEqual(await list('type=txt'), [ids.txt]);
+    assert.deepEqual(await list('status=read'), [ids.docx, ids.pdf]);
+    assert.deepEqual(await list('status=problem'), [ids.broken]);
+    assert.deepEqual(await list('status=details-deleted'), [ids.txt]);
+    assert.deepEqual(await list('status=processing'), []);
+    assert.deepEqual(await list('type=pdf&status=read'), [ids.pdf]);
+    assert.deepEqual(await list('type=txt&status=read'), [], 'a deleted-details document is not "read"');
+    const first = await request('/api/documents?type=pdf&limit=1', { token: user.token });
+    assert.deepEqual(first.body.items.map((item) => item.id), [ids.broken]);
+    assert.equal(typeof first.body.nextCursor, 'string');
+    assert.deepEqual(await list(`type=pdf&limit=1&cursor=${first.body.nextCursor}`), [ids.pdf], 'the cursor keeps the filter');
+    for (const query of ['type=png', 'status=done', 'type=PDF']) {
+      const response = await request(`/api/documents?${query}`, { token: user.token });
+      assert.equal(response.status, 400, query);
+      assert.ok(response.body.fieldErrors?.[query.split('=')[0]], query);
+    }
+    const stopped = (await upload(user, { name: 'dung-doc.txt', data: text() })).body.document.id;
+    assert.equal((await request(`/api/documents/${stopped}/details`, { method: 'DELETE', token: user.token })).status, 202);
+    assert.deepEqual(await list('status=details-deleted'), [stopped, ids.txt]);
+    assert.deepEqual(await list('status=problem'), [ids.broken], 'details deleted before the file was read are not a reading problem');
+    assert.deepEqual(await list('status=read'), [ids.docx, ids.pdf]);
+    const waiting = await db.document.create({ data: { userId: user.id, title: 'Đang chờ', source: 'WEB_UPLOAD' } });
+    await db.documentVersion.create({ data: {
+      userId: user.id, documentId: waiting.id, number: 1, sha256: sha256(randomUUID()), byteSize: 1n, mimeType: 'text/plain', originalFilename: 'cho.txt', source: 'WEB_UPLOAD',
+    } });
+    assert.deepEqual(await list('status=processing'), [waiting.id]);
+    assert.deepEqual(await list('status=processing&type=txt'), [waiting.id]);
+    assert.deepEqual(await list('status=processing&type=pdf'), []);
+    assert.equal((await request(`/api/documents/${ids.pdf}`, { method: 'DELETE', token: user.token })).status, 204);
+    assert.deepEqual(await list('type=pdf'), [ids.broken], 'a deleted document leaves every filtered list');
+    assert.deepEqual(await list('status=read'), [ids.docx]);
+    const others = await request('/api/documents?type=pdf&limit=50', { token: users.b.token });
+    assert.equal(others.body.items.some((item) => Object.values(ids).includes(item.id)), false);
   });
 
   test('listing is per user, newest first, with cursor pagination', async () => {

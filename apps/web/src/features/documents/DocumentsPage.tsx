@@ -3,7 +3,11 @@ import type { ChangeEvent, DragEvent } from 'react';
 import { Icon } from '../../components/Brand';
 import { ApiError, StaleSessionError } from '../../lib/api';
 import type { User } from '../../lib/api';
-import { canViewOriginal, documentsApi, fileTypeLabel, formatBytes, infoLine, isChanging, isProcessing, MAX_UPLOAD_MB, precheck, problemMessage } from '../../lib/documents';
+import {
+  canViewOriginal, documentsApi, fileTypeLabel, formatBytes, infoLine, isChanging, isProcessing, matchesFilters, MAX_UPLOAD_MB, precheck, problemMessage,
+  statusFilterLabels, typeFilterLabels,
+} from '../../lib/documents';
+import type { DocumentFilters, DocumentStatusFilter, DocumentTypeFilter } from '../../lib/documents';
 import type { DocumentSummary, StorageUsage } from '../../lib/documents';
 import { DocumentOptions } from './DocumentOptions';
 import { openOriginal } from './original-file';
@@ -54,6 +58,11 @@ export function DocumentsPage({ user }: { user: User }) {
   const [dragging, setDragging] = useState(false);
   const [summaryOf, setSummaryOf] = useState<DocumentSummary | null>(null);
   const [viewing, setViewing] = useState<string | null>(null);
+  const [filters, setFilters] = useState<DocumentFilters>({});
+  const currentFilters = useRef(filters);
+  currentFilters.current = filters;
+  const listRun = useRef(0);
+  const filtered = Boolean(filters.type || filters.status);
   const [usage, setUsage] = useState<StorageUsage | null>(null);
   const input = useRef<HTMLInputElement>(null);
   const queue = useRef(Promise.resolve());
@@ -72,19 +81,28 @@ export function DocumentsPage({ user }: { user: User }) {
       setDocuments([]);
       setCursor(null);
       setUsage(null);
-      setLoading(true);
+      setFilters({});
     }
+    refreshUsage();
+  }, [user.id, refreshUsage]);
+
+  useEffect(() => {
     let active = true;
-    documentsApi.list().then((page) => {
+    listRun.current++;
+    setLoading(true);
+    setError('');
+    documentsApi.list(undefined, { type: filters.type, status: filters.status }).then((page) => {
       if (!active) return;
       setDocuments(page.items);
       setCursor(page.nextCursor);
     }).catch((failure: unknown) => {
-      if (active && !(failure instanceof StaleSessionError)) setError(failureMessage(failure, 'Chưa thể tải danh sách tài liệu.'));
+      if (!active) return;
+      setDocuments([]);
+      setCursor(null);
+      if (!(failure instanceof StaleSessionError)) setError(failureMessage(failure, 'Chưa thể tải danh sách tài liệu.'));
     }).finally(() => { if (active) setLoading(false); });
-    refreshUsage();
     return () => { active = false; };
-  }, [user.id, refreshUsage]);
+  }, [user.id, filters.type, filters.status]);
 
   const changingIds = documents.filter(isChanging).slice(0, POLL_BATCH).map((item) => item.id).join(',');
 
@@ -113,14 +131,16 @@ export function DocumentsPage({ user }: { user: User }) {
 
   async function loadMore() {
     if (!cursor) return;
+    const run = listRun.current;
     setLoading(true);
     try {
-      const page = await documentsApi.list(cursor);
+      const page = await documentsApi.list(cursor, currentFilters.current);
+      if (run !== listRun.current) return;
       setDocuments((previous) => [...previous, ...page.items.filter((item) => !previous.some((known) => known.id === item.id))]);
       setCursor(page.nextCursor);
     } catch (failure) {
-      if (!(failure instanceof StaleSessionError)) setError(failureMessage(failure, 'Chưa thể tải thêm tài liệu.'));
-    } finally { setLoading(false); }
+      if (run === listRun.current && !(failure instanceof StaleSessionError)) setError(failureMessage(failure, 'Chưa thể tải thêm tài liệu.'));
+    } finally { if (run === listRun.current) setLoading(false); }
   }
 
   function update(key: string, patch: Partial<UploadItem>) {
@@ -143,7 +163,9 @@ export function DocumentsPage({ user }: { user: User }) {
         try {
           const result = await documentsApi.upload(file, owner);
           if (currentUser.current !== owner) return;
-          setDocuments((previous) => [result.document, ...previous.filter((known) => known.id !== result.document.id)]);
+          if (matchesFilters(result.document, currentFilters.current)) {
+            setDocuments((previous) => [result.document, ...previous.filter((known) => known.id !== result.document.id)]);
+          }
           update(item.key, { state: result.duplicate ? 'duplicate' : 'done' });
           if (!result.duplicate && result.document.originalAvailable) refreshUsage();
         } catch (failure) {
@@ -222,11 +244,30 @@ export function DocumentsPage({ user }: { user: User }) {
     <section className="profile-card documents-card" aria-labelledby="documents-title">
       <div className="profile-heading"><div><span className="auth-kicker">THƯ VIỆN</span><h2 id="documents-title">Tài liệu của bạn</h2></div><span className="profile-icon"><Icon name="folder" size={24} /></span></div>
       {error && <div className="form-alert documents-alert" role="alert"><span aria-hidden="true">!</span><p>{error}</p></div>}
-      {!loading && !documents.length && !error && <div className="documents-empty">
-        <span><Icon name="folder" size={26} /></span>
-        <strong>Chưa có tài liệu nào</strong>
-        <p>Kéo thả hợp đồng, hóa đơn hay giấy bảo hành vào ô phía trên để bắt đầu.</p>
+      {(documents.length > 0 || filtered) && <div className="document-filters" role="group" aria-label="Lọc tài liệu">
+        <div className="filter-chips">
+          {([undefined, 'pdf', 'docx', 'txt'] as (DocumentTypeFilter | undefined)[]).map((type) =>
+            <button key={type ?? 'all'} type="button" className="filter-chip" aria-pressed={filters.type === type}
+              onClick={() => setFilters((current) => ({ ...current, type }))}>{type ? typeFilterLabels[type] : 'Tất cả'}</button>)}
+        </div>
+        <select className="filter-select" aria-label="Lọc theo trạng thái" value={filters.status ?? ''}
+          onChange={(event) => setFilters((current) => ({ ...current, status: (event.target.value || undefined) as DocumentStatusFilter | undefined }))}>
+          <option value="">Mọi trạng thái</option>
+          {(Object.keys(statusFilterLabels) as DocumentStatusFilter[]).map((status) => <option key={status} value={status}>{statusFilterLabels[status]}</option>)}
+        </select>
       </div>}
+      {!loading && !documents.length && !error && (filtered
+        ? <div className="documents-empty">
+          <span><Icon name="folder" size={26} /></span>
+          <strong>Không có tài liệu khớp bộ lọc</strong>
+          <p>Thử chọn loại tệp hoặc trạng thái khác.</p>
+          <button type="button" className="button-secondary" onClick={() => setFilters({})}>Bỏ lọc</button>
+        </div>
+        : <div className="documents-empty">
+          <span><Icon name="folder" size={26} /></span>
+          <strong>Chưa có tài liệu nào</strong>
+          <p>Kéo thả hợp đồng, hóa đơn hay giấy bảo hành vào ô phía trên để bắt đầu.</p>
+        </div>)}
       <ul className="document-list" aria-busy={loading}>
         {documents.length > 0 && <li className="document-columns" aria-hidden="true"><span /><span>Tài liệu</span><span>Cập nhật</span><span /></li>}
         {documents.map((item) => <li key={item.id} className="document-row">
@@ -258,7 +299,7 @@ export function DocumentsPage({ user }: { user: User }) {
       </ul>
       {summaryOf && <SummaryDialog document={summaryOf} onClose={() => setSummaryOf(null)} />}
       {(loading || documents.length > 0 || cursor) && <div className="profile-bottom">
-        <p role="status">{loading ? 'Đang tải danh sách…' : `${documents.length} tài liệu`}</p>
+        <p role="status">{loading ? 'Đang tải danh sách…' : `${documents.length}${cursor ? '+' : ''} tài liệu${filtered ? ' khớp bộ lọc' : ''}`}</p>
         {cursor && <button type="button" className="button-secondary" onClick={loadMore} disabled={loading}>Tải thêm</button>}
       </div>}
     </section>

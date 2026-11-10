@@ -77,7 +77,7 @@ export class DocumentsController {
   @ApiOperation({ summary: 'Danh sách tài liệu của người dùng hiện tại, mới nhất trước (phân trang bằng cursor).' })
   @ApiOkResponse({ schema: { type: 'object', properties: { items: { type: 'array', items: summarySchema }, nextCursor: { type: 'string', nullable: true } } } })
   list(@Req() request: AuthRequest, @Query() query: ListDocumentsQuery): Promise<{ items: DocumentSummary[]; nextCursor: string | null }> {
-    return this.documents.list(request.auth!.user.id, query.cursor, query.limit);
+    return this.documents.list(request.auth!.user.id, query.cursor, query.limit, { type: query.type, status: query.status });
   }
 
   @Get('usage')

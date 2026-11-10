@@ -1,4 +1,4 @@
-import { authClient } from './api';
+import { authClient } from './api.ts';
 
 export type DocumentStatus = 'PENDING' | 'PROCESSING' | 'SUCCEEDED' | 'FAILED' | 'UNSUPPORTED';
 
@@ -21,6 +21,27 @@ export interface DocumentSummary {
 export const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 
 export const isProcessing = (document: Pick<DocumentSummary, 'status'>) => document.status === 'PENDING' || document.status === 'PROCESSING';
+
+export type DocumentTypeFilter = 'pdf' | 'docx' | 'txt';
+export type DocumentStatusFilter = 'read' | 'processing' | 'problem' | 'details-deleted';
+export interface DocumentFilters { type?: DocumentTypeFilter; status?: DocumentStatusFilter }
+
+export const typeFilterLabels: Record<DocumentTypeFilter, string> = { pdf: 'PDF', docx: 'DOCX', txt: 'TXT' };
+export const statusFilterLabels: Record<DocumentStatusFilter, string> = {
+  read: 'Đã đọc nội dung', processing: 'Đang đọc', problem: 'Không đọc được', 'details-deleted': 'Đã xóa bản chi tiết',
+};
+const filterMime: Record<DocumentTypeFilter, string> = { pdf: 'application/pdf', docx: DOCX_MIME, txt: 'text/plain' };
+
+export function matchesFilters(document: Pick<DocumentSummary, 'file' | 'status' | 'detailsDeleted'>, filters: DocumentFilters): boolean {
+  if (filters.type && document.file.mimeType !== filterMime[filters.type]) return false;
+  switch (filters.status) {
+    case 'read': return document.status === 'SUCCEEDED' && !document.detailsDeleted;
+    case 'processing': return document.status === 'PENDING' || document.status === 'PROCESSING';
+    case 'problem': return (document.status === 'FAILED' || document.status === 'UNSUPPORTED') && !document.detailsDeleted;
+    case 'details-deleted': return document.detailsDeleted;
+    default: return true;
+  }
+}
 
 export const isChanging = (document: Pick<DocumentSummary, 'status' | 'originalDeleting'>) => isProcessing(document) || document.originalDeleting;
 
@@ -73,7 +94,7 @@ export const canViewOriginal = (document: Pick<DocumentSummary, 'file' | 'origin
   document.originalAvailable && ['application/pdf', 'text/plain', DOCX_MIME].includes(document.file.mimeType);
 
 export function precheck(file: File): string | null {
-  const extension = file.name.split('.').pop()?.toLowerCase() ?? '';
+  const extension = file.name.includes('.') ? file.name.slice(file.name.lastIndexOf('.') + 1).toLowerCase() : '';
   if (!ACCEPTED_EXTENSIONS.includes(extension)) return 'Chỉ hỗ trợ tệp PDF, DOCX và TXT.';
   if (file.size === 0) return 'Tệp rỗng, không có gì để lưu.';
   if (file.size > MAX_UPLOAD_BYTES) return `Tệp vượt quá ${MAX_UPLOAD_MB} MB.`;
@@ -88,8 +109,10 @@ export function formatBytes(bytes: number): string {
 }
 
 export const documentsApi = {
-  list(cursor?: string) {
-    const query = new URLSearchParams({ limit: '20', ...(cursor ? { cursor } : {}) });
+  list(cursor?: string, filters: DocumentFilters = {}) {
+    const query = new URLSearchParams({
+      limit: '20', ...(cursor ? { cursor } : {}), ...(filters.type ? { type: filters.type } : {}), ...(filters.status ? { status: filters.status } : {}),
+    });
     return authClient.request<{ items: DocumentSummary[]; nextCursor: string | null }>(`/documents?${query}`);
   },
   get(id: string) {

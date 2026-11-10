@@ -85,6 +85,10 @@ export class JobQueue {
     return changed === 1;
   }
 
+  async holds(db: Prisma.TransactionClient, job: ClaimedJob): Promise<boolean> {
+    return await db.aIJob.count({ where: { id: job.id, status: 'RUNNING', leaseOwner: this.workerId } }) === 1;
+  }
+
   async complete(job: ClaimedJob): Promise<boolean> {
     const result = await this.prisma.aIJob.updateMany({
       where: { id: job.id, status: 'RUNNING', leaseOwner: this.workerId },
