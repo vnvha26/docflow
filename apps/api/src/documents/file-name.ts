@@ -27,6 +27,12 @@ export function titleFromFileName(fileName: string): string {
   return fileName.replace(/\.[^.]+$/, '') || fileName;
 }
 
+export function downloadName(title: string, originalFileName: string): string {
+  const extension = /\.([A-Za-z0-9]{1,10})$/.exec(originalFileName)?.[1]?.toLowerCase();
+  if (!extension) return originalFileName;
+  return sanitizeFileName(title.replace(/[\\/]/g, '_'), extension);
+}
+
 export function cleanTitle(value: string | undefined): string | undefined {
   if (value === undefined) return undefined;
   const title = Array.from(clean(value)).slice(0, 255).join('').trim();

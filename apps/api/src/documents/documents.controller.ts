@@ -1,5 +1,5 @@
 import {
-  Body, Controller, Delete, Get, HttpCode, Inject, Logger, Param, ParseUUIDPipe, Post, Query, Req, Res, UploadedFile,
+  Body, Controller, Delete, Get, HttpCode, Inject, Logger, Param, ParseUUIDPipe, Patch, Post, Query, Req, Res, UploadedFile,
   UseFilters, UseGuards, UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
@@ -14,9 +14,9 @@ import { pipeline } from 'node:stream/promises';
 import { AccessTokenGuard, AuthOriginGuard } from '../auth/auth.guards';
 import { AuthRequest } from '../auth/auth.types';
 import { RetentionService } from '../retention/retention.service';
-import { ListDocumentsQuery, UploadDocumentDto } from './documents.dto';
+import { ListDocumentsQuery, UpdateDocumentDto, UploadDocumentDto } from './documents.dto';
 import { DocumentsService, UploadedFile as StoredUpload } from './documents.service';
-import { DocumentSummary, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, StorageUsage, UploadResult } from './documents.types';
+import { DocumentSummary, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, RenameResult, StorageUsage, UploadResult } from './documents.types';
 import { contentDisposition } from './file-name';
 import { UploadErrorsFilter } from './upload-errors.filter';
 import { UploadGuard } from './upload.guard';
@@ -25,7 +25,7 @@ const summarySchema = {
   type: 'object',
   properties: {
     id: { type: 'string', format: 'uuid' }, title: { type: 'string' }, createdAt: { type: 'string', format: 'date-time' },
-    typeCode: { type: 'string', nullable: true },
+    typeCode: { type: 'string', nullable: true }, folderId: { type: 'string', format: 'uuid', nullable: true },
     status: { type: 'string', enum: ['PENDING', 'PROCESSING', 'SUCCEEDED', 'FAILED', 'UNSUPPORTED'] },
     file: { type: 'object', properties: { name: { type: 'string' }, mimeType: { type: 'string' }, byteSize: { type: 'integer' } } },
     originalAvailable: { type: 'boolean' }, originalDeleting: { type: 'boolean' },
@@ -52,13 +52,13 @@ export class DocumentsController {
   @UseFilters(UploadErrorsFilter)
   @UseInterceptors(FileInterceptor('file', {
     storage: memoryStorage(),
-    limits: { fileSize: MAX_UPLOAD_BYTES, files: 1, fields: 2, fieldSize: 2048, parts: 4 },
+    limits: { fileSize: MAX_UPLOAD_BYTES, files: 1, fields: 3, fieldSize: 2048, parts: 5 },
     defParamCharset: 'utf8',
   } as Parameters<typeof FileInterceptor>[1]))
   @ApiOperation({ summary: `Tải lên PDF/DOCX/TXT ≤ ${MAX_UPLOAD_MB} MB. Trùng nội dung với tài liệu đã có → 200 và trả tài liệu cũ.` })
   @ApiConsumes('multipart/form-data')
-  @ApiBody({ schema: { type: 'object', required: ['file'], properties: { file: { type: 'string', format: 'binary' }, title: { type: 'string', maxLength: 255 } } } })
-  @ApiCreatedResponse({ schema: { type: 'object', properties: { document: summarySchema, duplicate: { type: 'boolean' } } } })
+  @ApiBody({ schema: { type: 'object', required: ['file'], properties: { file: { type: 'string', format: 'binary' }, title: { type: 'string', maxLength: 255 }, folderId: { type: 'string', format: 'uuid' } } } })
+  @ApiCreatedResponse({ schema: { type: 'object', properties: { document: summarySchema, duplicate: { type: 'boolean' }, renamed: { type: 'boolean' } } } })
   @ApiPayloadTooLargeResponse({ description: `Tệp quá ${MAX_UPLOAD_MB} MB hoặc vượt hạn mức bản gốc mức 3.` })
   @ApiUnsupportedMediaTypeResponse({ description: 'Không phải PDF, DOCX hoặc TXT UTF-8 (kiểm bằng nội dung tệp).' })
   @ApiTooManyRequestsResponse()
@@ -68,7 +68,7 @@ export class DocumentsController {
     @Req() request: AuthRequest,
     @Res({ passthrough: true }) response: Response,
   ): Promise<UploadResult> {
-    const result = await this.documents.upload(request.auth!.user.id, file, body.title);
+    const result = await this.documents.upload(request.auth!.user.id, file, body.title, body.folderId ?? null);
     response.status(result.duplicate ? 200 : 201);
     return result;
   }
@@ -77,7 +77,7 @@ export class DocumentsController {
   @ApiOperation({ summary: 'Danh sách tài liệu của người dùng hiện tại, mới nhất trước (phân trang bằng cursor).' })
   @ApiOkResponse({ schema: { type: 'object', properties: { items: { type: 'array', items: summarySchema }, nextCursor: { type: 'string', nullable: true } } } })
   list(@Req() request: AuthRequest, @Query() query: ListDocumentsQuery): Promise<{ items: DocumentSummary[]; nextCursor: string | null }> {
-    return this.documents.list(request.auth!.user.id, query.cursor, query.limit, { type: query.type, status: query.status });
+    return this.documents.list(request.auth!.user.id, query.cursor, query.limit, { type: query.type, folder: query.folder?.toLowerCase(), sort: query.sort });
   }
 
   @Get('usage')
@@ -92,6 +92,14 @@ export class DocumentsController {
   @ApiNotFoundResponse()
   get(@Param('id', new ParseUUIDPipe()) id: string, @Req() request: AuthRequest): Promise<DocumentSummary> {
     return this.documents.get(request.auth!.user.id, id);
+  }
+
+  @Patch(':id')
+  @ApiOperation({ summary: 'Đổi tên hiển thị và/hoặc chuyển tài liệu sang thư mục khác. Trùng tên trong thư mục → tự thêm hậu tố.' })
+  @ApiOkResponse({ schema: { type: 'object', properties: { document: summarySchema, renamed: { type: 'boolean' } } } })
+  @ApiNotFoundResponse({ description: 'Tài liệu hoặc thư mục không phải của bạn.' })
+  update(@Param('id', new ParseUUIDPipe()) id: string, @Req() request: AuthRequest, @Body() body: UpdateDocumentDto): Promise<RenameResult> {
+    return this.documents.update(request.auth!.user.id, id, body);
   }
 
   @Delete(':id')

@@ -356,7 +356,7 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
   test('an identical upload still storing its blob is waited for, never reported as saved before it is', async () => {
     const user = await createUser('in-flight');
     const inFlight = async (content, createdAt = new Date()) => {
-      const document = await db.document.create({ data: { userId: user.id, title: 'Đang tải', source: 'WEB_UPLOAD' } });
+      const document = await db.document.create({ data: { userId: user.id, title: `Đang tải ${randomUUID()}`, source: 'WEB_UPLOAD' } });
       const version = await db.documentVersion.create({ data: { userId: user.id, documentId: document.id, number: 1, sha256: sha256(content), byteSize: BigInt(content.length), mimeType: 'text/plain', originalFilename: 'dang-tai.txt', source: 'WEB_UPLOAD' } });
       const copy = await db.fileCopy.create({ data: { userId: user.id, documentId: document.id, versionId: version.id, kind: 'WEB_SOURCE', state: 'UPLOADING', storageKey: `web-source/${user.id}/${randomUUID()}`, contentType: 'application/octet-stream', byteSize: 7n, encryptionKeyRef: 'w1.it.x', createdAt } });
       return { document, version, copy };
@@ -845,7 +845,7 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     }), PrivacyPolicyChangedError, 'a stale worker cannot write the deleted text back');
     assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), 0);
     const raise = await request(`/api/documents/${doc.id}`, { method: 'PATCH', token: users.c.token, body: { privacyLevel: null } });
-    assert.equal(raise.status, 404, 'there is no API to bring a deleted layer back');
+    assert.equal(raise.status, 400, 'there is no API to bring a deleted layer back');
     const metadata = await db.extractedMetadata.findFirstOrThrow({ where: { documentId: doc.id } });
     assert.equal(metadata.summary, null);
     assert.deepEqual(metadata.fields, { deposit: '16000000' }, 'structured info stays');
@@ -1028,7 +1028,7 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal(sha256(download.raw), sha256(content));
   });
 
-  test('B5 filters: by file type and reading status, combined, paginated and only for the owner', async () => {
+  test('B5 filters: by file type, paginated and only for the owner; there is no status filter', async () => {
     const user = await createUser('filters', 'ENCRYPTED_COPY');
     const ids = {};
     for (const [key, file] of [
@@ -1050,38 +1050,229 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.deepEqual(await list('type=pdf'), [ids.broken, ids.pdf]);
     assert.deepEqual(await list('type=docx'), [ids.docx]);
     assert.deepEqual(await list('type=txt'), [ids.txt]);
-    assert.deepEqual(await list('status=read'), [ids.docx, ids.pdf]);
-    assert.deepEqual(await list('status=problem'), [ids.broken]);
-    assert.deepEqual(await list('status=details-deleted'), [ids.txt]);
-    assert.deepEqual(await list('status=processing'), []);
-    assert.deepEqual(await list('type=pdf&status=read'), [ids.pdf]);
-    assert.deepEqual(await list('type=txt&status=read'), [], 'a deleted-details document is not "read"');
     const first = await request('/api/documents?type=pdf&limit=1', { token: user.token });
     assert.deepEqual(first.body.items.map((item) => item.id), [ids.broken]);
     assert.equal(typeof first.body.nextCursor, 'string');
     assert.deepEqual(await list(`type=pdf&limit=1&cursor=${first.body.nextCursor}`), [ids.pdf], 'the cursor keeps the filter');
-    for (const query of ['type=png', 'status=done', 'type=PDF']) {
+    for (const query of ['type=png', 'status=read', 'type=PDF']) {
       const response = await request(`/api/documents?${query}`, { token: user.token });
       assert.equal(response.status, 400, query);
       assert.ok(response.body.fieldErrors?.[query.split('=')[0]], query);
     }
-    const stopped = (await upload(user, { name: 'dung-doc.txt', data: text() })).body.document.id;
-    assert.equal((await request(`/api/documents/${stopped}/details`, { method: 'DELETE', token: user.token })).status, 202);
-    assert.deepEqual(await list('status=details-deleted'), [stopped, ids.txt]);
-    assert.deepEqual(await list('status=problem'), [ids.broken], 'details deleted before the file was read are not a reading problem');
-    assert.deepEqual(await list('status=read'), [ids.docx, ids.pdf]);
-    const waiting = await db.document.create({ data: { userId: user.id, title: 'Đang chờ', source: 'WEB_UPLOAD' } });
-    await db.documentVersion.create({ data: {
-      userId: user.id, documentId: waiting.id, number: 1, sha256: sha256(randomUUID()), byteSize: 1n, mimeType: 'text/plain', originalFilename: 'cho.txt', source: 'WEB_UPLOAD',
-    } });
-    assert.deepEqual(await list('status=processing'), [waiting.id]);
-    assert.deepEqual(await list('status=processing&type=txt'), [waiting.id]);
-    assert.deepEqual(await list('status=processing&type=pdf'), []);
     assert.equal((await request(`/api/documents/${ids.pdf}`, { method: 'DELETE', token: user.token })).status, 204);
     assert.deepEqual(await list('type=pdf'), [ids.broken], 'a deleted document leaves every filtered list');
-    assert.deepEqual(await list('status=read'), [ids.docx]);
     const others = await request('/api/documents?type=pdf&limit=50', { token: users.b.token });
     assert.equal(others.body.items.some((item) => Object.values(ids).includes(item.id)), false);
+  });
+
+  test('folders: create, rename and move keep sibling names unique, the tree within 5 levels, and stay per user', async () => {
+    const user = await createUser('folders', 'ENCRYPTED_COPY');
+    users.f = user;
+    const api = (path, method, body, token = user.token) => request(`/api/folders${path}`, { method, token, body });
+    assert.equal((await request('/api/folders')).status, 401);
+    assert.equal((await request('/api/folders', { method: 'POST', token: user.token, body: { name: 'Sai nguồn' }, requestOrigin: 'https://evil.example' })).status, 403);
+
+    const home = await api('', 'POST', { name: '  Nhà Cầu Giấy ', purpose: ' Giấy tờ căn nhà ở Cầu Giấy ' });
+    assert.equal(home.status, 201);
+    assert.deepEqual([home.body.folder.name, home.body.folder.purpose, home.body.folder.parentId, home.body.renamed], ['Nhà Cầu Giấy', 'Giấy tờ căn nhà ở Cầu Giấy', null, false]);
+    assertPrivate(home.body);
+    const twin = await api('', 'POST', { name: 'NHÀ CẦU GIẤY' });
+    assert.deepEqual([twin.body.folder.name, twin.body.renamed], ['NHÀ CẦU GIẤY (2)', true], 'a sibling with the same name gets a suffix');
+    const third = await api('', 'POST', { name: 'nhà cầu giấy' });
+    assert.equal(third.body.folder.name, 'nhà cầu giấy (3)');
+    const bills = await api('', 'POST', { name: 'Hóa đơn', parentId: home.body.folder.id });
+    assert.deepEqual([bills.body.folder.name, bills.body.folder.parentId], ['Hóa đơn', home.body.folder.id]);
+    assert.equal((await api('', 'POST', { name: 'hoá đơn', parentId: home.body.folder.id })).body.folder.name, 'hoá đơn (2)', 'the tone position does not make a new name');
+    assert.equal((await api('', 'POST', { name: 'Hóa đơn' })).body.renamed, false, 'the same name is free one level up');
+
+    for (const name of ['', '   ', 'a/b', 'a\\b', 'x'.repeat(101), 42]) {
+      const bad = await api('', 'POST', { name });
+      assert.equal(bad.status, 400, String(name));
+      assert.ok(bad.body.fieldErrors?.name, String(name));
+    }
+    assert.ok((await api('', 'POST', { name: 'Dài', purpose: 'x'.repeat(501) })).body.fieldErrors?.purpose);
+    assert.equal((await api('', 'POST', { name: 'Thừa trường', color: 'red' })).status, 400);
+    assert.equal((await api('', 'POST', { name: 'Cha sai', parentId: 'not-a-uuid' })).status, 400);
+    const foreign = await api('', 'POST', { name: 'Trong thư mục người khác', parentId: home.body.folder.id }, users.b.token);
+    assert.equal(foreign.status, 404);
+    assert.ok(foreign.body.fieldErrors?.parentId);
+
+    const chain = [home.body.folder.id, bills.body.folder.id];
+    for (let level = 3; level <= 5; level++) {
+      const next = await api('', 'POST', { name: `Cấp ${level}`, parentId: chain.at(-1) });
+      assert.equal(next.status, 201, `level ${level}`);
+      chain.push(next.body.folder.id);
+    }
+    const sixth = await api('', 'POST', { name: 'Cấp 6', parentId: chain[4] });
+    assert.equal(sixth.status, 400);
+    assert.match(sixth.body.fieldErrors.parentId, /5 cấp/);
+
+    const renamed = await api(`/${twin.body.folder.id}`, 'PATCH', { name: 'Xe máy', purpose: 'Đăng ký, bảo hiểm xe' });
+    assert.deepEqual([renamed.status, renamed.body.folder.name, renamed.body.folder.purpose, renamed.body.renamed], [200, 'Xe máy', 'Đăng ký, bảo hiểm xe', false]);
+    assert.equal((await api(`/${twin.body.folder.id}`, 'PATCH', { name: 'xe máy' })).body.folder.name, 'xe máy', 'changing only the case of its own name needs no suffix');
+    assert.equal((await api(`/${twin.body.folder.id}`, 'PATCH', { purpose: null })).body.folder.purpose, null);
+    assert.equal((await api(`/${twin.body.folder.id}`, 'PATCH', { purpose: '' })).body.folder.name, 'xe máy');
+    const clash = await api(`/${third.body.folder.id}`, 'PATCH', { name: 'Xe Máy' });
+    assert.deepEqual([clash.body.folder.name, clash.body.renamed], ['Xe Máy (2)', true]);
+    assert.equal((await api(`/${twin.body.folder.id}`, 'PATCH', {})).status, 400);
+    assert.equal((await api(`/${twin.body.folder.id}`, 'PATCH', { name: 'a/b' })).status, 400);
+    assert.equal((await api(`/${twin.body.folder.id}`, 'PATCH', { name: 'Của tôi' }, users.b.token)).status, 404, 'other users cannot rename it');
+    assert.equal((await api(`/${randomUUID()}`, 'PATCH', { name: 'Không có' })).status, 404);
+
+    for (const target of [home.body.folder.id, chain[4]]) {
+      const loop = await api(`/${home.body.folder.id}`, 'PATCH', { parentId: target });
+      assert.equal(loop.status, 400);
+      assert.match(loop.body.fieldErrors.parentId, /chính nó/);
+    }
+    const tooDeep = await api(`/${home.body.folder.id}`, 'PATCH', { parentId: twin.body.folder.id });
+    assert.equal(tooDeep.status, 400, 'a 5-level subtree cannot go under another folder');
+    assert.match(tooDeep.body.fieldErrors.parentId, /5 cấp/);
+    assert.equal((await api(`/${twin.body.folder.id}`, 'PATCH', { parentId: chain[4] })).status, 400);
+    assert.equal((await api(`/${twin.body.folder.id}`, 'PATCH', { parentId: randomUUID() })).status, 404);
+    const moved = await api(`/${twin.body.folder.id}`, 'PATCH', { parentId: chain[3] });
+    assert.deepEqual([moved.status, moved.body.folder.parentId], [200, chain[3]]);
+    const lifted = await api(`/${chain[4]}`, 'PATCH', { parentId: null });
+    assert.deepEqual([lifted.status, lifted.body.folder.parentId, lifted.body.folder.name], [200, null, 'Cấp 5']);
+    const sameName = await api('', 'POST', { name: 'Cấp 5', parentId: home.body.folder.id });
+    const collided = await api(`/${sameName.body.folder.id}`, 'PATCH', { parentId: null });
+    assert.deepEqual([collided.body.folder.name, collided.body.renamed], ['Cấp 5 (2)', true], 'moving next to a folder with the same name adds a suffix');
+
+    const tree = await api('', 'GET');
+    assert.equal(tree.status, 200);
+    assert.equal(tree.body.folders.length, 10);
+    assert.ok(tree.body.folders.every((folder) => folder.documentCount === 0));
+    assert.deepEqual([tree.body.unfiledCount, tree.body.totalCount], [0, 0]);
+    assert.equal((await api('', 'GET', undefined, users.b.token)).body.folders.some((folder) => tree.body.folders.some((mine) => mine.id === folder.id)), false);
+    users.f.folders = { home: home.body.folder.id, bills: bills.body.folder.id };
+  });
+
+  test('folders: documents upload into, move between and are listed by folder; names stay unique inside each folder', async () => {
+    const user = users.f;
+    const { home, bills } = user.folders;
+    const patch = (id, body, token = user.token) => request(`/api/documents/${id}`, { method: 'PATCH', token, body });
+    const uploadTo = (folderId, name, token = user) => {
+      const form = new FormData();
+      form.append('file', new Blob([text()], { type: 'text/plain' }), name);
+      if (folderId) form.append('folderId', folderId);
+      return request('/api/documents', { method: 'POST', token: token.token, form });
+    };
+
+    const first = await uploadTo(bills, 'Tiền điện.txt');
+    assert.deepEqual([first.status, first.body.document.title, first.body.document.folderId, first.body.renamed], [201, 'Tiền điện', bills, false]);
+    const second = await uploadTo(bills, 'tiền điện.txt');
+    assert.deepEqual([second.status, second.body.document.title, second.body.renamed], [201, 'tiền điện (2)', true], 'same name, different content: saved with a suffix');
+    const elsewhere = await uploadTo(home, 'Tiền điện.txt');
+    assert.deepEqual([elsewhere.body.document.title, elsewhere.body.renamed], ['Tiền điện', false], 'the name is free in another folder');
+    const loose = await uploadTo(null, 'Tiền điện.txt');
+    assert.deepEqual([loose.body.document.title, loose.body.document.folderId], ['Tiền điện', null]);
+
+    const before = await documentCount(user);
+    const stolen = await uploadTo(bills, 'cua-nguoi-khac.txt', users.b);
+    assert.equal(stolen.status, 404, 'uploading into another user\'s folder');
+    assert.ok(stolen.body.fieldErrors?.folderId);
+    assert.equal((await uploadTo(randomUUID(), 'khong-co-thu-muc.txt')).status, 404);
+    assert.equal((await uploadTo('not-a-uuid', 'sai.txt')).status, 400);
+    assert.equal(await documentCount(user), before);
+    assert.equal(await db.fileCopy.count({ where: { userId: users.b.id, state: 'UPLOADING' } }), 0);
+
+    const same = await Promise.all(Array.from({ length: 4 }, () => uploadTo(home, 'Biên bản.txt')));
+    assert.deepEqual(same.map((result) => result.status), [201, 201, 201, 201]);
+    assert.deepEqual(same.map((result) => result.body.document.title).sort(), ['Biên bản', 'Biên bản (2)', 'Biên bản (3)', 'Biên bản (4)'], 'concurrent uploads never share a name');
+
+    const ids = async (query) => {
+      const response = await request(`/api/documents?limit=50&${query}`, { token: user.token });
+      assert.equal(response.status, 200, query);
+      return response.body.items.map((item) => item.id).sort();
+    };
+    assert.deepEqual(await ids(`folder=${bills}`), [first.body.document.id, second.body.document.id].sort());
+    assert.deepEqual(await ids('folder=none'), [loose.body.document.id]);
+    assert.deepEqual(await ids(`folder=${bills}&type=pdf`), []);
+    assert.deepEqual(await ids(`folder=${bills.toUpperCase()}&type=txt`), [first.body.document.id, second.body.document.id].sort());
+    assert.equal((await ids('type=txt')).length, 8, 'without a folder every document is listed');
+    assert.deepEqual(await ids(`folder=${randomUUID()}`), []);
+    const badFolder = await request('/api/documents?folder=root', { token: user.token });
+    assert.equal(badFolder.status, 400);
+    assert.ok(badFolder.body.fieldErrors?.folder);
+    assert.equal((await request(`/api/documents?folder=${bills}`, { token: users.b.token })).body.items.length, 0, 'another user sees nothing in it');
+
+    const renamed = await patch(first.body.document.id, { title: '  Hóa đơn điện tháng 10  ' });
+    assert.deepEqual([renamed.status, renamed.body.document.title, renamed.body.renamed], [200, 'Hóa đơn điện tháng 10', false]);
+    assert.equal(renamed.body.document.file.name, 'Tiền điện.txt', 'the uploaded file name is kept');
+    assert.ok(new Date(renamed.body.document.updatedAt) > new Date(first.body.document.updatedAt));
+    assertPrivate(renamed.body);
+    const clash = await patch(second.body.document.id, { title: 'HOÁ ĐƠN ĐIỆN THÁNG 10' });
+    assert.deepEqual([clash.body.document.title, clash.body.renamed], ['HOÁ ĐƠN ĐIỆN THÁNG 10 (2)', true]);
+    assert.equal((await patch(first.body.document.id, { title: 'hóa đơn điện tháng 10' })).body.renamed, false, 'its own name in another case is not a clash');
+    for (const body of [{ title: '   ' }, { title: 'x'.repeat(256) }, { title: 5 }, {}, { folderId: 'none' }, { privacyLevel: 'ENCRYPTED_COPY' }]) {
+      assert.equal((await patch(first.body.document.id, body)).status, 400, JSON.stringify(body));
+    }
+    assert.equal((await patch(first.body.document.id, { title: 'Của tôi' }, users.b.token)).status, 404, 'other users cannot rename it');
+    assert.equal((await patch(first.body.document.id, { folderId: randomUUID() })).status, 404);
+    const otherFolder = (await request('/api/folders', { method: 'POST', token: users.b.token, body: { name: 'Của B' } })).body.folder.id;
+    assert.equal((await patch(first.body.document.id, { folderId: otherFolder })).status, 404, 'a document cannot move into another user\'s folder');
+
+    const download = await request(`/api/documents/${first.body.document.id}/original`, { token: user.token });
+    assert.equal(download.status, 200);
+    assert.match(download.headers.get('content-disposition'), new RegExp(encodeURIComponent('hóa đơn điện tháng 10.txt')), 'the download is named after the display name');
+
+    const moved = await patch(elsewhere.body.document.id, { folderId: null });
+    assert.deepEqual([moved.status, moved.body.document.folderId, moved.body.document.title, moved.body.renamed], [200, null, 'Tiền điện (2)', true], 'moving next to a document with the same name adds a suffix');
+    const back = await patch(elsewhere.body.document.id, { folderId: bills, title: 'Tiền nước' });
+    assert.deepEqual([back.body.document.folderId, back.body.document.title, back.body.renamed], [bills, 'Tiền nước', false]);
+
+    const tree = (await request('/api/folders', { token: user.token })).body;
+    const count = (id) => tree.folders.find((folder) => folder.id === id).documentCount;
+    assert.deepEqual([count(bills), count(home), tree.unfiledCount, tree.totalCount], [3, 4, 1, 8]);
+    assert.equal((await request(`/api/documents/${second.body.document.id}`, { method: 'DELETE', token: user.token })).status, 204);
+    const after = (await request('/api/folders', { token: user.token })).body;
+    assert.equal(after.folders.find((folder) => folder.id === bills).documentCount, 2, 'deleted documents are not counted');
+    const reuse = await patch(first.body.document.id, { title: 'HOÁ ĐƠN ĐIỆN THÁNG 10 (2)' });
+    assert.equal(reuse.body.renamed, false, 'the name of a deleted document is free again');
+  });
+
+  test('sorting: by upload time, update time or name, each with its own cursor pagination', async () => {
+    const user = users.f;
+    const folder = (await request('/api/folders', { method: 'POST', token: user.token, body: { name: 'Sắp xếp' } })).body.folder.id;
+    const ids = {};
+    for (const name of ['Chuối', 'an', 'Bưởi', 'Ăn', 'cam']) {
+      const form = new FormData();
+      form.append('file', new Blob([text()], { type: 'text/plain' }), `${name}.txt`);
+      form.append('folderId', folder);
+      ids[name] = (await request('/api/documents', { method: 'POST', token: user.token, form })).body.document.id;
+      await delay(5);
+    }
+    for (const id of Object.values(ids)) await parsed(user, id);
+    await delay(20);
+    assert.equal((await request(`/api/documents/${ids.an}`, { method: 'PATCH', token: user.token, body: { title: 'An' } })).status, 200);
+    const names = Object.fromEntries(Object.entries(ids).map(([name, id]) => [id, name]));
+    const pages = async (sort, limit = 2) => {
+      const seen = [];
+      let cursor = null;
+      do {
+        const response = await request(`/api/documents?folder=${folder}&limit=${limit}${sort ? `&sort=${sort}` : ''}${cursor ? `&cursor=${cursor}` : ''}`, { token: user.token });
+        assert.equal(response.status, 200, `${sort} ${cursor}`);
+        assert.ok(response.body.items.length <= limit);
+        seen.push(...response.body.items.map((item) => names[item.id]));
+        cursor = response.body.nextCursor;
+      } while (cursor);
+      return seen;
+    };
+    assert.deepEqual(await pages(undefined), ['cam', 'Ăn', 'Bưởi', 'an', 'Chuối']);
+    assert.deepEqual(await pages('created'), ['cam', 'Ăn', 'Bưởi', 'an', 'Chuối']);
+    assert.equal((await pages('updated'))[0], 'an', 'the renamed document was updated last');
+    assert.equal((await pages('updated')).length, 5);
+    const byName = await pages('name');
+    assert.deepEqual([...byName].sort(), ['an', 'Bưởi', 'Chuối', 'cam', 'Ăn'].sort(), 'every document appears exactly once across pages');
+    assert.equal(byName.length, 5);
+    assert.ok(byName.indexOf('Bưởi') < byName.indexOf('cam') && byName.indexOf('cam') < byName.indexOf('Chuối'), byName.join(','));
+    assert.deepEqual(await pages('name-desc'), [...byName].reverse());
+    assert.deepEqual(await pages('name', 1), byName, 'one per page gives the same order');
+    const first = await request(`/api/documents?folder=${folder}&limit=2&sort=name`, { token: user.token });
+    for (const query of ['sort=size', `sort=created&cursor=${first.body.nextCursor}`, `sort=name&cursor=${Buffer.from(`!!|${randomUUID()}`).toString('base64url')}`]) {
+      const bad = await request(`/api/documents?folder=${folder}&${query}`, { token: user.token });
+      assert.equal(bad.status, 400, query);
+      assert.ok(bad.body.fieldErrors?.sort || bad.body.fieldErrors?.cursor, query);
+    }
   });
 
   test('listing is per user, newest first, with cursor pagination', async () => {

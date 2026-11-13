@@ -17,7 +17,7 @@ before(async () => {
   db = new PGlite();
   const dirs = (await readdir(MIGRATIONS, { withFileTypes: true }))
     .filter((d) => d.isDirectory()).map((d) => d.name).sort();
-  assert.equal(dirs.length, 9);
+  assert.equal(dirs.length, 10);
   for (const dir of dirs) await db.exec(await readFile(new URL(`${dir}/migration.sql`, MIGRATIONS), 'utf8'));
   await db.exec(`INSERT INTO "DocumentType" ("code","name","pathTemplate","fieldSchema")
                  VALUES ('RENTAL_CONTRACT','Hợp đồng thuê nhà','Hợp đồng/Thuê nhà/{year}','{"type":"object"}')`);
@@ -75,9 +75,9 @@ async function seedUser(tag) {
 
 // ───────────────────────────── Structure ─────────────────────────────
 
-test('migrations create the 19 CP1 tables including email challenges', async () => {
+test('migrations create the 20 CP1 tables including email challenges and folders', async () => {
   const { count } = await one(`SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'public'`);
-  assert.equal(count, 19);
+  assert.equal(count, 20);
 });
 
 test('accounts default to level 3 (ENCRYPTED_COPY)', async () => {
@@ -374,4 +374,71 @@ test('a deleted document stays deleted and never receives new text or live store
   await rejects(`UPDATE "FileCopy" SET "state" = 'AVAILABLE', "deleteRequestedAt" = NULL WHERE "storageKey" = 'encrypted/a/live'`, [], /live stored copy/);
   await db.query(`UPDATE "FileCopy" SET "state" = 'DELETED', "deletedAt" = now() WHERE "storageKey" = 'encrypted/a/live'`);
   await db.query(`UPDATE "Document" SET "title" = 'Đã xóa' WHERE "id" = $1`, [a.doc]);
+});
+
+const folder = (user, name, parent = null) => id(`INSERT INTO "Folder" ("userId","name","parentId") VALUES ($1,$2,$3)`, [user, name, parent]);
+
+test('names are compared without case or the position of the Vietnamese tone mark', async () => {
+  const key = async (value) => (await one('SELECT docflow_name_key($1) AS key', [value])).key;
+  for (const [left, right] of [['Hóa đơn', 'hoá đơn'], ['HÓA ĐƠN', 'hoá đơn'], ['Thuý Kiều', 'THÚY KIỀU'], ['quỵ', 'qụy'], ['  Hợp đồng  ', 'hợp đồng'], ['Hóa đơn', 'Ho\u0301a đơn']]) {
+    assert.equal(await key(left), await key(right), `${left} = ${right}`);
+  }
+  for (const [left, right] of [['Hóa', 'Hòa'], ['Hoa', 'Hóa'], ['Hợp đồng', 'Hợp đồng (2)'], ['Dao', 'Đao'], ['Mua', 'Mưa'], ['hóa đơn', 'hóađơn']]) {
+    assert.notEqual(await key(left), await key(right), `${left} ≠ ${right}`);
+  }
+});
+
+test('folders: sibling names are unique per user; names, purposes and ownership are checked', async () => {
+  const a = await seedUser('a');
+  const b = await seedUser('b');
+  const home = await folder(a.user, 'Nhà Cầu Giấy');
+  await rejects(`INSERT INTO "Folder" ("userId","name") VALUES ($1,'NHÀ CẦU GIẤY')`, [a.user], 'Folder_sibling_name_key');
+  const bills = await folder(a.user, 'Hóa đơn', home);
+  await rejects(`INSERT INTO "Folder" ("userId","name","parentId") VALUES ($1,'hoá đơn',$2)`, [a.user, home], 'Folder_sibling_name_key');
+  await folder(a.user, 'Hóa đơn');
+  await folder(b.user, 'Nhà Cầu Giấy');
+  await rejects(`UPDATE "Folder" SET "name" = 'nhà cầu giấy', "parentId" = NULL WHERE "id" = $1`, [bills], 'Folder_sibling_name_key');
+  for (const name of ['', '  ', ' Lề trái', 'a/b', 'a\\b', 'tab\there', 'x'.repeat(101)]) {
+    await rejects(`INSERT INTO "Folder" ("userId","name") VALUES ($1,$2)`, [a.user, name], /Folder_name_check|value too long/);
+  }
+  await rejects(`INSERT INTO "Folder" ("userId","name","purpose") VALUES ($1,'Mục đích rỗng','  ')`, [a.user], 'Folder_purpose_check');
+  await db.query(`UPDATE "Folder" SET "purpose" = 'Giấy tờ căn nhà ở Cầu Giấy' WHERE "id" = $1`, [home]);
+  await rejects(`INSERT INTO "Folder" ("userId","name","parentId") VALUES ($1,'Của người khác',$2)`, [b.user, home], 'Folder_parentId_userId_fkey');
+  await rejects(`UPDATE "Document" SET "folderId" = $1 WHERE "id" = $2`, [home, b.doc], 'Document_folderId_userId_fkey');
+  await db.query(`UPDATE "Document" SET "folderId" = $1 WHERE "id" = $2`, [bills, a.doc]);
+  await rejects(`DELETE FROM "Folder" WHERE "id" = $1`, [bills], 'Document_folderId_userId_fkey');
+  await rejects(`DELETE FROM "Folder" WHERE "id" = $1`, [home], 'Folder_parentId_userId_fkey');
+  await db.query(`DELETE FROM "User" WHERE "id" = $1`, [a.user]);
+  assert.equal((await one(`SELECT count(*)::int AS count FROM "Folder" WHERE "userId" = $1`, [a.user])).count, 0);
+});
+
+test('folders: the tree is at most 5 levels deep and never loops, also when a subtree moves', async () => {
+  const a = await seedUser('a');
+  const chain = [];
+  for (let level = 1; level <= 5; level++) chain.push(await folder(a.user, `Cấp ${level}`, chain.at(-1) ?? null));
+  await rejects(`INSERT INTO "Folder" ("userId","name","parentId") VALUES ($1,'Cấp 6',$2)`, [a.user, chain[4]], 'Folder_max_depth');
+  await rejects(`UPDATE "Folder" SET "parentId" = "id" WHERE "id" = $1`, [chain[0]], /Folder_not_own_parent_check|Folder_no_cycle/);
+  await rejects(`UPDATE "Folder" SET "parentId" = $1 WHERE "id" = $2`, [chain[3], chain[0]], 'Folder_no_cycle');
+  const other = await folder(a.user, 'Khác');
+  const inner = await folder(a.user, 'Trong', other);
+  await rejects(`UPDATE "Folder" SET "parentId" = $1 WHERE "id" = $2`, [chain[3], other], 'Folder_max_depth');
+  await rejects(`UPDATE "Folder" SET "parentId" = $1 WHERE "id" = $2`, [inner, chain[1]], 'Folder_max_depth');
+  await db.query(`UPDATE "Folder" SET "parentId" = $1 WHERE "id" = $2`, [chain[2], other]);
+  await db.query(`UPDATE "Folder" SET "parentId" = NULL WHERE "id" = $1`, [chain[4]]);
+  await db.query(`UPDATE "Folder" SET "name" = 'Đổi tên không kiểm tra lại cây' WHERE "id" = $1`, [inner]);
+});
+
+test('documents: live titles are unique inside a folder, not across folders, users or deleted documents', async () => {
+  const a = await seedUser('a');
+  const b = await seedUser('b');
+  const insert = `INSERT INTO "Document" ("userId","title","source","folderId") VALUES ($1,$2,'WEB_UPLOAD',$3)`;
+  await rejects(insert, [a.user, 'HỢP ĐỒNG THUÊ', null], 'Document_folder_title_key');
+  const box = await folder(a.user, 'Hợp đồng');
+  const moved = await id(insert, [a.user, 'hợp đồng thuê', box]);
+  await rejects(insert, [a.user, 'Hợp đồng thuê', box], 'Document_folder_title_key');
+  await rejects(`UPDATE "Document" SET "folderId" = NULL WHERE "id" = $1`, [moved], 'Document_folder_title_key');
+  await db.query(`UPDATE "Document" SET "deletedAt" = now() WHERE "id" = $1`, [a.doc]);
+  await db.query(`UPDATE "Document" SET "folderId" = NULL WHERE "id" = $1`, [moved]);
+  await db.query(insert, [a.user, 'Hợp đồng thuê (2)', null]);
+  assert.equal((await one(`SELECT "title" FROM "Document" WHERE "id" = $1`, [b.doc])).title, 'Hợp đồng thuê');
 });

@@ -2,31 +2,19 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   canViewOriginal, DOCX_MIME, fileTypeLabel, formatBytes, infoLine, isChanging, isProcessing, matchesFilters, MAX_UPLOAD_BYTES, precheck, problemMessage,
+  titleProblem,
 } from './documents.ts';
-import type { DocumentFilters, DocumentStatus, DocumentStatusFilter, DocumentSummary, DocumentTypeFilter } from './documents.ts';
+import type { DocumentFilters, DocumentStatus, DocumentSummary, DocumentTypeFilter } from './documents.ts';
 
 const doc = (patch: Partial<DocumentSummary> = {}): DocumentSummary => ({
   id: '00000000-0000-4000-8000-000000000001', title: 'Hợp đồng', createdAt: '2026-11-01T00:00:00.000Z', updatedAt: '2026-11-02T00:00:00.000Z',
-  typeCode: null, status: 'SUCCEEDED', problem: null, file: { name: 'a.pdf', mimeType: 'application/pdf', byteSize: 1000 },
+  typeCode: null, folderId: null, status: 'SUCCEEDED', problem: null, file: { name: 'a.pdf', mimeType: 'application/pdf', byteSize: 1000 },
   originalAvailable: true, originalDeleting: false, pageCount: null, summary: null, detailsDeleted: false, ...patch,
 });
 const file = (mimeType: string) => ({ name: 'a', mimeType, byteSize: 1 });
 const STATUSES: DocumentStatus[] = ['PENDING', 'PROCESSING', 'SUCCEEDED', 'FAILED', 'UNSUPPORTED'];
 
-test('filters: each status filter picks exactly the states the server picks', () => {
-  const expected: Record<DocumentStatusFilter, { kept: DocumentStatus[]; deleted: DocumentStatus[] }> = {
-    read: { kept: ['SUCCEEDED'], deleted: [] },
-    processing: { kept: ['PENDING', 'PROCESSING'], deleted: ['PENDING', 'PROCESSING'] },
-    problem: { kept: ['FAILED', 'UNSUPPORTED'], deleted: [] },
-    'details-deleted': { kept: [], deleted: STATUSES },
-  };
-  for (const [status, { kept, deleted }] of Object.entries(expected) as [DocumentStatusFilter, typeof expected.read][]) {
-    assert.deepEqual(STATUSES.filter((state) => matchesFilters(doc({ status: state }), { status })), kept, `${status}, details kept`);
-    assert.deepEqual(STATUSES.filter((state) => matchesFilters(doc({ status: state, detailsDeleted: true }), { status })), deleted, `${status}, details deleted`);
-  }
-});
-
-test('filters: type and status combine; no filter keeps everything', () => {
+test('filters: by file type; no filter keeps everything', () => {
   const mimes: Record<DocumentTypeFilter, string> = { pdf: 'application/pdf', docx: DOCX_MIME, txt: 'text/plain' };
   for (const [type, mimeType] of Object.entries(mimes) as [DocumentTypeFilter, string][]) {
     for (const other of Object.values(mimes)) {
@@ -35,18 +23,18 @@ test('filters: type and status combine; no filter keeps everything', () => {
   }
   const empty: DocumentFilters = {};
   for (const status of STATUSES) assert.equal(matchesFilters(doc({ status, detailsDeleted: status === 'FAILED' }), empty), true);
-  assert.equal(matchesFilters(doc({ file: file(DOCX_MIME), status: 'SUCCEEDED' }), { type: 'docx', status: 'read' }), true);
-  assert.equal(matchesFilters(doc({ file: file(DOCX_MIME), status: 'FAILED' }), { type: 'docx', status: 'read' }), false);
-  assert.equal(matchesFilters(doc({ file: file('text/plain'), status: 'SUCCEEDED' }), { type: 'docx', status: 'read' }), false);
   assert.equal(matchesFilters(doc({ file: file('image/png') }), { type: 'pdf' }), false);
 });
 
-test('info line: type, pages and reading state; a deleted detail layer replaces the state', () => {
-  assert.equal(infoLine(doc({ pageCount: 25 })), 'PDF · 25 trang · Đã đọc nội dung');
-  assert.equal(infoLine(doc({ file: file(DOCX_MIME), status: 'PENDING' })), 'DOCX · Chờ đọc nội dung');
-  assert.equal(infoLine(doc({ file: file('text/plain'), status: 'PROCESSING', pageCount: 0 })), 'TXT · Đang đọc nội dung');
+test('info line: type, pages, then size once read or the reading state; a missing original is flagged', () => {
+  assert.equal(infoLine(doc({ pageCount: 3, file: { name: 'a.pdf', mimeType: 'application/pdf', byteSize: 1258291 } })), 'PDF · 3 trang · 1,2 MB');
+  assert.equal(infoLine(doc({ file: file(DOCX_MIME), status: 'PENDING' })), 'DOCX · Chờ đọc nội dung…');
+  assert.equal(infoLine(doc({ file: file('text/plain'), status: 'PROCESSING', pageCount: 0 })), 'TXT · Đang đọc nội dung…');
   assert.equal(infoLine(doc({ status: 'UNSUPPORTED' })), 'PDF · Không đọc được');
-  assert.equal(infoLine(doc({ status: 'FAILED', detailsDeleted: true, pageCount: 2 })), 'PDF · 2 trang · Đã xóa bản chi tiết');
+  assert.equal(infoLine(doc({ status: 'FAILED', detailsDeleted: true, pageCount: 2, originalAvailable: false })), 'PDF · 2 trang · Đã xóa bản chi tiết');
+  assert.equal(infoLine(doc({ pageCount: 2, originalAvailable: false })), 'PDF · 2 trang · 1000 B · Không còn bản gốc');
+  assert.equal(infoLine(doc({ originalAvailable: false, originalDeleting: true })), 'PDF · 1000 B', 'still being deleted: the page shows that separately');
+  assert.equal(infoLine(doc({ status: 'PENDING', originalAvailable: false })), 'PDF · Chờ đọc nội dung…');
   assert.match(infoLine(doc({ pageCount: 1200 })), /^PDF · 1[.\s ]?200 trang · /);
   assert.equal(fileTypeLabel(doc({ file: file('image/png') })), 'TỆP');
 });
@@ -92,8 +80,26 @@ test('precheck: extension, emptiness and the size limit, with the limit itself a
 test('sizes are shown in the nearest unit', () => {
   assert.equal(formatBytes(0), '0 B');
   assert.equal(formatBytes(1023), '1023 B');
-  assert.equal(formatBytes(1536), '1.5 KB');
+  assert.equal(formatBytes(1536), '1,5 KB');
   assert.equal(formatBytes(20 * 1024), '20 KB');
-  assert.equal(formatBytes(150e6), '143.1 MB');
-  assert.equal(formatBytes(1024 ** 3), '1.00 GB');
+  assert.equal(formatBytes(150e6), '143,1 MB');
+  assert.equal(formatBytes(1024 ** 3), '1,00 GB');
+});
+
+test('filters: a folder view keeps only that folder, "none" only unfiled documents', () => {
+  const inside = doc({ folderId: 'f1' });
+  assert.equal(matchesFilters(inside, { folder: 'f1' }), true);
+  assert.equal(matchesFilters(inside, { folder: 'f2' }), false);
+  assert.equal(matchesFilters(inside, { folder: 'none' }), false);
+  assert.equal(matchesFilters(doc(), { folder: 'none' }), true);
+  assert.equal(matchesFilters(doc(), { folder: 'f1' }), false);
+  assert.equal(matchesFilters(inside, {}), true);
+  assert.equal(matchesFilters(inside, { folder: 'f1', type: 'docx' }), false);
+});
+
+test('a document name must not be blank or longer than 255 characters', () => {
+  assert.equal(titleProblem('Hợp đồng'), null);
+  assert.equal(titleProblem('x'.repeat(255)), null);
+  assert.equal(titleProblem('   '), 'Nhập tên tài liệu.');
+  assert.equal(titleProblem('x'.repeat(256)), 'Tên tài liệu không được vượt quá 255 ký tự.');
 });

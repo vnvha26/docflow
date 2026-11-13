@@ -9,6 +9,7 @@ export interface DocumentSummary {
   title: string;
   createdAt: Date;
   typeCode: string | null;
+  folderId: string | null;
   status: ParseState;
   problem: string | null;
   file: { name: string; mimeType: string; byteSize: number };
@@ -23,17 +24,31 @@ export interface DocumentSummary {
 
 export const DOCUMENT_TYPE_FILTERS = ['pdf', 'docx', 'txt'] as const;
 export type DocumentTypeFilter = (typeof DOCUMENT_TYPE_FILTERS)[number];
-export const DOCUMENT_STATUS_FILTERS = ['read', 'processing', 'problem', 'details-deleted'] as const;
-export type DocumentStatusFilter = (typeof DOCUMENT_STATUS_FILTERS)[number];
+
+export const UNFILED = 'none';
+export const DOCUMENT_SORTS = ['created', 'updated', 'name', 'name-desc'] as const;
+export type DocumentSort = (typeof DOCUMENT_SORTS)[number];
 
 export interface DocumentFilters {
   type?: DocumentTypeFilter;
-  status?: DocumentStatusFilter;
+  folder?: string;
+  sort?: DocumentSort;
+}
+
+export interface DocumentChange {
+  title?: string;
+  folderId?: string | null;
+}
+
+export interface RenameResult {
+  document: DocumentSummary;
+  renamed: boolean;
 }
 
 export interface UploadResult {
   document: DocumentSummary;
   duplicate: boolean;
+  renamed: boolean;
 }
 
 export interface StorageUsage {

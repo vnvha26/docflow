@@ -140,6 +140,7 @@ model User {
   sessions            Session[]
   emailChallenges     EmailChallenge[]
   documents           Document[]
+  folders             Folder[]
   documentVersions    DocumentVersion[]
   fileCopies          FileCopy[]
   documentChunks      DocumentChunk[]
@@ -217,6 +218,7 @@ model Document {
   title        String         @db.VarChar(255)
   source       DocumentSource
   typeCode     String?        @db.VarChar(64)
+  folderId     String?        @db.Uuid
   privacyLevel PrivacyLevel?
   deletedAt    DateTime?      @db.Timestamptz(3)
   revision     BigInt         @default(1)
@@ -225,6 +227,7 @@ model Document {
 
   user              User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
   type              DocumentType?        @relation(fields: [typeCode], references: [code], onDelete: NoAction)
+  folder            Folder?              @relation(fields: [folderId, userId], references: [id, userId], onDelete: NoAction)
   versions          DocumentVersion[]
   fileCopies        FileCopy[]
   chunks            DocumentChunk[]
@@ -236,6 +239,26 @@ model Document {
   @@unique([id, userId])
   @@index([userId, createdAt(sort: Desc)])
   @@index([userId, typeCode])
+  @@index([userId, folderId])
+}
+
+model Folder {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String   @db.Uuid
+  parentId  String?  @db.Uuid
+  name      String   @db.VarChar(100)
+  purpose   String?  @db.VarChar(500)
+  revision  BigInt   @default(1)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @default(now()) @updatedAt @db.Timestamptz(3)
+
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  parent    Folder?    @relation("FolderTree", fields: [parentId, userId], references: [id, userId], onDelete: NoAction)
+  children  Folder[]   @relation("FolderTree")
+  documents Document[]
+
+  @@unique([id, userId])
+  @@index([userId, parentId])
 }
 
 model DocumentVersion {

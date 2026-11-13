@@ -133,6 +133,7 @@ export class ParseService {
       const current = await transaction.documentVersion.findFirst({ where: { id: versionId, documentId }, select: { parseState: true } });
       if (!current || DONE.includes(current.parseState)) return false;
       await transaction.documentChunk.deleteMany({ where: { versionId } });
+      await transaction.document.update({ where: { id: documentId }, data: { revision: { increment: 1 } } });
       if (outcome.kind === 'failed') {
         await transaction.documentVersion.update({ where: { id: versionId }, data: { parseState: 'FAILED', parseErrorCode: outcome.code.slice(0, 64) } });
         return false;

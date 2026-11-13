@@ -11,6 +11,8 @@ interface Props {
   document: DocumentSummary;
   onChange: (next: DocumentSummary) => void;
   onRemove: () => void;
+  onRename: () => void;
+  onMove: () => void;
 }
 
 const LAYERS: Record<Layer, { label: string; action: string; lost: string; kept: string }> = {
@@ -31,7 +33,7 @@ const LAYERS: Record<Layer, { label: string; action: string; lost: string; kept:
   },
 };
 
-export function DocumentOptions({ document, onChange, onRemove }: Props) {
+export function DocumentOptions({ document, onChange, onRemove, onRename, onMove }: Props) {
   const [pending, setPending] = useState<Layer | null>(null);
   const [saving, setSaving] = useState(false);
   const [downloading, setDownloading] = useState(false);
@@ -59,6 +61,11 @@ export function DocumentOptions({ document, onChange, onRemove }: Props) {
     for (const other of window.document.querySelectorAll<HTMLDetailsElement>('details.document-menu[open]')) {
       if (other !== menu.current) other.open = false;
     }
+  }
+
+  function leave(action: () => void) {
+    if (menu.current) menu.current.open = false;
+    action();
   }
 
   async function download() {
@@ -104,6 +111,8 @@ export function DocumentOptions({ document, onChange, onRemove }: Props) {
           </div>
         </div>
         : <>
+          <button type="button" className="text-button menu-item" onClick={() => leave(onRename)}>Đổi tên…</button>
+          <button type="button" className="text-button menu-item" onClick={() => leave(onMove)}>Chuyển tới…</button>
           {document.originalAvailable && <button type="button" className="text-button menu-item" onClick={download} disabled={downloading}>
             {downloading ? 'Đang tải…' : 'Tải bản gốc'}
           </button>}
