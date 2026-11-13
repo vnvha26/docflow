@@ -1,4 +1,5 @@
 import { authClient } from './api.ts';
+import type { DuplicateCheck } from './duplicates.ts';
 
 export type DocumentStatus = 'PENDING' | 'PROCESSING' | 'SUCCEEDED' | 'FAILED' | 'UNSUPPORTED';
 
@@ -43,7 +44,7 @@ export function matchesFilters(document: Pick<DocumentSummary, 'file' | 'folderI
 export const isChanging = (document: Pick<DocumentSummary, 'status' | 'originalDeleting'>) => isProcessing(document) || document.originalDeleting;
 
 const problemMessages: Record<string, string> = {
-  NO_TEXT_LAYER: 'PDF này là ảnh scan, không có lớp chữ. Hãy dùng bản PDF xuất từ Word hoặc chạy nhận dạng chữ (OCR) trước khi tải lên.',
+  NO_TEXT_LAYER: 'PDF này là ảnh scan.',
   EMPTY_TEXT: 'Tệp không có nội dung chữ.',
   LEGACY_VIETNAMESE_FONT: 'Văn bản dùng font tiếng Việt cũ (TCVN3/VNI). Hãy chuyển sang Unicode, ví dụ bằng công cụ chuyển mã của Unikey, rồi tải lại.',
   UNREADABLE_TEXT: 'Chữ trong tệp dùng font nhúng không đọc được. Hãy xuất lại PDF hoặc lưu sang DOCX rồi tải lại.',
@@ -60,6 +61,9 @@ export function problemMessage(document: Pick<DocumentSummary, 'status' | 'probl
   return (document.problem && problemMessages[document.problem])
     ?? (document.status === 'FAILED' ? 'Chưa đọc được tệp do lỗi tạm thời. Tải lại đúng tệp này để thử lại.' : 'Không đọc được nội dung tệp này.');
 }
+
+export interface UploadDecision { mode: 'new' | 'supplement'; targetId?: string }
+export interface UploadResult { document: DocumentSummary; duplicate: boolean; renamed: boolean; supplemented: boolean; conflict?: DuplicateCheck }
 
 export interface StorageUsage { encryptedBytes: number; quotaBytes: number }
 
@@ -129,11 +133,18 @@ export const documentsApi = {
   get(id: string) {
     return authClient.request<DocumentSummary>(`/documents/${encodeURIComponent(id)}`);
   },
-  upload(file: File, userId: string, folderId: string | null = null) {
+  upload(file: File, userId: string, folderId: string | null = null, decision?: UploadDecision) {
     const form = new FormData();
     form.append('file', file, file.name);
     if (folderId) form.append('folderId', folderId);
-    return authClient.request<{ document: DocumentSummary; duplicate: boolean; renamed: boolean }>('/documents', { method: 'POST', body: form }, { asUser: userId });
+    if (decision) form.append('onDuplicate', decision.mode);
+    if (decision?.targetId) form.append('targetId', decision.targetId);
+    return authClient.request<UploadResult>('/documents', { method: 'POST', body: form }, { asUser: userId });
+  },
+  check(sha256: string, size: number, folderId: string | null, userId: string) {
+    return authClient.request<DuplicateCheck>('/documents/check', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sha256, size, folderId }),
+    }, { asUser: userId });
   },
   update(id: string, change: { title?: string; folderId?: string | null }, userId: string) {
     return authClient.request<{ document: DocumentSummary; renamed: boolean }>(

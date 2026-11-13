@@ -2,7 +2,7 @@ import {
   ConflictException, HttpException, HttpStatus, Inject, Injectable, Logger, NotFoundException,
   ServiceUnavailableException, UnprocessableEntityException, UnsupportedMediaTypeException,
 } from '@nestjs/common';
-import { FileCopyKind, Prisma, PrivacyLevel } from '@prisma/client';
+import { FileCopyKind, ParseState, Prisma, PrivacyLevel } from '@prisma/client';
 import { createHash, randomUUID } from 'node:crypto';
 import { Readable, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -19,6 +19,7 @@ import { renderDocxHtml } from '../parsing/text-extract';
 import { ParserFailedError, UnsupportedDocumentError } from '../parsing/text';
 import { ObjectStorage, storageKey } from '../storage/object-storage';
 import { cleanTitle, downloadName, sanitizeFileName, titleFromFileName } from './file-name';
+import { Candidate, classifyDuplicates, DuplicateCheck, rankCandidates } from './duplicates';
 import { detectFileType } from './file-type';
 import { effectivePrivacy } from './privacy';
 import {
@@ -38,11 +39,17 @@ const MAX_PREVIEWS = 2;
 const PREVIEW_LIMITS = { timeoutMs: 60_000, memoryMb: 512 };
 const UPLOAD_IN_PROGRESS ='Một bản giống hệt tệp này đang được tải lên. Vui lòng thử lại sau ít giây.';
 
-interface Duplicate {
-  documentId: string; versionId: string; documentLevel: PrivacyLevel | null; inFlight: boolean; revivable: boolean; retryable: boolean;
+interface Found extends Candidate {
+  versionId: string; documentLevel: PrivacyLevel | null; inFlight: boolean; retryable: boolean;
+  previous: { parseState: ParseState; parseErrorCode: string | null };
 }
-interface Reserved { kind: FileCopyKind; key: string; documentId: string; versionId: string; revived: boolean; renamed: boolean }
-type Plan = { duplicateOf: string } | Reserved;
+interface Reserved {
+  kind: FileCopyKind; key: string; documentId: string; versionId: string; revived: boolean; renamed: boolean;
+  previous: Found['previous'] | null;
+}
+interface Blocked { conflict: DuplicateCheck; documentId: string; retryVersionId: string | null }
+type Plan = Blocked | Reserved;
+export interface UploadDecision { mode: 'new' | 'supplement'; targetId?: string }
 const SUMMARY_SELECT = {
   id: true, title: true, createdAt: true, updatedAt: true, typeCode: true, privacyLevel: true, folderId: true, originalTrashedAt: true,
   user: { select: { privacyLevel: true } },
@@ -158,35 +165,74 @@ export class DocumentsService {
     @Inject(JobQueue) private readonly jobs: JobQueue,
   ) {}
 
-  private async duplicateOf(db: Prisma.TransactionClient, userId: string, sha256: string, size: number): Promise<Duplicate | null> {
-    const version = await db.documentVersion.findFirst({
+  private async candidates(db: Prisma.TransactionClient, userId: string, sha256: string, size: number, withTrash: boolean): Promise<Found[]> {
+    const versions = await db.documentVersion.findMany({
       where: {
-        userId, sha256, byteSize: BigInt(size), document: { deletedAt: null },
+        userId, sha256, byteSize: BigInt(size), document: { purgedAt: null, ...(withTrash ? {} : { deletedAt: null }) },
         fileCopies: { none: { state: 'UPLOADING', createdAt: { lt: new Date(Date.now() - STALE_UPLOAD_MS) } } },
       },
-      orderBy: { createdAt: 'asc' },
-      select: { id: true, documentId: true, parseState: true, document: { select: { privacyLevel: true } }, fileCopies: { where: { state: { in: [...LIVE] } }, select: { state: true } } },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }], take: 50,
+      select: {
+        id: true, documentId: true, parseState: true, parseErrorCode: true, createdAt: true,
+        document: { select: {
+          title: true, folderId: true, privacyLevel: true, deletedAt: true, originalTrashedAt: true,
+          user: { select: { privacyLevel: true } }, trashItems: { select: { id: true, kind: true } },
+        } },
+        fileCopies: { where: { state: { in: [...LIVE] } }, select: { state: true, kind: true } },
+      },
     });
-    if (!version) return null;
-    return {
-      documentId: version.documentId,
-      versionId: version.id,
-      documentLevel: version.document.privacyLevel,
-      inFlight: version.fileCopies.some((copy) => copy.state === 'UPLOADING'),
-      revivable: version.parseState === 'FAILED' && version.fileCopies.length === 0,
-      retryable: version.parseState === 'FAILED' && version.fileCopies.some((copy) => copy.state === 'AVAILABLE'),
+    if (!versions.length) return [];
+    const folders = await db.folder.findMany({ where: { userId }, select: { id: true, parentId: true, name: true } });
+    const byId = new Map(folders.map((folder) => [folder.id, folder]));
+    const label = (id: string | null): string | null => {
+      const names: string[] = [];
+      for (let current = id ? byId.get(id) : undefined; current && names.length <= folders.length; current = current.parentId ? byId.get(current.parentId) : undefined) {
+        names.unshift(current.name);
+      }
+      return names.join(' › ') || null;
     };
+    const found: Found[] = [];
+    for (const version of versions) {
+      const { document, fileCopies } = version;
+      const item = (kind: 'DOCUMENT' | 'ORIGINAL') => document.trashItems.find((entry) => entry.kind === kind)?.id ?? null;
+      let state: Found['state'];
+      let trashId: string | null = null;
+      if (document.deletedAt) {
+        trashId = item('DOCUMENT');
+        if (!trashId) continue;
+        state = 'trashed';
+      } else if (document.originalTrashedAt) {
+        state = 'original-trashed';
+        trashId = item('ORIGINAL');
+      } else {
+        const level = effectivePrivacy(document.user.privacyLevel, document.privacyLevel);
+        const lacksOriginal = (level === 'ENCRYPTED_COPY' && !fileCopies.some((copy) => copy.kind === 'ENCRYPTED_COPY'))
+          || (version.parseState === 'FAILED' && fileCopies.length === 0);
+        state = lacksOriginal ? 'no-original' : 'full';
+      }
+      found.push({
+        documentId: version.documentId, versionId: version.id, title: document.title, folderId: document.folderId, location: label(document.folderId),
+        state, trashId, createdAt: version.createdAt, documentLevel: document.privacyLevel,
+        inFlight: !document.deletedAt && fileCopies.some((copy) => copy.state === 'UPLOADING'),
+        retryable: !document.deletedAt && version.parseState === 'FAILED' && fileCopies.some((copy) => copy.state === 'AVAILABLE'),
+        previous: { parseState: version.parseState, parseErrorCode: version.parseErrorCode },
+      });
+    }
+    return found;
   }
 
-  private async settledDuplicate(userId: string, sha256: string, size: number): Promise<Duplicate | null> {
+  private async waitForInFlight(userId: string, sha256: string, size: number): Promise<void> {
     const deadline = Date.now() + IN_FLIGHT_WAIT_MS;
     for (;;) {
-      const known = await this.duplicateOf(this.prisma, userId, sha256, size);
-      if (!known) return null;
-      if (!known.inFlight) return known;
+      const live = await this.candidates(this.prisma, userId, sha256, size, false);
+      if (!live.some((candidate) => candidate.inFlight)) return;
       if (Date.now() >= deadline) throw new ConflictException(UPLOAD_IN_PROGRESS);
       await sleep(IN_FLIGHT_POLL_MS);
     }
+  }
+
+  async check(userId: string, sha256: string, size: number, folderId: string | null): Promise<DuplicateCheck> {
+    return classifyDuplicates(await this.candidates(this.prisma, userId, sha256, size, true), folderId);
   }
 
   private async summary(userId: string, documentId: string): Promise<DocumentSummary> {
@@ -195,7 +241,9 @@ export class DocumentsService {
     return toSummary(row);
   }
 
-  async upload(userId: string, file: UploadedFile | undefined, requestedTitle?: string, folderId: string | null = null): Promise<UploadResult> {
+  async upload(
+    userId: string, file: UploadedFile | undefined, requestedTitle?: string, folderId: string | null = null, decision?: UploadDecision,
+  ): Promise<UploadResult> {
     if (!file) throw fieldError('file', 'Chọn một tệp để tải lên.');
     if (file.size === 0) throw fieldError('file', 'Tệp rỗng, không có gì để lưu.');
     if (file.size > MAX_UPLOAD_BYTES) throw fieldError('file', TOO_LARGE_MESSAGE, HttpStatus.PAYLOAD_TOO_LARGE);
@@ -216,18 +264,14 @@ export class DocumentsService {
     let plan: Plan | null = null;
     let dek: Buffer | null = null;
     for (let attempt = 0; !plan; attempt++) {
-      const settled = await this.settledDuplicate(userId, sha256, file.size);
-      if (settled && !settled.revivable) {
-        if (settled.retryable) await this.retryParse(userId, settled.versionId);
-        return { document: await this.summary(userId, settled.documentId), duplicate: true, renamed: false };
-      }
+      await this.waitForInFlight(userId, sha256, file.size);
       if (attempt >= 3) throw new ConflictException(UPLOAD_IN_PROGRESS);
       const key = this.vault.newKey(context);
       dek = key.dek;
       try {
         plan = await this.prisma.$transaction(async (transaction) => this.reserve(transaction, {
           userId, sha256, size: file.size, storedBytes, documentId, versionId, copyId, keyRef: key.keyRef,
-          title, mimeType: type.mimeType, fileName, folderId,
+          title, mimeType: type.mimeType, fileName, folderId, decision,
         }));
       } catch (error) {
         dek.fill(0);
@@ -235,9 +279,10 @@ export class DocumentsService {
       }
       if (plan === null) dek.fill(0);
     }
-    if ('duplicateOf' in plan) {
+    if ('conflict' in plan) {
       dek!.fill(0);
-      return { document: await this.summary(userId, plan.duplicateOf), duplicate: true, renamed: false };
+      if (plan.retryVersionId) await this.retryParse(userId, plan.retryVersionId);
+      return { document: await this.summary(userId, plan.documentId), duplicate: true, renamed: false, supplemented: false, conflict: plan.conflict };
     }
 
     try {
@@ -263,7 +308,7 @@ export class DocumentsService {
       if (error instanceof HttpException) throw error;
       throw new ServiceUnavailableException('Chưa thể lưu tệp lúc này. Vui lòng thử lại sau.');
     }
-    return { document: await this.summary(userId, plan.documentId), duplicate: false, renamed: plan.renamed };
+    return { document: await this.summary(userId, plan.documentId), duplicate: false, renamed: plan.renamed, supplemented: plan.revived };
   }
 
   private async retryParse(userId: string, versionId: string): Promise<void> {
@@ -284,15 +329,28 @@ export class DocumentsService {
 
   private async reserve(transaction: Prisma.TransactionClient, input: {
     userId: string; sha256: string; size: number; storedBytes: number; documentId: string; versionId: string;
-    copyId: string; keyRef: string; title: string; mimeType: string; fileName: string; folderId: string | null;
+    copyId: string; keyRef: string; title: string; mimeType: string; fileName: string; folderId: string | null; decision?: UploadDecision;
   }): Promise<Plan | null> {
     const { userId, sha256, documentId, versionId, copyId, keyRef, title, storedBytes, fileName, folderId } = input;
     const file = { size: input.size };
     const type = { mimeType: input.mimeType };
     await lockUserFiles(transaction, userId);
-    const duplicate = await this.duplicateOf(transaction, userId, sha256, file.size);
-    if (duplicate?.inFlight) return null;
-    if (duplicate && !duplicate.revivable) return { duplicateOf: duplicate.documentId };
+    const live = await this.candidates(transaction, userId, sha256, file.size, false);
+    if (live.some((candidate) => candidate.inFlight)) return null;
+    const conflict = classifyDuplicates(live, folderId);
+    const first = rankCandidates(live, folderId)[0];
+    const blocked = (): Plan => ({ conflict, documentId: first.documentId, retryVersionId: first.retryable ? first.versionId : null });
+    let duplicate: Found | null = null;
+    if (input.decision?.mode === 'supplement') {
+      duplicate = live.find((candidate) => candidate.documentId === input.decision!.targetId && candidate.state === 'no-original') ?? null;
+      if (!duplicate) {
+        if (!first) throw fieldError('targetId', 'Tài liệu cần bổ sung bản gốc không còn phù hợp. Hãy tải lại tệp để chọn lại.', HttpStatus.CONFLICT);
+        return blocked();
+      }
+    } else if (input.decision?.mode !== 'new' && first) {
+      if (conflict.situation !== 'auto-supplement') return blocked();
+      duplicate = first;
+    }
     const user = await transaction.user.findUnique({ where: { id: userId }, select: { privacyLevel: true } });
     if (!user) throw new NotFoundException('Không tìm thấy tài khoản.');
     const level = effectivePrivacy(user.privacyLevel, duplicate?.documentLevel ?? null);
@@ -305,6 +363,7 @@ export class DocumentsService {
     let renamed = false;
     if (duplicate) {
       await transaction.documentVersion.update({ where: { id: duplicate.versionId }, data: { parseState: 'PENDING', parseErrorCode: null } });
+      await transaction.document.update({ where: { id: duplicate.documentId }, data: { revision: { increment: 1 } } });
     } else {
       await this.assertFolder(transaction, userId, folderId);
       const free = await freeDocumentTitle(transaction, userId, folderId, title);
@@ -324,7 +383,7 @@ export class DocumentsService {
         expiresAt: kind === 'WEB_SOURCE' ? new Date(Date.now() + this.config.files.webSourceTtlMs) : null,
       },
     });
-    return { kind, key, ...target, revived: Boolean(duplicate), renamed };
+    return { kind, key, ...target, revived: Boolean(duplicate), renamed, previous: duplicate?.previous ?? null };
   }
 
   private async assertFolder(transaction: Prisma.TransactionClient, userId: string, folderId: string | null): Promise<void> {
@@ -378,7 +437,8 @@ export class DocumentsService {
         await this.prisma.$transaction([
           this.prisma.fileCopy.deleteMany({ where: { id: copyId, state: 'UPLOADING' } }),
           this.prisma.documentVersion.updateMany({
-            where: { id: plan.versionId, parseState: 'PENDING' }, data: { parseState: 'FAILED', parseErrorCode: 'SOURCE_UNAVAILABLE' },
+            where: { id: plan.versionId, parseState: 'PENDING' },
+            data: { parseState: plan.previous?.parseState ?? 'FAILED', parseErrorCode: plan.previous ? plan.previous.parseErrorCode : 'SOURCE_UNAVAILABLE' },
           }),
         ]);
       } else {

@@ -14,7 +14,8 @@ import { pipeline } from 'node:stream/promises';
 import { AccessTokenGuard, AuthOriginGuard } from '../auth/auth.guards';
 import { AuthRequest } from '../auth/auth.types';
 import { TrashService } from '../retention/trash.service';
-import { ListDocumentsQuery, UpdateDocumentDto, UploadDocumentDto } from './documents.dto';
+import { CheckDuplicateDto, ListDocumentsQuery, UpdateDocumentDto, UploadDocumentDto } from './documents.dto';
+import { DuplicateCheck } from './duplicates';
 import { DocumentsService, UploadedFile as StoredUpload } from './documents.service';
 import { DocumentSummary, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, RenameResult, StorageUsage, UploadResult } from './documents.types';
 import { contentDisposition } from './file-name';
@@ -31,6 +32,23 @@ const summarySchema = {
     originalAvailable: { type: 'boolean' }, originalDeleting: { type: 'boolean' },
     updatedAt: { type: 'string', format: 'date-time' }, pageCount: { type: 'integer', nullable: true },
     summary: { type: 'string', nullable: true }, originalInTrash: { type: 'boolean' },
+  },
+};
+
+const matchSchema = {
+  type: 'object',
+  properties: {
+    documentId: { type: 'string', format: 'uuid' }, title: { type: 'string' }, folderId: { type: 'string', format: 'uuid', nullable: true },
+    location: { type: 'string', nullable: true }, state: { type: 'string', enum: ['full', 'no-original', 'original-trashed', 'trashed'] },
+    sameFolder: { type: 'boolean' }, trashId: { type: 'string', format: 'uuid', nullable: true },
+  },
+};
+const duplicateSchema = {
+  type: 'object',
+  properties: {
+    situation: { type: 'string', enum: ['new', 'auto-supplement', 'ask'], description: 'new: chưa có; auto-supplement: sẽ tự bổ sung bản gốc; ask: cần người dùng chọn.' },
+    primary: { ...matchSchema, nullable: true }, matches: { type: 'array', items: matchSchema },
+    options: { type: 'array', items: { type: 'string', enum: ['new', 'skip', 'supplement', 'restore'] } },
   },
 };
 
@@ -52,13 +70,13 @@ export class DocumentsController {
   @UseFilters(UploadErrorsFilter)
   @UseInterceptors(FileInterceptor('file', {
     storage: memoryStorage(),
-    limits: { fileSize: MAX_UPLOAD_BYTES, files: 1, fields: 3, fieldSize: 2048, parts: 5 },
+    limits: { fileSize: MAX_UPLOAD_BYTES, files: 1, fields: 5, fieldSize: 2048, parts: 7 },
     defParamCharset: 'utf8',
   } as Parameters<typeof FileInterceptor>[1]))
   @ApiOperation({ summary: `Tải lên PDF/DOCX/TXT ≤ ${MAX_UPLOAD_MB} MB. Trùng nội dung với tài liệu đã có → 200 và trả tài liệu cũ.` })
   @ApiConsumes('multipart/form-data')
   @ApiBody({ schema: { type: 'object', required: ['file'], properties: { file: { type: 'string', format: 'binary' }, title: { type: 'string', maxLength: 255 }, folderId: { type: 'string', format: 'uuid' } } } })
-  @ApiCreatedResponse({ schema: { type: 'object', properties: { document: summarySchema, duplicate: { type: 'boolean' }, renamed: { type: 'boolean' } } } })
+  @ApiCreatedResponse({ schema: { type: 'object', properties: { document: summarySchema, duplicate: { type: 'boolean' }, renamed: { type: 'boolean' }, supplemented: { type: 'boolean' }, conflict: duplicateSchema } } })
   @ApiPayloadTooLargeResponse({ description: `Tệp quá ${MAX_UPLOAD_MB} MB hoặc vượt hạn mức bản gốc mức 3.` })
   @ApiUnsupportedMediaTypeResponse({ description: 'Không phải PDF, DOCX hoặc TXT UTF-8 (kiểm bằng nội dung tệp).' })
   @ApiTooManyRequestsResponse()
@@ -68,9 +86,18 @@ export class DocumentsController {
     @Req() request: AuthRequest,
     @Res({ passthrough: true }) response: Response,
   ): Promise<UploadResult> {
-    const result = await this.documents.upload(request.auth!.user.id, file, body.title, body.folderId ?? null);
+    const result = await this.documents.upload(request.auth!.user.id, file, body.title, body.folderId ?? null,
+      body.onDuplicate ? { mode: body.onDuplicate, targetId: body.targetId } : undefined);
     response.status(result.duplicate ? 200 : 201);
     return result;
+  }
+
+  @Post('check')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Hỏi trước khi tải lên: tệp có mã SHA-256 này đã có trong thư viện hay thùng rác chưa, và có những lựa chọn nào.' })
+  @ApiOkResponse({ schema: duplicateSchema })
+  check(@Req() request: AuthRequest, @Body() body: CheckDuplicateDto): Promise<DuplicateCheck> {
+    return this.documents.check(request.auth!.user.id, body.sha256, body.size, body.folderId ?? null);
   }
 
   @Get()
