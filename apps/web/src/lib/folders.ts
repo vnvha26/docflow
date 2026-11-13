@@ -86,6 +86,9 @@ export const foldersApi = {
   create(input: { name: string; purpose?: string | null; parentId?: string | null }, userId: string) {
     return authClient.request<FolderResult>('/folders', { method: 'POST', body: JSON.stringify(input) }, { asUser: userId });
   },
+  remove(id: string, userId: string) {
+    return authClient.request<{ documentCount: number; folderCount: number }>(`/folders/${encodeURIComponent(id)}`, { method: 'DELETE' }, { asUser: userId });
+  },
   update(id: string, input: { name?: string; purpose?: string | null; parentId?: string | null }, userId: string) {
     return authClient.request<FolderResult>(`/folders/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(input) }, { asUser: userId });
   },

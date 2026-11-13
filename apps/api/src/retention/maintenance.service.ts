@@ -4,6 +4,7 @@ import { PrismaService } from '../database/prisma.service';
 import { PARSER_VERSION } from '../parsing/text';
 import { ObjectStorage } from '../storage/object-storage';
 import { RetentionService } from './retention.service';
+import { TrashService } from './trash.service';
 
 const ABANDONED_UPLOAD_MS = 60 * 60_000;
 
@@ -16,6 +17,7 @@ export class MaintenanceService {
     @Inject(ObjectStorage) private readonly storage: ObjectStorage,
     @Inject(RetentionService) private readonly retention: RetentionService,
     @Inject(FileVault) private readonly vault: FileVault,
+    @Inject(TrashService) private readonly trash: TrashService,
   ) {}
 
   async expireTemporaryCopies(): Promise<number> {
@@ -125,12 +127,13 @@ export class MaintenanceService {
     return rewrapped;
   }
 
-  async runOnce(): Promise<{ expired: number; deleted: number; abandoned: number; rewrapped: number; parseQueued: number; parseFailed: number }> {
+  async runOnce(): Promise<{ expired: number; trashPurged: number; deleted: number; abandoned: number; rewrapped: number; parseQueued: number; parseFailed: number }> {
     const expired = await this.expireTemporaryCopies();
+    const trashPurged = await this.trash.purgeExpired();
     const { deleted } = await this.retention.deletePendingBlobs();
     const abandoned = await this.sweepAbandonedUploads();
     const rewrapped = await this.rewrapKeys();
     const parse = await this.resumeParsing();
-    return { expired, deleted, abandoned, rewrapped, parseQueued: parse.queued, parseFailed: parse.failed };
+    return { expired, trashPurged, deleted, abandoned, rewrapped, parseQueued: parse.queued, parseFailed: parse.failed };
   }
 }

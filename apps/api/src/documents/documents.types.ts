@@ -18,7 +18,7 @@ export interface DocumentSummary {
   updatedAt: Date;
   pageCount: number | null;
   summary: string | null;
-  detailsDeleted: boolean;
+  originalInTrash: boolean;
 }
 
 

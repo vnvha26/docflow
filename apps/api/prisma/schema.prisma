@@ -13,6 +13,12 @@ enum PrivacyLevel {
   ENCRYPTED_COPY
 }
 
+enum TrashKind {
+  DOCUMENT
+  FOLDER
+  ORIGINAL
+}
+
 enum NotificationDetail {
   MINIMAL
   DETAILED
@@ -141,6 +147,7 @@ model User {
   emailChallenges     EmailChallenge[]
   documents           Document[]
   folders             Folder[]
+  trashItems          TrashItem[]
   documentVersions    DocumentVersion[]
   fileCopies          FileCopy[]
   documentChunks      DocumentChunk[]
@@ -221,6 +228,8 @@ model Document {
   folderId     String?        @db.Uuid
   privacyLevel PrivacyLevel?
   deletedAt    DateTime?      @db.Timestamptz(3)
+  purgedAt     DateTime?      @db.Timestamptz(3)
+  originalTrashedAt DateTime? @db.Timestamptz(3)
   revision     BigInt         @default(1)
   createdAt    DateTime       @default(now()) @db.Timestamptz(3)
   updatedAt    DateTime       @default(now()) @updatedAt @db.Timestamptz(3)
@@ -235,6 +244,7 @@ model Document {
   collections       DocumentCollection[]
   obligations       Obligation[]
   aiJobs            AIJob[]
+  trashItems        TrashItem[]
 
   @@unique([id, userId])
   @@index([userId, createdAt(sort: Desc)])
@@ -248,6 +258,8 @@ model Folder {
   parentId  String?  @db.Uuid
   name      String   @db.VarChar(100)
   purpose   String?  @db.VarChar(500)
+  deletedAt DateTime? @db.Timestamptz(3)
+  purgedAt  DateTime? @db.Timestamptz(3)
   revision  BigInt   @default(1)
   createdAt DateTime @default(now()) @db.Timestamptz(3)
   updatedAt DateTime @default(now()) @updatedAt @db.Timestamptz(3)
@@ -256,9 +268,31 @@ model Folder {
   parent    Folder?    @relation("FolderTree", fields: [parentId, userId], references: [id, userId], onDelete: NoAction)
   children  Folder[]   @relation("FolderTree")
   documents Document[]
+  trashItems TrashItem[]
 
   @@unique([id, userId])
   @@index([userId, parentId])
+}
+
+model TrashItem {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId        String    @db.Uuid
+  kind          TrashKind
+  documentId    String?   @db.Uuid
+  folderId      String?   @db.Uuid
+  name          String    @db.VarChar(255)
+  location      String?   @db.VarChar(600)
+  documentCount Int       @default(0)
+  folderCount   Int       @default(0)
+  deletedAt     DateTime  @default(now()) @db.Timestamptz(3)
+  expiresAt     DateTime  @db.Timestamptz(3)
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  document Document? @relation(fields: [documentId, userId], references: [id, userId], onDelete: Cascade)
+  folder   Folder?   @relation(fields: [folderId, userId], references: [id, userId], onDelete: Cascade)
+
+  @@index([userId, deletedAt(sort: Desc)])
+  @@index([expiresAt])
 }
 
 model DocumentVersion {

@@ -5,7 +5,7 @@ import { documentsApi, isProcessing } from '../../lib/documents';
 import type { DocumentSummary } from '../../lib/documents';
 import { openOriginal } from './original-file';
 
-type Layer = 'original' | 'details' | 'all';
+type Layer = 'original' | 'all';
 
 interface Props {
   document: DocumentSummary;
@@ -15,33 +15,18 @@ interface Props {
   onMove: () => void;
 }
 
-const LAYERS: Record<Layer, { label: string; action: string; lost: string; kept: string }> = {
-  original: {
-    label: 'Xóa bản gốc…', action: 'Xóa bản gốc',
-    lost: 'Tệp gốc đã mã hóa. Sau này không xem hay tải lại được tệp này nữa.',
-    kept: 'Dòng thông tin, tóm tắt, nội dung đã đọc, việc cần làm và nhắc hạn.',
-  },
-  details: {
-    label: 'Xóa bản chi tiết…', action: 'Xóa bản chi tiết',
-    lost: 'Tệp gốc, nội dung đã đọc và tóm tắt.',
-    kept: 'Dòng thông tin (loại, ngày hết hạn, số tiền…), việc cần làm và nhắc hạn.',
-  },
-  all: {
-    label: 'Xóa toàn bộ…', action: 'Xóa toàn bộ',
-    lost: 'Cả tài liệu: tệp gốc, nội dung, tóm tắt, thông tin, việc cần làm và nhắc hạn của tài liệu này.',
-    kept: 'Không còn gì. Tài liệu biến mất khỏi danh sách.',
-  },
+const LABELS: Record<Layer, { label: string; hint: string }> = {
+  original: { label: 'Xóa bản gốc', hint: 'Bản gốc vào thùng rác; tên, thông tin và tóm tắt của tài liệu vẫn giữ.' },
+  all: { label: 'Xóa', hint: 'Tài liệu vào thùng rác; khôi phục được trong 30 ngày.' },
 };
 
 export function DocumentOptions({ document, onChange, onRemove, onRename, onMove }: Props) {
-  const [pending, setPending] = useState<Layer | null>(null);
-  const [saving, setSaving] = useState(false);
+  const [removing, setRemoving] = useState<Layer | null>(null);
   const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState('');
   const menu = useRef<HTMLDetailsElement>(null);
   const available: Layer[] = [
     ...(document.originalAvailable && !isProcessing(document) ? ['original' as const] : []),
-    ...(!document.detailsDeleted ? ['details' as const] : []),
     'all',
   ];
 
@@ -57,7 +42,7 @@ export function DocumentOptions({ document, onChange, onRemove, onRename, onMove
   }, []);
 
   function toggled() {
-    if (!menu.current?.open) { setPending(null); setError(''); return; }
+    if (!menu.current?.open) { setError(''); return; }
     for (const other of window.document.querySelectorAll<HTMLDetailsElement>('details.document-menu[open]')) {
       if (other !== menu.current) other.open = false;
     }
@@ -78,47 +63,34 @@ export function DocumentOptions({ document, onChange, onRemove, onRename, onMove
     } finally { setDownloading(false); }
   }
 
-  async function confirm(layer: Layer) {
-    setSaving(true); setError('');
+  async function remove(layer: Layer) {
+    setRemoving(layer); setError('');
     try {
       if (layer === 'all') {
         await documentsApi.remove(document.id);
         onRemove();
         return;
       }
-      const next = await (layer === 'original' ? documentsApi.deleteOriginal(document.id) : documentsApi.deleteDetails(document.id));
-      onChange(next);
-      setPending(null);
+      const next = await documentsApi.deleteOriginal(document.id);
       if (menu.current) menu.current.open = false;
+      onChange(next);
     } catch (failure) {
       if (failure instanceof StaleSessionError) return;
       if (failure instanceof ApiError && failure.status === 404 && layer === 'all') { onRemove(); return; }
       setError(failure instanceof ApiError ? failure.message : 'Chưa thể xóa. Vui lòng thử lại.');
-    } finally { setSaving(false); }
+    } finally { setRemoving(null); }
   }
 
   return <details ref={menu} className="document-menu" onToggle={toggled}>
     <summary aria-label={`Tùy chọn cho ${document.title}`} title="Tùy chọn"><Icon name="more" size={18} /></summary>
     <div className="document-menu-body">
-      {pending
-        ? <div className="menu-confirm">
-          <strong>{LAYERS[pending].action}?</strong>
-          <p><span>Mất vĩnh viễn:</span> {LAYERS[pending].lost}</p>
-          <p><span>Còn lại:</span> {LAYERS[pending].kept}</p>
-          <div className="menu-row">
-            <button type="button" className="button-danger" disabled={saving} onClick={() => confirm(pending)}>{saving ? 'Đang xóa…' : LAYERS[pending].action}</button>
-            <button type="button" className="text-button" disabled={saving} onClick={() => { setPending(null); setError(''); }}>Giữ lại</button>
-          </div>
-        </div>
-        : <>
-          <button type="button" className="text-button menu-item" onClick={() => leave(onRename)}>Đổi tên…</button>
-          <button type="button" className="text-button menu-item" onClick={() => leave(onMove)}>Chuyển tới…</button>
-          {document.originalAvailable && <button type="button" className="text-button menu-item" onClick={download} disabled={downloading}>
-            {downloading ? 'Đang tải…' : 'Tải bản gốc'}
-          </button>}
-          {available.map((layer) => <button key={layer} type="button" className="text-button danger menu-item"
-          onClick={() => { setPending(layer); setError(''); }}>{LAYERS[layer].label}</button>)}
-        </>}
+      <button type="button" className="text-button menu-item" onClick={() => leave(onRename)}>Đổi tên…</button>
+      <button type="button" className="text-button menu-item" onClick={() => leave(onMove)}>Chuyển tới…</button>
+      {document.originalAvailable && <button type="button" className="text-button menu-item" onClick={download} disabled={downloading}>
+        {downloading ? 'Đang tải…' : 'Tải bản gốc'}
+      </button>}
+      {available.map((layer) => <button key={layer} type="button" className="text-button danger menu-item" title={LABELS[layer].hint}
+        disabled={removing !== null} onClick={() => remove(layer)}>{removing === layer ? 'Đang xóa…' : LABELS[layer].label}</button>)}
       {error && <p className="field-error" role="alert">{error}</p>}
     </div>
   </details>;

@@ -16,7 +16,7 @@ export interface DocumentSummary {
   updatedAt: string;
   pageCount: number | null;
   summary: string | null;
-  detailsDeleted: boolean;
+  originalInTrash: boolean;
 }
 
 export const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
@@ -55,8 +55,7 @@ const problemMessages: Record<string, string> = {
   SOURCE_UNAVAILABLE: 'Bản tạm của tệp không còn nên chưa đọc được. Hãy tải lại đúng tệp này để xử lý tiếp.',
 };
 
-export function problemMessage(document: Pick<DocumentSummary, 'status' | 'problem'> & Partial<Pick<DocumentSummary, 'detailsDeleted'>>): string | null {
-  if (document.detailsDeleted) return null;
+export function problemMessage(document: Pick<DocumentSummary, 'status' | 'problem'>): string | null {
   if (document.status !== 'FAILED' && document.status !== 'UNSUPPORTED') return null;
   return (document.problem && problemMessages[document.problem])
     ?? (document.status === 'FAILED' ? 'Chưa đọc được tệp do lỗi tạm thời. Tải lại đúng tệp này để thử lại.' : 'Không đọc được nội dung tệp này.');
@@ -80,15 +79,15 @@ const statusLabels: Record<DocumentStatus, string> = {
   PENDING: 'Chờ đọc nội dung…', PROCESSING: 'Đang đọc nội dung…', SUCCEEDED: 'Đã đọc nội dung', FAILED: 'Chưa đọc được', UNSUPPORTED: 'Không đọc được',
 };
 
-type InfoFields = 'file' | 'pageCount' | 'status' | 'detailsDeleted' | 'originalAvailable' | 'originalDeleting';
+type InfoFields = 'file' | 'pageCount' | 'status' | 'originalInTrash' | 'originalAvailable' | 'originalDeleting';
 
 export function infoLine(document: Pick<DocumentSummary, InfoFields>): string {
   const parts = [fileTypeLabel(document)];
   if (document.pageCount) parts.push(`${document.pageCount.toLocaleString('vi-VN')} trang`);
-  if (document.detailsDeleted) parts.push('Đã xóa bản chi tiết');
-  else if (document.status === 'SUCCEEDED') parts.push(formatBytes(document.file.byteSize));
+  if (document.status === 'SUCCEEDED') parts.push(formatBytes(document.file.byteSize));
   else parts.push(statusLabels[document.status]);
-  if (!document.detailsDeleted && !isProcessing(document) && !document.originalAvailable && !document.originalDeleting) parts.push('Không còn bản gốc');
+  if (document.originalInTrash) parts.push('Bản gốc trong thùng rác');
+  else if (!isProcessing(document) && !document.originalAvailable && !document.originalDeleting) parts.push('Không còn bản gốc');
   return parts.join(' · ');
 }
 
@@ -154,8 +153,5 @@ export const documentsApi = {
   },
   deleteOriginal(id: string) {
     return authClient.request<DocumentSummary>(`/documents/${encodeURIComponent(id)}/original`, { method: 'DELETE' });
-  },
-  deleteDetails(id: string) {
-    return authClient.request<DocumentSummary>(`/documents/${encodeURIComponent(id)}/details`, { method: 'DELETE' });
   },
 };

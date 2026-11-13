@@ -4,7 +4,7 @@ import {
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import {
-  ApiAcceptedResponse, ApiBearerAuth, ApiBody, ApiConsumes, ApiCreatedResponse, ApiNoContentResponse, ApiNotFoundResponse,
+  ApiAcceptedResponse, ApiBearerAuth, ApiConflictResponse, ApiBody, ApiConsumes, ApiCreatedResponse, ApiNoContentResponse, ApiNotFoundResponse,
   ApiOkResponse, ApiOperation, ApiPayloadTooLargeResponse, ApiProduces, ApiTags, ApiTooManyRequestsResponse, ApiUnauthorizedResponse,
   ApiUnprocessableEntityResponse, ApiUnsupportedMediaTypeResponse,
 } from '@nestjs/swagger';
@@ -13,7 +13,7 @@ import { memoryStorage } from 'multer';
 import { pipeline } from 'node:stream/promises';
 import { AccessTokenGuard, AuthOriginGuard } from '../auth/auth.guards';
 import { AuthRequest } from '../auth/auth.types';
-import { RetentionService } from '../retention/retention.service';
+import { TrashService } from '../retention/trash.service';
 import { ListDocumentsQuery, UpdateDocumentDto, UploadDocumentDto } from './documents.dto';
 import { DocumentsService, UploadedFile as StoredUpload } from './documents.service';
 import { DocumentSummary, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, RenameResult, StorageUsage, UploadResult } from './documents.types';
@@ -30,7 +30,7 @@ const summarySchema = {
     file: { type: 'object', properties: { name: { type: 'string' }, mimeType: { type: 'string' }, byteSize: { type: 'integer' } } },
     originalAvailable: { type: 'boolean' }, originalDeleting: { type: 'boolean' },
     updatedAt: { type: 'string', format: 'date-time' }, pageCount: { type: 'integer', nullable: true },
-    summary: { type: 'string', nullable: true }, detailsDeleted: { type: 'boolean' },
+    summary: { type: 'string', nullable: true }, originalInTrash: { type: 'boolean' },
   },
 };
 
@@ -44,7 +44,7 @@ export class DocumentsController {
 
   constructor(
     @Inject(DocumentsService) private readonly documents: DocumentsService,
-    @Inject(RetentionService) private readonly retention: RetentionService,
+    @Inject(TrashService) private readonly trash: TrashService,
   ) {}
 
   @Post()
@@ -104,11 +104,11 @@ export class DocumentsController {
 
   @Delete(':id')
   @HttpCode(204)
-  @ApiOperation({ summary: 'B5: xóa mềm tài liệu. Ẩn khỏi danh sách, khóa mọi đường dẫn, xóa nội dung chữ ngay; bản lưu được worker xóa sau đó.' })
+  @ApiOperation({ summary: 'Đưa tài liệu vào thùng rác: ẩn khỏi danh sách và khóa mọi đường dẫn; khôi phục được tới khi hết hạn hoặc bị xóa vĩnh viễn.' })
   @ApiNoContentResponse()
   @ApiNotFoundResponse({ description: 'Không phải tài liệu của bạn hoặc đã bị xóa.' })
   async remove(@Param('id', new ParseUUIDPipe()) id: string, @Req() request: AuthRequest): Promise<void> {
-    await this.retention.deleteDocument(request.auth!.user.id, id);
+    await this.trash.trashDocument(request.auth!.user.id, id);
   }
 
   @Get(':id/preview')
@@ -127,25 +127,15 @@ export class DocumentsController {
     }).send(html);
   }
 
-  @Delete(':id/details')
-  @HttpCode(202)
-  @ApiOperation({ summary: 'Xóa bản chi tiết: bản gốc, nội dung đã đọc, tóm tắt. Giữ dòng thông tin, việc cần làm và nhắc hạn.' })
-  @ApiAcceptedResponse({ schema: summarySchema })
-  @ApiNotFoundResponse()
-  async deleteDetails(@Param('id', new ParseUUIDPipe()) id: string, @Req() request: AuthRequest): Promise<DocumentSummary> {
-    const userId = request.auth!.user.id;
-    await this.retention.deleteDetails(userId, id);
-    return this.documents.get(userId, id);
-  }
-
   @Delete(':id/original')
   @HttpCode(202)
-  @ApiOperation({ summary: 'P5: xóa bản gốc mã hóa, giữ tài liệu và dữ liệu đã trích xuất. Blob được worker xóa ngay sau đó.' })
+  @ApiOperation({ summary: 'Đưa bản gốc vào thùng rác: không xem/tải được nữa, giữ tên, thông tin trích xuất và tóm tắt. Chỉ khi tài liệu đã đọc xong.' })
   @ApiAcceptedResponse({ schema: summarySchema })
   @ApiNotFoundResponse({ description: 'Không phải tài liệu của bạn hoặc không có bản gốc.' })
+  @ApiConflictResponse({ description: 'Tài liệu đang được đọc nội dung.' })
   async deleteOriginal(@Param('id', new ParseUUIDPipe()) id: string, @Req() request: AuthRequest): Promise<DocumentSummary> {
     const userId = request.auth!.user.id;
-    await this.retention.deleteOriginal(userId, id);
+    await this.trash.trashOriginal(userId, id);
     return this.documents.get(userId, id);
   }
 

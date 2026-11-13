@@ -32,7 +32,7 @@ export class FoldersService {
 
   async tree(userId: string): Promise<FolderTree> {
     const [rows, unfiledCount, totalCount] = await Promise.all([
-      this.prisma.folder.findMany({ where: { userId }, orderBy: [{ name: 'asc' }, { id: 'asc' }], select: FOLDER_SELECT }),
+      this.prisma.folder.findMany({ where: { userId, deletedAt: null }, orderBy: [{ name: 'asc' }, { id: 'asc' }], select: FOLDER_SELECT }),
       this.prisma.document.count({ where: { userId, folderId: null, ...LISTED } }),
       this.prisma.document.count({ where: { userId, ...LISTED } }),
     ]);
@@ -40,7 +40,7 @@ export class FoldersService {
   }
 
   private nodes(transaction: Prisma.TransactionClient, userId: string): Promise<TreeNode[]> {
-    return transaction.folder.findMany({ where: { userId }, select: { id: true, parentId: true } });
+    return transaction.folder.findMany({ where: { userId, deletedAt: null }, select: { id: true, parentId: true } });
   }
 
   private purpose(value: string | null | undefined): string | null {
@@ -75,7 +75,7 @@ export class FoldersService {
     const purpose = input.purpose === undefined ? undefined : this.purpose(input.purpose);
     return this.prisma.$transaction(async (transaction) => {
       await lockUserFiles(transaction, userId);
-      const current = await transaction.folder.findFirst({ where: { id: folderId, userId }, select: { id: true, parentId: true, name: true } });
+      const current = await transaction.folder.findFirst({ where: { id: folderId, userId, deletedAt: null }, select: { id: true, parentId: true, name: true } });
       if (!current) throw new NotFoundException('Không tìm thấy thư mục.');
       const parentId = input.parentId === undefined ? current.parentId : input.parentId;
       if (parentId !== current.parentId) {

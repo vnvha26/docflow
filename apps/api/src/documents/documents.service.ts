@@ -44,7 +44,7 @@ interface Duplicate {
 interface Reserved { kind: FileCopyKind; key: string; documentId: string; versionId: string; revived: boolean; renamed: boolean }
 type Plan = { duplicateOf: string } | Reserved;
 const SUMMARY_SELECT = {
-  id: true, title: true, createdAt: true, updatedAt: true, typeCode: true, privacyLevel: true, folderId: true,
+  id: true, title: true, createdAt: true, updatedAt: true, typeCode: true, privacyLevel: true, folderId: true, originalTrashedAt: true,
   user: { select: { privacyLevel: true } },
   versions: {
     orderBy: { number: 'desc' }, take: 1,
@@ -58,19 +58,20 @@ type SummaryRow = Prisma.DocumentGetPayload<{ select: typeof SUMMARY_SELECT }>;
 function toSummary(row: SummaryRow): DocumentSummary {
   const version = row.versions[0];
   const privacyLevel = effectivePrivacy(row.user.privacyLevel, row.privacyLevel);
-  const detailsDeleted = row.privacyLevel === 'STRUCTURED_ONLY';
+  const textRemoved = row.privacyLevel === 'STRUCTURED_ONLY';
+  const originalInTrash = row.originalTrashedAt !== null;
   return {
     id: row.id, title: row.title, createdAt: row.createdAt, typeCode: row.typeCode, folderId: row.folderId,
     status: version.parseState,
-    problem: !detailsDeleted && (version.parseState === 'FAILED' || version.parseState === 'UNSUPPORTED') ? version.parseErrorCode : null,
+    problem: !textRemoved && (version.parseState === 'FAILED' || version.parseState === 'UNSUPPORTED') ? version.parseErrorCode : null,
     file: { name: version.originalFilename, mimeType: version.mimeType, byteSize: Number(version.byteSize) },
-    originalAvailable: privacyLevel === 'ENCRYPTED_COPY'
+    originalAvailable: !originalInTrash && privacyLevel === 'ENCRYPTED_COPY'
       && row.fileCopies.some((copy) => copy.versionId === version.id && copy.state === 'AVAILABLE'),
     originalDeleting: row.fileCopies.some((copy) => copy.versionId === version.id && copy.state === 'DELETE_PENDING'),
     updatedAt: row.updatedAt > version.updatedAt ? row.updatedAt : version.updatedAt,
     pageCount: version.pageCount,
     summary: privacyLevel === 'STRUCTURED_ONLY' ? null : row.extractedMetadata[0]?.summary ?? null,
-    detailsDeleted,
+    originalInTrash,
   };
 }
 
@@ -328,7 +329,7 @@ export class DocumentsService {
 
   private async assertFolder(transaction: Prisma.TransactionClient, userId: string, folderId: string | null): Promise<void> {
     if (!folderId) return;
-    const folder = await transaction.folder.findFirst({ where: { id: folderId, userId }, select: { id: true } });
+    const folder = await transaction.folder.findFirst({ where: { id: folderId, userId, deletedAt: null }, select: { id: true } });
     if (!folder) throw fieldError('folderId', 'Không tìm thấy thư mục.', HttpStatus.NOT_FOUND);
   }
 
@@ -453,13 +454,13 @@ export class DocumentsService {
     const row = await this.prisma.document.findFirst({
       where: { id: documentId, userId, deletedAt: null },
       select: {
-        title: true, privacyLevel: true, user: { select: { privacyLevel: true } },
+        title: true, privacyLevel: true, originalTrashedAt: true, user: { select: { privacyLevel: true } },
         versions: { orderBy: { number: 'desc' }, take: 1, select: { id: true, originalFilename: true, mimeType: true, byteSize: true } },
       },
     });
     const version = row?.versions[0];
     const level: PrivacyLevel | null = row ? effectivePrivacy(row.user.privacyLevel, row.privacyLevel) : null;
-    const copy = version && level === 'ENCRYPTED_COPY'
+    const copy = version && level === 'ENCRYPTED_COPY' && !row?.originalTrashedAt
       ? await this.prisma.fileCopy.findFirst({
         where: { userId, documentId, versionId: version.id, kind: 'ENCRYPTED_COPY', state: 'AVAILABLE' },
         select: { id: true, storageKey: true, encryptionKeyRef: true },

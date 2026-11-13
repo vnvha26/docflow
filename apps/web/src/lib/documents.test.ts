@@ -9,7 +9,7 @@ import type { DocumentFilters, DocumentStatus, DocumentSummary, DocumentTypeFilt
 const doc = (patch: Partial<DocumentSummary> = {}): DocumentSummary => ({
   id: '00000000-0000-4000-8000-000000000001', title: 'Hợp đồng', createdAt: '2026-11-01T00:00:00.000Z', updatedAt: '2026-11-02T00:00:00.000Z',
   typeCode: null, folderId: null, status: 'SUCCEEDED', problem: null, file: { name: 'a.pdf', mimeType: 'application/pdf', byteSize: 1000 },
-  originalAvailable: true, originalDeleting: false, pageCount: null, summary: null, detailsDeleted: false, ...patch,
+  originalAvailable: true, originalDeleting: false, pageCount: null, summary: null, originalInTrash: false, ...patch,
 });
 const file = (mimeType: string) => ({ name: 'a', mimeType, byteSize: 1 });
 const STATUSES: DocumentStatus[] = ['PENDING', 'PROCESSING', 'SUCCEEDED', 'FAILED', 'UNSUPPORTED'];
@@ -22,7 +22,7 @@ test('filters: by file type; no filter keeps everything', () => {
     }
   }
   const empty: DocumentFilters = {};
-  for (const status of STATUSES) assert.equal(matchesFilters(doc({ status, detailsDeleted: status === 'FAILED' }), empty), true);
+  for (const status of STATUSES) assert.equal(matchesFilters(doc({ status }), empty), true);
   assert.equal(matchesFilters(doc({ file: file('image/png') }), { type: 'pdf' }), false);
 });
 
@@ -31,7 +31,7 @@ test('info line: type, pages, then size once read or the reading state; a missin
   assert.equal(infoLine(doc({ file: file(DOCX_MIME), status: 'PENDING' })), 'DOCX · Chờ đọc nội dung…');
   assert.equal(infoLine(doc({ file: file('text/plain'), status: 'PROCESSING', pageCount: 0 })), 'TXT · Đang đọc nội dung…');
   assert.equal(infoLine(doc({ status: 'UNSUPPORTED' })), 'PDF · Không đọc được');
-  assert.equal(infoLine(doc({ status: 'FAILED', detailsDeleted: true, pageCount: 2, originalAvailable: false })), 'PDF · 2 trang · Đã xóa bản chi tiết');
+  assert.equal(infoLine(doc({ pageCount: 2, originalAvailable: false, originalInTrash: true })), 'PDF · 2 trang · 1000 B · Bản gốc trong thùng rác');
   assert.equal(infoLine(doc({ pageCount: 2, originalAvailable: false })), 'PDF · 2 trang · 1000 B · Không còn bản gốc');
   assert.equal(infoLine(doc({ originalAvailable: false, originalDeleting: true })), 'PDF · 1000 B', 'still being deleted: the page shows that separately');
   assert.equal(infoLine(doc({ status: 'PENDING', originalAvailable: false })), 'PDF · Chờ đọc nội dung…');
@@ -46,8 +46,6 @@ test('problem message: only for unread files whose details are kept; unknown cod
   assert.match(problemMessage(doc({ status: 'UNSUPPORTED', problem: 'SOMETHING_NEW' })) ?? '', /^Không đọc được nội dung/);
   assert.match(problemMessage(doc({ status: 'FAILED', problem: null })) ?? '', /Tải lại đúng tệp này/);
   assert.match(problemMessage(doc({ status: 'FAILED', problem: 'SOURCE_UNAVAILABLE' })) ?? '', /Bản tạm/);
-  assert.equal(problemMessage(doc({ status: 'FAILED', problem: 'DETAILS_DELETED', detailsDeleted: true })), null);
-  assert.equal(problemMessage(doc({ status: 'UNSUPPORTED', problem: 'NO_TEXT_LAYER', detailsDeleted: true })), null);
 });
 
 test('the page keeps asking while a file is being read or its original is being deleted', () => {

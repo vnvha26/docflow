@@ -7,7 +7,7 @@ export function Brand({ inverse = false }: { inverse?: boolean }) {
   </Link>;
 }
 
-export type IconName = 'arrow' | 'eye' | 'eye-off' | 'shield' | 'mail' | 'lock' | 'user' | 'logout' | 'check' | 'chevron' | 'file' | 'upload' | 'download' | 'folder' | 'more' | 'summary';
+export type IconName = 'arrow' | 'eye' | 'eye-off' | 'shield' | 'mail' | 'lock' | 'user' | 'logout' | 'check' | 'chevron' | 'file' | 'upload' | 'download' | 'folder' | 'more' | 'summary' | 'trash';
 
 export function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
   const paths = {
@@ -27,6 +27,7 @@ export function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
     folder: <><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /></>,
     more: <><circle cx="5" cy="12" r="1.2" /><circle cx="12" cy="12" r="1.2" /><circle cx="19" cy="12" r="1.2" /></>,
     summary: <><path d="M5 5h14M5 10h14M5 15h9M5 20h6" /></>,
+    trash: <><path d="M4 7h16M10 11v6m4-6v6M6 7l1 13h10l1-13M9 7V4h6v3" /></>,
   };
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
 }

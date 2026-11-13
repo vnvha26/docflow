@@ -30,7 +30,7 @@ export async function freeFolderName(
       FROM generate_series(1, 1000) AS n) c
     WHERE NOT EXISTS (
       SELECT 1 FROM "Folder" f
-      WHERE f."userId" = ${userId}::uuid
+      WHERE f."userId" = ${userId}::uuid AND f."deletedAt" IS NULL
         AND COALESCE(f."parentId", ${ROOT}::uuid) = COALESCE(${parentId}::uuid, ${ROOT}::uuid)
         AND f."nameKey" = docflow_name_key(c.name) AND f."id" IS DISTINCT FROM ${exceptId}::uuid)
     ORDER BY c.n LIMIT 1`;

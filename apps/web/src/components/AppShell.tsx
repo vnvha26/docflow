@@ -24,6 +24,7 @@ export function AppShell({ user, children }: { user: User; children: ReactNode }
       <div className="header-left"><Brand />
         <nav className="app-nav" aria-label="Chính">
           <NavLink to="/" end><Icon name="folder" size={17} />Tài liệu</NavLink>
+          <NavLink to="/trash"><Icon name="trash" size={17} />Thùng rác</NavLink>
           <NavLink to="/account"><Icon name="user" size={17} />Tài khoản</NavLink>
         </nav>
       </div>

@@ -3,6 +3,7 @@ import type { DragEvent } from 'react';
 import { Icon } from '../../components/Brand';
 import { flattenTree, pathOf, UNFILED } from '../../lib/folders';
 import type { FolderTree } from '../../lib/folders';
+import { folderContents } from '../../lib/trash';
 
 export const ALL = 'all';
 export const FOLDER_DRAG = 'application/x-docflow-folder';
@@ -32,9 +33,9 @@ interface Props {
   mayNest: (folderId: string) => boolean;
 }
 
-export type FolderAction = 'create' | 'edit' | 'move';
+export type FolderAction = 'create' | 'edit' | 'move' | 'delete';
 const MENU_WIDTH = 230;
-const MENU_HEIGHT = 132;
+const MENU_HEIGHT = 176;
 
 export function FolderPane({ tree, view, onSelect, onCreate, accepts, onDrop, onDragFolder, onAction, mayNest }: Props) {
   const [menu, setMenu] = useState<{ id: string; x: number; y: number } | null>(null);
@@ -133,17 +134,18 @@ export function FolderPane({ tree, view, onSelect, onCreate, accepts, onDrop, on
       {item(ALL, 'Tất cả tài liệu', tree?.totalCount, 1, 'file')}
       {item(UNFILED, 'Chưa phân loại', tree?.unfiledCount, 1, 'file')}
       {!stored.hidden && rows.length > 0 && <li className="folder-divider" aria-hidden="true" />}
-      {!stored.hidden && rows.map(({ folder, depth }) => item(folder.id, folder.name, folder.documentCount, depth, 'folder', parents.has(folder.id)))}
+      {!stored.hidden && rows.map(({ folder, depth }) => item(folder.id, folder.name, folderContents(folders, folder.id).documents, depth, 'folder', parents.has(folder.id)))}
     </ul>
     {menu && <div className="document-menu-body context-menu" role="menu" style={{ left: menu.x, top: menu.y, width: MENU_WIDTH }}>
       <button type="button" role="menuitem" className="text-button menu-item" disabled={!mayNest(menu.id)} onClick={() => choose('create')}>Thư mục con mới…</button>
       <button type="button" role="menuitem" className="text-button menu-item" onClick={() => choose('edit')}>Sửa tên và mục đích…</button>
       <button type="button" role="menuitem" className="text-button menu-item" onClick={() => choose('move')}>Chuyển tới…</button>
+      <button type="button" role="menuitem" className="text-button danger menu-item" onClick={() => choose('delete')}>Xóa thư mục</button>
     </div>}
     <select className="folder-select" aria-label="Chọn thư mục" value={view} onChange={(event) => onSelect(event.target.value)}>
       <option value={ALL}>Tất cả tài liệu{tree ? ` (${tree.totalCount})` : ''}</option>
       <option value={UNFILED}>Chưa phân loại{tree ? ` (${tree.unfiledCount})` : ''}</option>
-      {flattenTree(folders).map(({ folder, depth }) => <option key={folder.id} value={folder.id}>{'  '.repeat(depth - 1)}{depth > 1 ? '› ' : ''}{folder.name} ({folder.documentCount})</option>)}
+      {flattenTree(folders).map(({ folder, depth }) => <option key={folder.id} value={folder.id}>{'  '.repeat(depth - 1)}{depth > 1 ? '› ' : ''}{folder.name} ({folderContents(folders, folder.id).documents})</option>)}
     </select>
   </aside>;
 }

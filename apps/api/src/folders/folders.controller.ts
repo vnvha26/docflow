@@ -1,9 +1,10 @@
-import { Body, Controller, Get, Inject, Param, ParseUUIDPipe, Patch, Post, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Inject, Param, ParseUUIDPipe, Patch, Post, Req, UseGuards } from '@nestjs/common';
 import {
   ApiBadRequestResponse, ApiBearerAuth, ApiCreatedResponse, ApiNotFoundResponse, ApiOkResponse, ApiOperation, ApiTags, ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
 import { AccessTokenGuard, AuthOriginGuard } from '../auth/auth.guards';
 import { AuthRequest } from '../auth/auth.types';
+import { TrashService } from '../retention/trash.service';
 import { CreateFolderDto, UpdateFolderDto } from './folders.dto';
 import { FoldersService } from './folders.service';
 import { FolderResult, FolderTree } from './folders.types';
@@ -31,7 +32,10 @@ const treeSchema = {
 @Controller('folders')
 @UseGuards(AuthOriginGuard, AccessTokenGuard)
 export class FoldersController {
-  constructor(@Inject(FoldersService) private readonly folders: FoldersService) {}
+  constructor(
+    @Inject(FoldersService) private readonly folders: FoldersService,
+    @Inject(TrashService) private readonly trash: TrashService,
+  ) {}
 
   @Get()
   @ApiOperation({ summary: 'Toàn bộ thư mục của người dùng (danh sách phẳng, dựng cây theo parentId) kèm số tài liệu.' })
@@ -56,5 +60,13 @@ export class FoldersController {
   @ApiNotFoundResponse()
   update(@Param('id', new ParseUUIDPipe()) id: string, @Req() request: AuthRequest, @Body() body: UpdateFolderDto): Promise<FolderResult> {
     return this.folders.update(request.auth!.user.id, id, body);
+  }
+
+  @Delete(':id')
+  @ApiOperation({ summary: 'Đưa thư mục cùng mọi thư mục con và tài liệu bên trong vào thùng rác như một mục.' })
+  @ApiOkResponse({ schema: { type: 'object', properties: { documentCount: { type: 'integer' }, folderCount: { type: 'integer' } } } })
+  @ApiNotFoundResponse()
+  remove(@Param('id', new ParseUUIDPipe()) id: string, @Req() request: AuthRequest): Promise<{ documentCount: number; folderCount: number }> {
+    return this.trash.trashFolder(request.auth!.user.id, id);
   }
 }

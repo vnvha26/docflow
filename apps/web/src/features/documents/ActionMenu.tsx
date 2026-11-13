@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { Icon } from '../../components/Brand';
 
-export interface MenuAction { label: string; onSelect: () => void; disabled?: boolean; hint?: string }
+export interface MenuAction { label: string; onSelect: () => void; disabled?: boolean; hint?: string; danger?: boolean }
 
 export function ActionMenu({ label, actions }: { label: string; actions: MenuAction[] }) {
   const menu = useRef<HTMLDetailsElement>(null);
@@ -20,7 +20,7 @@ export function ActionMenu({ label, actions }: { label: string; actions: MenuAct
   return <details ref={menu} className="document-menu folder-menu">
     <summary aria-label={label} title={label}><Icon name="more" size={18} /></summary>
     <div className="document-menu-body">
-      {actions.map((action) => <button key={action.label} type="button" className="text-button menu-item" disabled={action.disabled} title={action.hint}
+      {actions.map((action) => <button key={action.label} type="button" className={`text-button menu-item${action.danger ? ' danger' : ''}`} disabled={action.disabled} title={action.hint}
         onClick={() => { if (menu.current) menu.current.open = false; action.onSelect(); }}>{action.label}</button>)}
     </div>
   </details>;
