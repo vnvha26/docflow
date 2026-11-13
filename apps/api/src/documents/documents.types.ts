@@ -1,4 +1,5 @@
 import { ParseState } from '@prisma/client';
+import { DuplicateCheck } from './duplicates';
 
 export const MAX_UPLOAD_MB = 50;
 export const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
@@ -49,6 +50,8 @@ export interface UploadResult {
   document: DocumentSummary;
   duplicate: boolean;
   renamed: boolean;
+  supplemented: boolean;
+  conflict?: DuplicateCheck;
 }
 
 export interface StorageUsage {

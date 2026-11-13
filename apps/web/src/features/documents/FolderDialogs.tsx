@@ -33,25 +33,44 @@ function Actions({ saving, label, onClose, disabled = false }: { saving: boolean
 
 interface FolderFormProps {
   folder?: Folder;
-  parentLabel: string;
-  onSubmit: (name: string, purpose: string | null) => Promise<void>;
+  path?: readonly Folder[];
+  onSubmit: (name: string, purpose: string | null, parentId: string | null) => Promise<void>;
   onClose: () => void;
 }
 
-export function FolderFormDialog({ folder, parentLabel, onSubmit, onClose }: FolderFormProps) {
+const ROOT_LABEL = 'Cấp ngoài cùng';
+
+export function FolderFormDialog({ folder, path = [], onSubmit, onClose }: FolderFormProps) {
   const [name, setName] = useState(folder?.name ?? '');
   const [purpose, setPurpose] = useState(folder?.purpose ?? '');
+  const [parentId, setParentId] = useState<string | null>(path.at(-1)?.id ?? null);
   const { saving, error, setError, run } = useSubmit(onClose);
+  const parent = path.find((known) => known.id === parentId);
+  const chosen = path.findIndex((known) => known.id === parentId);
 
   function submit(event: FormEvent) {
     event.preventDefault();
     const problem = folderNameProblem(name);
     if (problem) { setError(problem); return; }
-    void run(() => onSubmit(name.trim(), purpose.trim() || null), ['name', 'purpose', 'parentId']);
+    void run(() => onSubmit(name.trim(), purpose.trim() || null, parentId), ['name', 'purpose', 'parentId']);
   }
 
-  return <Modal kicker={folder ? 'SỬA THƯ MỤC' : 'THƯ MỤC MỚI'} title={folder ? folder.name : `Tạo trong ${parentLabel}`} onClose={onClose} locked={saving}>
+  const place = (id: string | null, label: string, index: number) => <span key={id ?? 'root'}>
+    {index >= 0 && <i aria-hidden="true">›</i>}
+    <button type="button" className={`parent-place${id === parentId ? ' selected' : ''}${index > chosen ? ' beyond' : ''}`}
+      aria-pressed={id === parentId} disabled={saving} onClick={() => setParentId(id)}>{label}</button>
+  </span>;
+
+  return <Modal kicker={folder ? 'SỬA THƯ MỤC' : 'THƯ MỤC MỚI'} title={folder ? folder.name : `Tạo trong ${parent ? `“${parent.name}”` : 'cấp ngoài cùng'}`} onClose={onClose} locked={saving}>
     <form className="dialog-form" onSubmit={submit} noValidate>
+      {!folder && path.length > 0 && <div className="dialog-field">
+        <span>Tạo trong</span>
+        <div className="parent-path" role="group" aria-label="Chọn nơi tạo thư mục">
+          {place(null, ROOT_LABEL, -1)}
+          {path.map((known, index) => place(known.id, known.name, index))}
+        </div>
+        <small>Bấm vào một thư mục trong đường dẫn để tạo ở đó.</small>
+      </div>}
       <label className="dialog-field">
         <span>Tên thư mục</span>
         <input value={name} onChange={(event) => setName(event.target.value)} maxLength={MAX_FOLDER_NAME} autoFocus required placeholder="Ví dụ: Nhà Cầu Giấy" />

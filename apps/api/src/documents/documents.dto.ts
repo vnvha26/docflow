@@ -1,6 +1,7 @@
-import { ApiPropertyOptional } from '@nestjs/swagger';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import { IsIn, IsInt, IsOptional, IsString, IsUUID, Matches, Max, MaxLength, Min, ValidateIf } from 'class-validator';
+import { MAX_UPLOAD_BYTES } from './documents.types';
 import { DOCUMENT_SORTS, DOCUMENT_TYPE_FILTERS, DocumentSort, DocumentTypeFilter } from './documents.types';
 
 export class UploadDocumentDto {
@@ -14,6 +15,33 @@ export class UploadDocumentDto {
   @IsOptional()
   @IsUUID(undefined, { message: 'Thư mục không hợp lệ.' })
   folderId?: string;
+
+  @ApiPropertyOptional({ enum: ['new', 'supplement'], description: 'Lựa chọn khi tệp trùng nội dung với tài liệu đã có: new = tải thành tài liệu mới; supplement = bổ sung bản gốc cho targetId. Bỏ trống = server tự xử lý hoặc báo trùng.' })
+  @IsOptional()
+  @IsIn(['new', 'supplement'], { message: 'Lựa chọn khi trùng không hợp lệ.' })
+  onDuplicate?: 'new' | 'supplement';
+
+  @ApiPropertyOptional({ format: 'uuid', description: 'Tài liệu nhận bản gốc khi onDuplicate = supplement.' })
+  @ValidateIf((object: UploadDocumentDto, value: unknown) => value !== undefined || object.onDuplicate === 'supplement')
+  @IsUUID(undefined, { message: 'Tài liệu cần bổ sung bản gốc không hợp lệ.' })
+  targetId?: string;
+}
+
+export class CheckDuplicateDto {
+  @ApiProperty({ description: 'SHA-256 của tệp (hex, chữ thường), tính ở trình duyệt.' })
+  @Matches(/^[0-9a-f]{64}$/, { message: 'Mã SHA-256 không hợp lệ.' })
+  sha256!: string;
+
+  @ApiProperty({ minimum: 1, maximum: MAX_UPLOAD_BYTES })
+  @IsInt({ message: 'Kích thước tệp phải là số nguyên.' })
+  @Min(1, { message: 'Tệp rỗng, không có gì để lưu.' })
+  @Max(MAX_UPLOAD_BYTES, { message: 'Tệp vượt quá kích thước cho phép.' })
+  size!: number;
+
+  @ApiPropertyOptional({ format: 'uuid', nullable: true, description: 'Thư mục đang mở; null = "Chưa phân loại".' })
+  @ValidateIf((_object: object, value: unknown) => value !== undefined && value !== null)
+  @IsUUID(undefined, { message: 'Thư mục không hợp lệ.' })
+  folderId?: string | null;
 }
 
 export class UpdateDocumentDto {

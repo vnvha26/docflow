@@ -1032,6 +1032,140 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.ok(await db.documentChunk.count({ where: { documentId: id } }) > 0);
   });
 
+  test('duplicates: the server is asked first by hash, and an upload carries the choice: new, supplement the original, or nothing', async () => {
+    const user = await createUser('duplicates', 'ENCRYPTED_COPY');
+    users.dup = user;
+    const folder = async (name) => (await request('/api/folders', { method: 'POST', token: user.token, body: { name } })).body.folder.id;
+    const here = await folder('Hợp đồng');
+    const there = await folder('Khác');
+    const body = text();
+    const hash = sha256(body);
+    const check = async (folderId, token = user.token, extra = {}) => request('/api/documents/check', { method: 'POST', token, body: { sha256: hash, size: body.length, folderId, ...extra } });
+    const put = async (folderId, fields = {}, name = 'thue-nha.txt') => {
+      const form = new FormData();
+      form.append('file', new Blob([body], { type: 'text/plain' }), name);
+      if (folderId) form.append('folderId', folderId);
+      for (const [key, value] of Object.entries(fields)) form.append(key, value);
+      return request('/api/documents', { method: 'POST', token: user.token, form });
+    };
+    const count = () => db.document.count({ where: { userId: user.id } });
+    const dropOriginal = async (documentId, purge) => {
+      assert.equal((await request(`/api/documents/${documentId}/original`, { method: 'DELETE', token: user.token })).status, 202);
+      const item = (await trashOf(user)).find((entry) => entry.kind === 'ORIGINAL' && entry.documentId === documentId);
+      if (purge) assert.equal((await request(`/api/trash/${item.id}`, { method: 'DELETE', token: user.token })).status, 204);
+      return item;
+    };
+
+    assert.equal((await request('/api/documents/check', { method: 'POST', body: { sha256: hash, size: 1 } })).status, 401);
+    for (const [bad, field] of [[{ sha256: 'xyz' }, 'sha256'], [{ sha256: hash.toUpperCase() }, 'sha256'], [{ size: 0 }, 'size'], [{ size: 51 * MiB }, 'size'], [{ folderId: 'root' }, 'folderId']]) {
+      const response = await check(null, user.token, bad);
+      assert.equal(response.status, 400, JSON.stringify(bad));
+      assert.ok(response.body.fieldErrors?.[field], JSON.stringify(bad));
+    }
+    assert.deepEqual((await check(here)).body, { situation: 'new', primary: null, matches: [], options: [] });
+
+    const first = await put(here);
+    assert.deepEqual([first.status, first.body.duplicate, first.body.supplemented, first.body.document.title], [201, false, false, 'thue-nha']);
+    const doc = first.body.document.id;
+    assert.equal((await parsed(user, doc)).status, 'SUCCEEDED');
+    const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: doc } });
+    await db.extractedMetadata.create({ data: {
+      userId: user.id, documentId: doc, versionId: version.id, modelId: 'test', promptVersion: 'p1', schemaVersion: 1, summary: 'Tóm tắt giữ nguyên.', fields: { rent: '8000000' },
+    } });
+
+    const same = (await check(here)).body;
+    assertPrivate(same);
+    assert.deepEqual([same.situation, same.options, same.matches.length], ['ask', ['new', 'skip'], 1]);
+    assert.deepEqual(same.primary, { documentId: doc, title: 'thue-nha', folderId: here, location: 'Hợp đồng', state: 'full', sameFolder: true, trashId: null });
+    const elsewhere = (await check(there)).body;
+    assert.deepEqual([elsewhere.situation, elsewhere.primary.sameFolder, elsewhere.primary.location, elsewhere.options], ['ask', false, 'Hợp đồng', ['new', 'skip']]);
+    assert.equal((await check(null, users.a.token)).body.situation, 'new', 'another user never learns the file exists');
+    assert.equal((await check(here, user.token, { size: body.length + 1 })).body.situation, 'new', 'the size must match too');
+
+    const before = await count();
+    const blind = await put(there);
+    assert.deepEqual([blind.status, blind.body.duplicate, blind.body.document.id, blind.body.conflict.situation, blind.body.conflict.options], [200, true, doc, 'ask', ['new', 'skip']],
+      'an upload without a choice stores nothing and says what it found');
+    assert.equal(await count(), before);
+
+    const copy = await put(here, { onDuplicate: 'new' });
+    assert.deepEqual([copy.status, copy.body.duplicate, copy.body.supplemented, copy.body.document.title, copy.body.renamed], [201, false, false, 'thue-nha (2)', true], '"upload as new" saves a second document with a suffix');
+    const twin = copy.body.document.id;
+    assert.notEqual(twin, doc);
+    assert.equal((await check(here)).body.matches.length, 2, 'every place that has the file is listed');
+    for (const fields of [{ onDuplicate: 'replace' }, { onDuplicate: 'supplement' }, { onDuplicate: 'supplement', targetId: 'abc' }, { targetId: 'abc' }]) {
+      const response = await put(here, fields);
+      assert.equal(response.status, 400, JSON.stringify(fields));
+      assert.ok(response.body.fieldErrors?.onDuplicate || response.body.fieldErrors?.targetId, JSON.stringify(fields));
+    }
+    const wrongTarget = await put(here, { onDuplicate: 'supplement', targetId: twin });
+    assert.deepEqual([wrongTarget.status, wrongTarget.body.duplicate, wrongTarget.body.conflict.situation], [200, true, 'ask'], 'a document that still has its original cannot be supplemented');
+    assert.equal((await put(here, { onDuplicate: 'supplement', targetId: randomUUID() })).body.duplicate, true);
+
+    const kept = await dropOriginal(doc, false);
+    const waiting = (await check(here)).body;
+    assert.deepEqual([waiting.primary.documentId, waiting.primary.state, waiting.primary.trashId, waiting.options], [doc, 'original-trashed', kept.id, ['restore', 'new', 'skip']],
+      'an original in the trash suggests restoring it');
+    assert.equal((await put(here)).body.duplicate, true, 'and is not replaced silently');
+    assert.equal((await request(`/api/trash/${kept.id}`, { method: 'DELETE', token: user.token })).status, 204);
+    const usage = async () => (await request('/api/documents/usage', { token: user.token })).body.encryptedBytes;
+    const usedBefore = await usage();
+
+    const lost = (await check(here)).body;
+    assert.deepEqual([lost.situation, lost.primary.documentId, lost.primary.state, lost.options], ['auto-supplement', doc, 'no-original', []], 'in the same folder a missing original needs no question');
+    const far = (await check(there)).body;
+    assert.deepEqual([far.situation, far.primary.documentId, far.options], ['ask', doc, ['supplement', 'new', 'skip']], 'from another folder the user chooses');
+    const asked = await put(there);
+    assert.deepEqual([asked.status, asked.body.duplicate, asked.body.conflict.options], [200, true, ['supplement', 'new', 'skip']]);
+    assert.equal(await usage(), usedBefore);
+
+    const supplemented = await put(there, { onDuplicate: 'supplement', targetId: doc }, 'ten-khac.txt');
+    assert.deepEqual([supplemented.status, supplemented.body.duplicate, supplemented.body.supplemented, supplemented.body.document.id, supplemented.body.document.folderId, supplemented.body.document.title],
+      [201, false, true, doc, here, 'thue-nha'], 'the original goes to the existing document, which stays where it is');
+    assert.equal(supplemented.body.document.originalAvailable, true);
+    assert.ok(await usage() > usedBefore, 'the new original counts against the quota');
+    assert.equal(await count(), before + 1, 'no document is created');
+    const reread = await parsed(user, doc, 30_000);
+    assert.deepEqual([reread.status, reread.summary], ['SUCCEEDED', 'Tóm tắt giữ nguyên.'], 'the text is read again and the summary is kept');
+    assert.ok(await db.documentChunk.count({ where: { documentId: doc } }) > 0);
+    assert.deepEqual((await db.extractedMetadata.findFirstOrThrow({ where: { documentId: doc } })).fields, { rent: '8000000' });
+    assert.equal(sha256((await request(`/api/documents/${doc}/original`, { token: user.token })).raw), hash);
+    assert.equal((await put(there, { onDuplicate: 'supplement', targetId: doc })).body.duplicate, true, 'once it has an original it cannot be supplemented again');
+
+    await dropOriginal(doc, true);
+    const auto = await put(here);
+    assert.deepEqual([auto.status, auto.body.duplicate, auto.body.supplemented, auto.body.document.id], [201, false, true, doc], 'same folder: supplemented without a question');
+    assert.equal((await parsed(user, doc, 30_000)).status, 'SUCCEEDED');
+
+    assert.equal((await request(`/api/documents/${twin}`, { method: 'DELETE', token: user.token })).status, 204);
+    assert.equal((await request(`/api/documents/${doc}`, { method: 'DELETE', token: user.token })).status, 204);
+    const binned = (await check(here)).body;
+    assert.deepEqual([binned.situation, binned.options, binned.matches.map((match) => match.state)], ['ask', ['restore', 'new', 'skip'], ['trashed', 'trashed']]);
+    assert.ok(binned.primary.trashId);
+    const fresh = await put(here);
+    assert.deepEqual([fresh.status, fresh.body.duplicate, fresh.body.document.title], [201, false, 'thue-nha'], 'the trash never blocks an upload; restoring is only offered before sending');
+    assert.equal((await request(`/api/trash/${binned.primary.trashId}/restore`, { method: 'POST', token: user.token })).status, 200);
+  });
+
+  test('duplicates: a failed supplement leaves the document as it was', async () => {
+    const user = users.dup;
+    const body = Buffer.concat([text(), randomBytes(400 * 1024).map((byte) => 97 + (byte % 26))]);
+    const doc = (await upload(user, { name: 'lon.txt', data: body })).body.document.id;
+    assert.equal((await parsed(user, doc, 30_000)).status, 'SUCCEEDED');
+    assert.equal((await request(`/api/documents/${doc}/original`, { method: 'DELETE', token: user.token })).status, 202);
+    const item = (await trashOf(user)).find((entry) => entry.kind === 'ORIGINAL');
+    assert.equal((await request(`/api/trash/${item.id}`, { method: 'DELETE', token: user.token })).status, 204);
+    for (const name of ['day-1.txt', 'day-2.txt']) {
+      const filler = Buffer.concat([text(), randomBytes(330 * 1024).map((byte) => 97 + (byte % 26))]);
+      assert.equal((await upload(user, { name, data: filler })).status, 201);
+    }
+    const full = await upload(user, { name: 'lon.txt', data: body });
+    assert.equal(full.status, 413, 'supplementing an original needs room in the quota');
+    const after = (await request(`/api/documents/${doc}`, { token: user.token })).body;
+    assert.deepEqual([after.status, after.originalAvailable, after.problem], ['SUCCEEDED', false, null], 'the document is not turned into a failed one');
+    assert.equal(await db.fileCopy.count({ where: { documentId: doc, state: { in: ['UPLOADING', 'AVAILABLE'] } } }), 0);
+  });
+
   test('DOCX preview: level 3 owners get escaped HTML under a sandbox policy; other files, levels and users get 404', async () => {
     const docx = (await upload(users.c, { name: 'xem-truoc.docx', data: docxWith(['Hợp đồng thuê nhà', '&lt;script&gt;alert(1)&lt;/script&gt;', randomUUID()]) })).body.document;
     const preview = await request(`/api/documents/${docx.id}/preview`, { token: users.c.token });
@@ -1070,7 +1204,7 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
 
   test('jobs: concurrent claims never share a job; retries back off; expired leases are fenced', async () => {
     const { JobQueue } = await compiled('jobs/job-queue.service.js');
-    const user = await createUser('jobs');
+    const user = users.b;
     const ids = [];
     for (let index = 0; index < 8; index++) {
       ids.push((await db.aIJob.create({ data: { userId: user.id, kind: 'EMBED', idempotencyKey: `embed:${user.id}:${index}`, maxAttempts: 2 } })).id);

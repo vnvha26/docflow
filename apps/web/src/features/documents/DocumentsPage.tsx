@@ -8,20 +8,25 @@ import {
   canViewOriginal, documentsApi, fileTypeLabel, formatBytes, infoLine, isChanging, isProcessing, matchesFilters, MAX_UPLOAD_MB, precheck, problemMessage,
   sortLabels, typeFilterLabels,
 } from '../../lib/documents';
-import type { DocumentFilters, DocumentSort, DocumentSummary, DocumentTypeFilter, StorageUsage } from '../../lib/documents';
+import type { DocumentFilters, DocumentSort, DocumentSummary, DocumentTypeFilter, StorageUsage, UploadDecision, UploadResult } from '../../lib/documents';
+import { sha256Hex } from '../../lib/duplicates';
+import type { DuplicateCheck, DuplicateChoice } from '../../lib/duplicates';
 import { canCreateIn, childrenOf, foldersApi, MAX_FOLDER_DEPTH, moveProblem, pathLabel, pathOf, UNFILED } from '../../lib/folders';
 import type { Folder, FolderTree } from '../../lib/folders';
 import { folderContents, trashApi, undoTargets } from '../../lib/trash';
 import type { Undo } from '../../lib/trash';
-import { summarizeUploads } from '../../lib/upload-summary';
+import { isRunning, summarizeUploads } from '../../lib/upload-summary';
 import type { UploadItem } from '../../lib/upload-summary';
 import { DocumentOptions } from './DocumentOptions';
+import { DuplicateDialog } from './DuplicateDialog';
+import type { DuplicateQuestion } from './DuplicateDialog';
 import { FolderFormDialog, MoveDialog, RenameDialog } from './FolderDialogs';
 import { ActionMenu } from './ActionMenu';
 import { ALL, DOCUMENT_DRAG, FolderPane, hasFiles } from './FolderPane';
 import type { FolderAction } from './FolderPane';
 import { openOriginal } from './original-file';
 import { SummaryDialog } from './SummaryDialog';
+import { useMarquee } from './useMarquee';
 import './documents.css';
 
 const dateFormat = new Intl.DateTimeFormat('vi-VN', { dateStyle: 'full', timeStyle: 'short' });
@@ -52,6 +57,9 @@ type Dialog =
   | { kind: 'move-document'; document: DocumentSummary }
   | { kind: 'move-many'; ids: string[] };
 
+interface Pending { key: string; fileName: string; file: File; folderId: string | null }
+type Question = Pending & DuplicateQuestion;
+
 const NOTICE_MS = 7_000;
 const NOTICE_UNDO_MS = 12_000;
 const POLL_FIRST_MS = 2_000;
@@ -79,6 +87,7 @@ export function DocumentsPage({ user }: { user: User }) {
   const [reload, setReload] = useState(0);
   const [over, setOver] = useState<string | null>(null);
   const [uploads, setUploads] = useState<UploadItem[]>([]);
+  const [questions, setQuestions] = useState<Question[]>([]);
   const [dragging, setDragging] = useState(false);
   const [summaryOf, setSummaryOf] = useState<DocumentSummary | null>(null);
   const [viewing, setViewing] = useState<string | null>(null);
@@ -125,6 +134,7 @@ export function DocumentsPage({ user }: { user: User }) {
     if (currentUser.current !== user.id) {
       currentUser.current = user.id;
       setUploads([]);
+      setQuestions([]);
       setDocuments([]);
       setCursor(null);
       setUsage(null);
@@ -204,38 +214,95 @@ export function DocumentsPage({ user }: { user: User }) {
     setUploads((previous) => previous.map((item) => item.key === key ? { ...item, ...patch } : item));
   }
 
+  function settle(key: string, result: UploadResult) {
+    if (matchesFilters(result.document, currentFilters.current)) {
+      setDocuments((previous) => result.supplemented && previous.some((known) => known.id === result.document.id)
+        ? previous.map((known) => known.id === result.document.id ? result.document : known)
+        : [result.document, ...previous.filter((known) => known.id !== result.document.id)]);
+    }
+    update(key, result.supplemented
+      ? { state: 'supplemented', target: result.document.title }
+      : { state: 'done', savedAs: result.renamed ? result.document.title : undefined });
+    refreshTree();
+    if (result.document.originalAvailable) refreshUsage();
+  }
+
+  function fail(key: string, failure: unknown) {
+    if (failure instanceof StaleSessionError) return update(key, { state: 'error', message: 'Phiên đã thay đổi; tệp này không được tải lên.' });
+    const fields = failure instanceof ApiError ? failure.fieldErrors : {};
+    update(key, { state: 'error', message: failure instanceof ApiError ? (fields.file || fields.folderId || fields.targetId || failure.message) : 'Chưa thể tải lên. Vui lòng thử lại.' });
+    if (fields.folderId) refreshTree();
+  }
+
+  function ask(pending: Pending, check: DuplicateCheck) {
+    update(pending.key, { state: 'asking' });
+    setQuestions((previous) => [...previous.filter((known) => known.key !== pending.key), { ...pending, check }]);
+  }
+
+  function send(pending: Pending, decision?: UploadDecision) {
+    const owner = user.id;
+    queue.current = queue.current.then(async () => {
+      if (currentUser.current !== owner) return update(pending.key, { state: 'error', message: 'Đã đổi tài khoản; tệp này không được tải lên.' });
+      const problem = precheck(pending.file);
+      if (problem) return update(pending.key, { state: 'error', message: problem });
+      update(pending.key, { state: 'uploading' });
+      try {
+        if (!decision) {
+          const check = await sha256Hex(pending.file)
+            .then((hash) => documentsApi.check(hash, pending.file.size, pending.folderId, owner))
+            .catch((failure: unknown) => { if (failure instanceof StaleSessionError) throw failure; return null; });
+          if (currentUser.current !== owner) return;
+          if (check?.situation === 'ask') return ask(pending, check);
+        }
+        const result = await documentsApi.upload(pending.file, owner, pending.folderId, decision);
+        if (currentUser.current !== owner) return;
+        if (result.duplicate && result.conflict?.situation === 'ask') return ask(pending, result.conflict);
+        if (result.duplicate) return update(pending.key, { state: 'duplicate' });
+        settle(pending.key, result);
+      } catch (failure) {
+        fail(pending.key, failure);
+      }
+    });
+  }
+
   function enqueue(files: File[], folderId: string | null = uploadFolderId) {
     if (!files.length) return;
     setNotice('');
     setUndo(null);
+    const items = files.map((file) => ({ key: crypto.randomUUID(), fileName: file.name, file, folderId }));
+    setUploads((previous) => [...(previous.some((known) => isRunning(known) || known.state === 'asking') ? previous : []),
+      ...items.map((item) => ({ key: item.key, name: item.fileName, state: 'waiting' as const }))]);
+    for (const item of items) send(item);
+  }
+
+  function answer(choices: Record<string, DuplicateChoice>) {
     const owner = user.id;
-    const items = files.map((file) => ({ file, item: { key: crypto.randomUUID(), name: file.name, state: 'waiting' as const } }));
-    setUploads((previous) => {
-      const running = previous.some((known) => known.state === 'waiting' || known.state === 'uploading');
-      return [...(running ? previous : []), ...items.map(({ item }) => item)];
-    });
-    for (const { file, item } of items) {
-      queue.current = queue.current.then(async () => {
-        if (currentUser.current !== owner) return update(item.key, { state: 'error', message: 'Đã đổi tài khoản; tệp này không được tải lên.' });
-        const problem = precheck(file);
-        if (problem) return update(item.key, { state: 'error', message: problem });
-        update(item.key, { state: 'uploading' });
-        try {
-          const result = await documentsApi.upload(file, owner, folderId);
-          if (currentUser.current !== owner) return;
-          if (matchesFilters(result.document, currentFilters.current)) {
-            setDocuments((previous) => [result.document, ...previous.filter((known) => known.id !== result.document.id)]);
+    const answered = questions;
+    setQuestions([]);
+    for (const question of answered) {
+      const choice = choices[question.key] ?? 'skip';
+      const primary = question.check.primary;
+      if (choice === 'new') { update(question.key, { state: 'waiting' }); send(question, { mode: 'new' }); continue; }
+      if (choice === 'supplement' && primary) { update(question.key, { state: 'waiting' }); send(question, { mode: 'supplement', targetId: primary.documentId }); continue; }
+      if (choice === 'restore' && primary?.trashId) {
+        const trashId = primary.trashId;
+        update(question.key, { state: 'uploading' });
+        queue.current = queue.current.then(async () => {
+          try {
+            const restored = await trashApi.restore(trashId, owner);
+            if (currentUser.current !== owner) return;
+            update(question.key, { state: 'restored', target: primary.state === 'original-trashed' ? `bản gốc của ${primary.title}` : restored.name });
+            setReload((value) => value + 1);
+            refreshTree();
+            refreshUsage();
+          } catch (failure) {
+            if (failure instanceof ApiError && failure.status === 404) return send(question);
+            fail(question.key, failure);
           }
-          update(item.key, { state: result.duplicate ? 'duplicate' : 'done', savedAs: result.renamed ? result.document.title : undefined });
-          if (!result.duplicate) refreshTree();
-          if (!result.duplicate && result.document.originalAvailable) refreshUsage();
-        } catch (failure) {
-          if (failure instanceof StaleSessionError) return update(item.key, { state: 'error', message: 'Phiên đã thay đổi; tệp này không được tải lên.' });
-          const message = failure instanceof ApiError ? (failure.fieldErrors.file || failure.fieldErrors.folderId || failure.message) : 'Chưa thể tải lên. Vui lòng thử lại.';
-          update(item.key, { state: 'error', message });
-          if (failure instanceof ApiError && failure.fieldErrors.folderId) refreshTree();
-        }
-      });
+        });
+        continue;
+      }
+      update(question.key, { state: 'duplicate' });
     }
   }
 
@@ -417,6 +484,10 @@ export function DocumentsPage({ user }: { user: User }) {
 
   const chosen = selected.filter((id) => documents.some((known) => known.id === id));
   const allChosen = documents.length > 0 && chosen.length === documents.length;
+  const marquee = useMarquee(documents.length > 0 && !dialog && !summaryOf && !questions.length, chosen, setSelected);
+  const barBefore = useRef(false);
+  if (!marquee.box) barBefore.current = chosen.length > 0;
+  const showBar = marquee.box ? barBefore.current : chosen.length > 0;
   async function undoDelete() {
     const target = undo;
     if (!target) return;
@@ -447,7 +518,7 @@ export function DocumentsPage({ user }: { user: User }) {
 
   useEffect(() => {
     if (!notice) return;
-    setUploads((previous) => previous.some((item) => item.state === 'waiting' || item.state === 'uploading') ? previous : []);
+    setUploads((previous) => previous.some((item) => isRunning(item) || item.state === 'asking') ? previous : []);
     if (undoing) return;
     const timer = setTimeout(() => { setNotice(''); setUndo(null); }, undo ? NOTICE_UNDO_MS : NOTICE_MS);
     return () => clearTimeout(timer);
@@ -455,7 +526,7 @@ export function DocumentsPage({ user }: { user: User }) {
 
   useEffect(() => {
     if (uploadTone !== 'done') return;
-    const timer = setTimeout(() => setUploads((previous) => previous.some((item) => item.state === 'waiting' || item.state === 'uploading') ? previous : []), NOTICE_MS);
+    const timer = setTimeout(() => setUploads((previous) => previous.some((item) => isRunning(item) || item.state === 'asking') ? previous : []), NOTICE_MS);
     return () => clearTimeout(timer);
   }, [uploadTone, uploads.length]);
   const usagePercent = usage ? Math.min(100, (usage.encryptedBytes / usage.quotaBytes) * 100) : 0;
@@ -539,7 +610,7 @@ export function DocumentsPage({ user }: { user: User }) {
               {(Object.keys(sortLabels) as DocumentSort[]).map((key) => <option key={key} value={key}>{sortLabels[key]}</option>)}
             </select>
           </div>}
-          {chosen.length > 0 && <div className="bulk-bar" role="group" aria-label="Thao tác với tài liệu đã chọn">
+          {showBar && <div className="bulk-bar" role="group" aria-label="Thao tác với tài liệu đã chọn">
             <strong>Đã chọn {chosen.length} tài liệu</strong>
             <button type="button" className="action-button" onClick={() => setDialog({ kind: 'move-many', ids: chosen })}><Icon name="folder" size={15} />Chuyển tới…</button>
             <button type="button" className="action-button bulk-danger" title="Vào thùng rác; khôi phục được trong 30 ngày." onClick={() => deleteNow(removeDocuments(chosen))}>Xóa</button>
@@ -587,9 +658,10 @@ export function DocumentsPage({ user }: { user: User }) {
                 ]} />
               </div>
             </li>)}
-            {documents.map((item) => <li key={item.id} draggable
+            {documents.map((item) => <li key={item.id} draggable data-document-id={item.id}
               className={`document-row${drag?.kind === 'document' && drag.ids.includes(item.id) ? ' is-dragged' : ''}${chosen.includes(item.id) ? ' is-selected' : ''}`}
               onDragStart={(event) => {
+                if (marquee.armed.current) { event.preventDefault(); return; }
                 const ids = chosen.includes(item.id) ? chosen : [item.id];
                 event.dataTransfer.setData(DOCUMENT_DRAG, ids.join(','));
                 event.dataTransfer.effectAllowed = 'move';
@@ -636,6 +708,7 @@ export function DocumentsPage({ user }: { user: User }) {
               </div>
             </li>)}
           </ul>
+          {marquee.box && <div className="marquee-box" aria-hidden="true" style={marquee.box} />}
           {dragging && <div className="drop-overlay" aria-hidden="true"><Icon name="upload" size={22} />Thả tệp để tải vào {openFolder ? quoted(viewLabel) : quoted(UNFILED_LABEL)}</div>}
           {(loading || documents.length > 0 || cursor) && <div className="profile-bottom">
             <p role="status">{loading ? 'Đang tải danh sách…' : `${documents.length}${cursor ? '+' : ''} tài liệu${filtered ? ' khớp bộ lọc' : ''}`}</p>
@@ -643,10 +716,11 @@ export function DocumentsPage({ user }: { user: User }) {
           </div>}
         </div>
       </div>
+      {questions.length > 0 && !uploads.some(isRunning) && <DuplicateDialog key={questions.map((question) => question.key).join(',')} questions={questions} onSubmit={answer} />}
       {summaryOf && <SummaryDialog document={summaryOf} onClose={() => setSummaryOf(null)} />}
-      {dialog?.kind === 'create' && <FolderFormDialog parentLabel={dialog.parentId ? quoted(pathLabel(folders, dialog.parentId)) : 'cấp ngoài cùng'}
-        onSubmit={(folderName, purpose) => createFolder(dialog.parentId, folderName, purpose)} onClose={() => setDialog(null)} />}
-      {dialog?.kind === 'edit' && <FolderFormDialog folder={dialog.folder} parentLabel=""
+      {dialog?.kind === 'create' && <FolderFormDialog path={pathOf(folders, dialog.parentId)}
+        onSubmit={(folderName, purpose, parentId) => createFolder(parentId, folderName, purpose)} onClose={() => setDialog(null)} />}
+      {dialog?.kind === 'edit' && <FolderFormDialog folder={dialog.folder}
         onSubmit={(folderName, purpose) => editFolder(dialog.folder, folderName, purpose)} onClose={() => setDialog(null)} />}
       {dialog?.kind === 'move-folder' && <MoveDialog kicker="CHUYỂN THƯ MỤC" title={dialog.folder.name} folders={folders} currentId={dialog.folder.parentId}
         rootLabel="Cấp ngoài cùng" problemFor={(target) => moveProblem(folders, dialog.folder.id, target)}
