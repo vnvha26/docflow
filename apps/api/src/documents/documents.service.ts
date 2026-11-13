@@ -2,7 +2,7 @@ import {
   ConflictException, HttpException, HttpStatus, Inject, Injectable, Logger, NotFoundException,
   ServiceUnavailableException, UnprocessableEntityException, UnsupportedMediaTypeException,
 } from '@nestjs/common';
-import { FileCopyKind, ParseState, Prisma, PrivacyLevel } from '@prisma/client';
+import { FileCopyKind, Prisma, PrivacyLevel } from '@prisma/client';
 import { createHash, randomUUID } from 'node:crypto';
 import { Readable, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -10,16 +10,21 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { API_CONFIG, ApiConfig } from '../config';
 import { encryptedSize } from '../crypto/file-encryption';
 import { FileVault } from '../crypto/file-vault.service';
+import { fieldError } from '../common/field-error';
 import { lockUserFiles } from '../database/locks';
 import { PrismaService } from '../database/prisma.service';
+import { freeDocumentTitle } from '../folders/names';
 import { JobQueue } from '../jobs/job-queue.service';
 import { renderDocxHtml } from '../parsing/text-extract';
 import { ParserFailedError, UnsupportedDocumentError } from '../parsing/text';
 import { ObjectStorage, storageKey } from '../storage/object-storage';
-import { cleanTitle, sanitizeFileName, titleFromFileName } from './file-name';
+import { cleanTitle, downloadName, sanitizeFileName, titleFromFileName } from './file-name';
 import { detectFileType } from './file-type';
 import { effectivePrivacy } from './privacy';
-import { DocumentFilters, DocumentStatusFilter, DocumentSummary, DocumentTypeFilter, MAX_UPLOAD_BYTES, StorageUsage, TOO_LARGE_MESSAGE, UploadResult } from './documents.types';
+import {
+  DocumentChange, DocumentFilters, DocumentSort, DocumentSummary, DocumentTypeFilter, MAX_UPLOAD_BYTES, RenameResult, StorageUsage,
+  TOO_LARGE_MESSAGE, UNFILED, UploadResult,
+} from './documents.types';
 
 export interface UploadedFile { buffer: Buffer; originalname: string; size: number }
 
@@ -36,10 +41,10 @@ const UPLOAD_IN_PROGRESS ='Một bản giống hệt tệp này đang được t
 interface Duplicate {
   documentId: string; versionId: string; documentLevel: PrivacyLevel | null; inFlight: boolean; revivable: boolean; retryable: boolean;
 }
-interface Reserved { kind: FileCopyKind; key: string; documentId: string; versionId: string; revived: boolean }
+interface Reserved { kind: FileCopyKind; key: string; documentId: string; versionId: string; revived: boolean; renamed: boolean }
 type Plan = { duplicateOf: string } | Reserved;
 const SUMMARY_SELECT = {
-  id: true, title: true, createdAt: true, updatedAt: true, typeCode: true, privacyLevel: true,
+  id: true, title: true, createdAt: true, updatedAt: true, typeCode: true, privacyLevel: true, folderId: true,
   user: { select: { privacyLevel: true } },
   versions: {
     orderBy: { number: 'desc' }, take: 1,
@@ -55,7 +60,7 @@ function toSummary(row: SummaryRow): DocumentSummary {
   const privacyLevel = effectivePrivacy(row.user.privacyLevel, row.privacyLevel);
   const detailsDeleted = row.privacyLevel === 'STRUCTURED_ONLY';
   return {
-    id: row.id, title: row.title, createdAt: row.createdAt, typeCode: row.typeCode,
+    id: row.id, title: row.title, createdAt: row.createdAt, typeCode: row.typeCode, folderId: row.folderId,
     status: version.parseState,
     problem: !detailsDeleted && (version.parseState === 'FAILED' || version.parseState === 'UNSUPPORTED') ? version.parseErrorCode : null,
     file: { name: version.originalFilename, mimeType: version.mimeType, byteSize: Number(version.byteSize) },
@@ -74,44 +79,49 @@ const TYPE_MIME: Record<DocumentTypeFilter, string> = {
   docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   txt: 'text/plain',
 };
-const STATUS_STATES: Record<DocumentStatusFilter, ParseState[] | null> = {
-  read: ['SUCCEEDED'], processing: ['PENDING', 'PROCESSING'], problem: ['FAILED', 'UNSUPPORTED'], 'details-deleted': null,
-};
-const DETAILS_KEPT: Prisma.DocumentWhereInput = { OR: [{ privacyLevel: null }, { privacyLevel: { not: 'STRUCTURED_ONLY' } }] };
-
 function versionFilter(filters: DocumentFilters): Prisma.DocumentVersionWhereInput {
-  const states = filters.status ? STATUS_STATES[filters.status] : null;
-  return {
-    ...(filters.type ? { mimeType: TYPE_MIME[filters.type] } : {}),
-    ...(states ? { parseState: { in: states } } : {}),
-  };
+  return filters.type ? { mimeType: TYPE_MIME[filters.type] } : {};
 }
 
-function detailsFilter(status?: DocumentStatusFilter): Prisma.DocumentWhereInput[] {
-  if (status === 'details-deleted') return [{ privacyLevel: 'STRUCTURED_ONLY' }];
-  if (status === 'read' || status === 'problem') return [DETAILS_KEPT];
-  return [];
-}
-
-function fieldError(field: string, message: string, status = HttpStatus.BAD_REQUEST): HttpException {
-  return new HttpException({ statusCode: status, message, fieldErrors: { [field]: message } }, status);
+function folderFilter(folder?: string): Prisma.DocumentWhereInput {
+  if (folder === undefined) return {};
+  return { folderId: folder === UNFILED ? null : folder };
 }
 
 function formatBytes(bytes: number): string {
   return bytes >= 1024 * 1024 * 1024 ? `${(bytes / 1024 ** 3).toFixed(2)} GB` : `${Math.ceil(bytes / 1024 ** 2)} MB`;
 }
 
-function encodeCursor(row: { createdAt: Date; id: string }): string {
-  return Buffer.from(`${row.createdAt.toISOString()}|${row.id}`, 'utf8').toString('base64url');
+type SortField = 'createdAt' | 'updatedAt' | 'title';
+const SORTS: Record<DocumentSort, { field: SortField; direction: 'asc' | 'desc' }> = {
+  created: { field: 'createdAt', direction: 'desc' },
+  updated: { field: 'updatedAt', direction: 'desc' },
+  name: { field: 'title', direction: 'asc' },
+  'name-desc': { field: 'title', direction: 'desc' },
+};
+const INVALID_CURSOR = 'Con trỏ phân trang không hợp lệ.';
+
+function encodeCursor(row: { createdAt: Date; updatedAt: Date; title: string; id: string }, field: SortField): string {
+  const value = field === 'title' ? Buffer.from(row.title, 'utf8').toString('base64url') : row[field].toISOString();
+  return Buffer.from(`${value}|${row.id}`, 'utf8').toString('base64url');
 }
 
-function decodeCursor(cursor: string): { createdAt: Date; id: string } {
-  const [time, id, extra] = Buffer.from(cursor, 'base64url').toString('utf8').split('|');
-  const createdAt = new Date(time ?? '');
-  if (extra !== undefined || Number.isNaN(createdAt.getTime()) || createdAt.toISOString() !== time || !UUID.test(id ?? '')) {
-    throw fieldError('cursor', 'Con trỏ phân trang không hợp lệ.');
+function decodeCursor(cursor: string, field: SortField): { value: Date | string; id: string } {
+  const [raw, id, extra] = Buffer.from(cursor, 'base64url').toString('utf8').split('|');
+  if (extra !== undefined || raw === undefined || !UUID.test(id ?? '')) throw fieldError('cursor', INVALID_CURSOR);
+  if (field === 'title') {
+    const title = Buffer.from(raw, 'base64url').toString('utf8');
+    if (!/^[A-Za-z0-9_-]+$/.test(raw) || !title || title.includes('\ufffd') || title.length > 255) throw fieldError('cursor', INVALID_CURSOR);
+    return { value: title, id };
   }
-  return { createdAt, id };
+  const time = new Date(raw);
+  if (Number.isNaN(time.getTime()) || time.toISOString() !== raw) throw fieldError('cursor', INVALID_CURSOR);
+  return { value: time, id };
+}
+
+function afterCursor(field: SortField, direction: 'asc' | 'desc', cursor: { value: Date | string; id: string }): Prisma.DocumentWhereInput {
+  const beyond = direction === 'asc' ? 'gt' : 'lt';
+  return { OR: [{ [field]: { [beyond]: cursor.value } }, { [field]: cursor.value, id: { [beyond]: cursor.id } }] };
 }
 
 async function collect(body: Readable, decrypt: NodeJS.ReadWriteStream, expectedBytes: number): Promise<Buffer> {
@@ -184,7 +194,7 @@ export class DocumentsService {
     return toSummary(row);
   }
 
-  async upload(userId: string, file: UploadedFile | undefined, requestedTitle?: string): Promise<UploadResult> {
+  async upload(userId: string, file: UploadedFile | undefined, requestedTitle?: string, folderId: string | null = null): Promise<UploadResult> {
     if (!file) throw fieldError('file', 'Chọn một tệp để tải lên.');
     if (file.size === 0) throw fieldError('file', 'Tệp rỗng, không có gì để lưu.');
     if (file.size > MAX_UPLOAD_BYTES) throw fieldError('file', TOO_LARGE_MESSAGE, HttpStatus.PAYLOAD_TOO_LARGE);
@@ -208,7 +218,7 @@ export class DocumentsService {
       const settled = await this.settledDuplicate(userId, sha256, file.size);
       if (settled && !settled.revivable) {
         if (settled.retryable) await this.retryParse(userId, settled.versionId);
-        return { document: await this.summary(userId, settled.documentId), duplicate: true };
+        return { document: await this.summary(userId, settled.documentId), duplicate: true, renamed: false };
       }
       if (attempt >= 3) throw new ConflictException(UPLOAD_IN_PROGRESS);
       const key = this.vault.newKey(context);
@@ -216,7 +226,7 @@ export class DocumentsService {
       try {
         plan = await this.prisma.$transaction(async (transaction) => this.reserve(transaction, {
           userId, sha256, size: file.size, storedBytes, documentId, versionId, copyId, keyRef: key.keyRef,
-          title, mimeType: type.mimeType, fileName,
+          title, mimeType: type.mimeType, fileName, folderId,
         }));
       } catch (error) {
         dek.fill(0);
@@ -226,7 +236,7 @@ export class DocumentsService {
     }
     if ('duplicateOf' in plan) {
       dek!.fill(0);
-      return { document: await this.summary(userId, plan.duplicateOf), duplicate: true };
+      return { document: await this.summary(userId, plan.duplicateOf), duplicate: true, renamed: false };
     }
 
     try {
@@ -252,7 +262,7 @@ export class DocumentsService {
       if (error instanceof HttpException) throw error;
       throw new ServiceUnavailableException('Chưa thể lưu tệp lúc này. Vui lòng thử lại sau.');
     }
-    return { document: await this.summary(userId, plan.documentId), duplicate: false };
+    return { document: await this.summary(userId, plan.documentId), duplicate: false, renamed: plan.renamed };
   }
 
   private async retryParse(userId: string, versionId: string): Promise<void> {
@@ -273,9 +283,9 @@ export class DocumentsService {
 
   private async reserve(transaction: Prisma.TransactionClient, input: {
     userId: string; sha256: string; size: number; storedBytes: number; documentId: string; versionId: string;
-    copyId: string; keyRef: string; title: string; mimeType: string; fileName: string;
+    copyId: string; keyRef: string; title: string; mimeType: string; fileName: string; folderId: string | null;
   }): Promise<Plan | null> {
-    const { userId, sha256, documentId, versionId, copyId, keyRef, title, storedBytes, fileName } = input;
+    const { userId, sha256, documentId, versionId, copyId, keyRef, title, storedBytes, fileName, folderId } = input;
     const file = { size: input.size };
     const type = { mimeType: input.mimeType };
     await lockUserFiles(transaction, userId);
@@ -291,10 +301,14 @@ export class DocumentsService {
     const target = duplicate
       ? { documentId: duplicate.documentId, versionId: duplicate.versionId }
       : { documentId, versionId };
+    let renamed = false;
     if (duplicate) {
       await transaction.documentVersion.update({ where: { id: duplicate.versionId }, data: { parseState: 'PENDING', parseErrorCode: null } });
     } else {
-      await transaction.document.create({ data: { id: documentId, userId, title, source: 'WEB_UPLOAD' } });
+      await this.assertFolder(transaction, userId, folderId);
+      const free = await freeDocumentTitle(transaction, userId, folderId, title);
+      renamed = free.renamed;
+      await transaction.document.create({ data: { id: documentId, userId, title: free.name, folderId, source: 'WEB_UPLOAD' } });
       await transaction.documentVersion.create({
         data: {
           id: versionId, userId, documentId, number: 1, sha256, byteSize: BigInt(file.size),
@@ -309,7 +323,34 @@ export class DocumentsService {
         expiresAt: kind === 'WEB_SOURCE' ? new Date(Date.now() + this.config.files.webSourceTtlMs) : null,
       },
     });
-    return { kind, key, ...target, revived: Boolean(duplicate) };
+    return { kind, key, ...target, revived: Boolean(duplicate), renamed };
+  }
+
+  private async assertFolder(transaction: Prisma.TransactionClient, userId: string, folderId: string | null): Promise<void> {
+    if (!folderId) return;
+    const folder = await transaction.folder.findFirst({ where: { id: folderId, userId }, select: { id: true } });
+    if (!folder) throw fieldError('folderId', 'Không tìm thấy thư mục.', HttpStatus.NOT_FOUND);
+  }
+
+  async update(userId: string, documentId: string, change: DocumentChange): Promise<RenameResult> {
+    if (change.title === undefined && change.folderId === undefined) throw fieldError('title', 'Không có thay đổi nào để lưu.');
+    const wanted = change.title === undefined ? undefined : cleanTitle(change.title);
+    if (change.title !== undefined && !wanted) throw fieldError('title', 'Tên tài liệu không được để trống.');
+    const renamed = await this.prisma.$transaction(async (transaction) => {
+      await lockUserFiles(transaction, userId);
+      const current = await transaction.document.findFirst({
+        where: { id: documentId, userId, deletedAt: null, versions: { some: {} } }, select: { id: true, title: true, folderId: true },
+      });
+      if (!current) throw new NotFoundException('Không tìm thấy tài liệu.');
+      const folderId = change.folderId === undefined ? current.folderId : change.folderId;
+      if (folderId !== current.folderId) await this.assertFolder(transaction, userId, folderId);
+      const free = await freeDocumentTitle(transaction, userId, folderId, wanted ?? current.title, current.id);
+      if (free.name !== current.title || folderId !== current.folderId) {
+        await transaction.document.update({ where: { id: current.id }, data: { title: free.name, folderId, revision: { increment: 1 } } });
+      }
+      return free.renamed;
+    });
+    return { document: await this.summary(userId, documentId), renamed };
   }
 
   private async checkQuota(transaction: Prisma.TransactionClient, userId: string, incoming: number): Promise<void> {
@@ -353,23 +394,21 @@ export class DocumentsService {
   }
 
   async list(userId: string, cursor?: string, limit = 20, filters: DocumentFilters = {}): Promise<{ items: DocumentSummary[]; nextCursor: string | null }> {
-    const after = cursor ? decodeCursor(cursor) : null;
+    const { field, direction } = SORTS[filters.sort ?? 'created'];
+    const after = cursor ? decodeCursor(cursor, field) : null;
     const rows = await this.prisma.document.findMany({
       where: {
-        userId, deletedAt: null, versions: { some: versionFilter(filters) },
-        AND: [
-          ...(after ? [{ OR: [{ createdAt: { lt: after.createdAt } }, { createdAt: after.createdAt, id: { lt: after.id } }] }] : []),
-          ...detailsFilter(filters.status),
-        ],
+        userId, deletedAt: null, versions: { some: versionFilter(filters) }, ...folderFilter(filters.folder),
+        ...(after ? afterCursor(field, direction, after) : {}),
       },
-      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      orderBy: [{ [field]: direction }, { id: direction }],
       take: limit + 1,
       select: SUMMARY_SELECT,
     });
     const page = rows.slice(0, limit);
     return {
       items: page.map(toSummary),
-      nextCursor: rows.length > limit ? encodeCursor(page[page.length - 1]) : null,
+      nextCursor: rows.length > limit ? encodeCursor(page[page.length - 1], field) : null,
     };
   }
 
@@ -414,7 +453,7 @@ export class DocumentsService {
     const row = await this.prisma.document.findFirst({
       where: { id: documentId, userId, deletedAt: null },
       select: {
-        privacyLevel: true, user: { select: { privacyLevel: true } },
+        title: true, privacyLevel: true, user: { select: { privacyLevel: true } },
         versions: { orderBy: { number: 'desc' }, take: 1, select: { id: true, originalFilename: true, mimeType: true, byteSize: true } },
       },
     });
@@ -436,7 +475,7 @@ export class DocumentsService {
       this.logger.error(`Không mở được bản gốc mã hóa (copy ${copy.id}).`);
       throw new ServiceUnavailableException('Chưa thể tải bản gốc lúc này. Vui lòng thử lại sau.');
     }
-    return { body, decrypt, fileName: version.originalFilename, mimeType: version.mimeType, byteSize: Number(version.byteSize) };
+    return { body, decrypt, fileName: downloadName(row!.title, version.originalFilename), mimeType: version.mimeType, byteSize: Number(version.byteSize) };
   }
 }
 

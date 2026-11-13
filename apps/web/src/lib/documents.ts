@@ -7,6 +7,7 @@ export interface DocumentSummary {
   title: string;
   createdAt: string;
   typeCode: string | null;
+  folderId: string | null;
   status: DocumentStatus;
   problem: string | null;
   file: { name: string; mimeType: string; byteSize: number };
@@ -23,24 +24,20 @@ export const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordproc
 export const isProcessing = (document: Pick<DocumentSummary, 'status'>) => document.status === 'PENDING' || document.status === 'PROCESSING';
 
 export type DocumentTypeFilter = 'pdf' | 'docx' | 'txt';
-export type DocumentStatusFilter = 'read' | 'processing' | 'problem' | 'details-deleted';
-export interface DocumentFilters { type?: DocumentTypeFilter; status?: DocumentStatusFilter }
+export type DocumentSort = 'created' | 'updated' | 'name' | 'name-desc';
+export interface DocumentFilters { type?: DocumentTypeFilter; folder?: string; sort?: DocumentSort }
+export const sortLabels: Record<DocumentSort, string> = {
+  created: 'Mới tải lên trước', updated: 'Mới cập nhật trước', name: 'Tên A → Z', 'name-desc': 'Tên Z → A',
+};
+export const UNFILED = 'none';
 
 export const typeFilterLabels: Record<DocumentTypeFilter, string> = { pdf: 'PDF', docx: 'DOCX', txt: 'TXT' };
-export const statusFilterLabels: Record<DocumentStatusFilter, string> = {
-  read: 'Đã đọc nội dung', processing: 'Đang đọc', problem: 'Không đọc được', 'details-deleted': 'Đã xóa bản chi tiết',
-};
 const filterMime: Record<DocumentTypeFilter, string> = { pdf: 'application/pdf', docx: DOCX_MIME, txt: 'text/plain' };
 
-export function matchesFilters(document: Pick<DocumentSummary, 'file' | 'status' | 'detailsDeleted'>, filters: DocumentFilters): boolean {
+export function matchesFilters(document: Pick<DocumentSummary, 'file' | 'folderId'>, filters: DocumentFilters): boolean {
+  if (filters.folder !== undefined && document.folderId !== (filters.folder === UNFILED ? null : filters.folder)) return false;
   if (filters.type && document.file.mimeType !== filterMime[filters.type]) return false;
-  switch (filters.status) {
-    case 'read': return document.status === 'SUCCEEDED' && !document.detailsDeleted;
-    case 'processing': return document.status === 'PENDING' || document.status === 'PROCESSING';
-    case 'problem': return (document.status === 'FAILED' || document.status === 'UNSUPPORTED') && !document.detailsDeleted;
-    case 'details-deleted': return document.detailsDeleted;
-    default: return true;
-  }
+  return true;
 }
 
 export const isChanging = (document: Pick<DocumentSummary, 'status' | 'originalDeleting'>) => isProcessing(document) || document.originalDeleting;
@@ -80,13 +77,18 @@ const typeLabels: Record<string, string> = {
 export const fileTypeLabel = (document: Pick<DocumentSummary, 'file'>) => typeLabels[document.file.mimeType] ?? 'TỆP';
 
 const statusLabels: Record<DocumentStatus, string> = {
-  PENDING: 'Chờ đọc nội dung', PROCESSING: 'Đang đọc nội dung', SUCCEEDED: 'Đã đọc nội dung', FAILED: 'Chưa đọc được', UNSUPPORTED: 'Không đọc được',
+  PENDING: 'Chờ đọc nội dung…', PROCESSING: 'Đang đọc nội dung…', SUCCEEDED: 'Đã đọc nội dung', FAILED: 'Chưa đọc được', UNSUPPORTED: 'Không đọc được',
 };
 
-export function infoLine(document: Pick<DocumentSummary, 'file' | 'pageCount' | 'status' | 'detailsDeleted'>): string {
+type InfoFields = 'file' | 'pageCount' | 'status' | 'detailsDeleted' | 'originalAvailable' | 'originalDeleting';
+
+export function infoLine(document: Pick<DocumentSummary, InfoFields>): string {
   const parts = [fileTypeLabel(document)];
   if (document.pageCount) parts.push(`${document.pageCount.toLocaleString('vi-VN')} trang`);
-  parts.push(document.detailsDeleted ? 'Đã xóa bản chi tiết' : statusLabels[document.status]);
+  if (document.detailsDeleted) parts.push('Đã xóa bản chi tiết');
+  else if (document.status === 'SUCCEEDED') parts.push(formatBytes(document.file.byteSize));
+  else parts.push(statusLabels[document.status]);
+  if (!document.detailsDeleted && !isProcessing(document) && !document.originalAvailable && !document.originalDeleting) parts.push('Không còn bản gốc');
   return parts.join(' · ');
 }
 
@@ -101,27 +103,42 @@ export function precheck(file: File): string | null {
   return null;
 }
 
+const decimal = (value: number, digits: number) => value.toFixed(digits).replace('.', ',');
+
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
-  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
-  return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+  if (bytes < 1024 * 1024) return `${decimal(bytes / 1024, bytes < 10 * 1024 ? 1 : 0)} KB`;
+  if (bytes < 1024 ** 3) return `${decimal(bytes / 1024 ** 2, 1)} MB`;
+  return `${decimal(bytes / 1024 ** 3, 2)} GB`;
+}
+
+export function titleProblem(value: string): string | null {
+  const title = value.trim();
+  if (!title) return 'Nhập tên tài liệu.';
+  if (title.length > 255) return 'Tên tài liệu không được vượt quá 255 ký tự.';
+  return null;
 }
 
 export const documentsApi = {
   list(cursor?: string, filters: DocumentFilters = {}) {
     const query = new URLSearchParams({
-      limit: '20', ...(cursor ? { cursor } : {}), ...(filters.type ? { type: filters.type } : {}), ...(filters.status ? { status: filters.status } : {}),
+      limit: '20', ...(cursor ? { cursor } : {}), ...(filters.type ? { type: filters.type } : {}),
+      ...(filters.folder ? { folder: filters.folder } : {}), ...(filters.sort && filters.sort !== 'created' ? { sort: filters.sort } : {}),
     });
     return authClient.request<{ items: DocumentSummary[]; nextCursor: string | null }>(`/documents?${query}`);
   },
   get(id: string) {
     return authClient.request<DocumentSummary>(`/documents/${encodeURIComponent(id)}`);
   },
-  upload(file: File, userId: string) {
+  upload(file: File, userId: string, folderId: string | null = null) {
     const form = new FormData();
     form.append('file', file, file.name);
-    return authClient.request<{ document: DocumentSummary; duplicate: boolean }>('/documents', { method: 'POST', body: form }, { asUser: userId });
+    if (folderId) form.append('folderId', folderId);
+    return authClient.request<{ document: DocumentSummary; duplicate: boolean; renamed: boolean }>('/documents', { method: 'POST', body: form }, { asUser: userId });
+  },
+  update(id: string, change: { title?: string; folderId?: string | null }, userId: string) {
+    return authClient.request<{ document: DocumentSummary; renamed: boolean }>(
+      `/documents/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(change) }, { asUser: userId });
   },
   usage() {
     return authClient.request<StorageUsage>('/documents/usage');

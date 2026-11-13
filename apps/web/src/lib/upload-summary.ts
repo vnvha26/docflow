@@ -1,6 +1,6 @@
 export type UploadState = 'waiting' | 'uploading' | 'done' | 'duplicate' | 'error';
 
-export interface UploadItem { key: string; name: string; state: UploadState; message?: string }
+export interface UploadItem { key: string; name: string; state: UploadState; message?: string; savedAs?: string }
 
 export interface UploadSummary { tone: 'busy' | 'done' | 'warn' | 'error'; text: string; details: string[] }
 
@@ -22,6 +22,9 @@ export function summarizeUploads(items: readonly UploadItem[]): UploadSummary | 
 
   if (items.length === 1) {
     const [item] = items;
+    if (item.state === 'done' && item.savedAs) {
+      return { tone: 'done', text: `Đã tải lên tệp ${quoted(item.name)}, lưu với tên ${quoted(item.savedAs)} vì tên này đã có trong thư mục.`, details: [] };
+    }
     if (item.state === 'done') return { tone: 'done', text: `Đã tải lên tệp ${quoted(item.name)}.`, details: [] };
     if (item.state === 'duplicate') return { tone: 'done', text: `Tệp ${quoted(item.name)} đã có sẵn trong thư viện, không lưu thêm.`, details: [] };
     return { tone: 'error', text: `Không tải lên được ${quoted(item.name)}: ${reason(item)}`, details: [] };
@@ -34,6 +37,9 @@ export function summarizeUploads(items: readonly UploadItem[]): UploadSummary | 
   return {
     tone: !failed.length ? 'done' : failed.length === items.length ? 'error' : 'warn',
     text: `${parts.join(' · ')}.`,
-    details: failed.map((item) => `${quoted(item.name)}: ${reason(item)}`),
+    details: [
+      ...failed.map((item) => `${quoted(item.name)}: ${reason(item)}`),
+      ...saved.filter((item) => item.savedAs).map((item) => `${quoted(item.name)}: lưu với tên ${quoted(item.savedAs!)} vì tên đã có trong thư mục.`),
+    ],
   };
 }
