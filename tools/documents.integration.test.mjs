@@ -580,16 +580,15 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     const content = text();
     const doc = (await upload(user, { name: 'muc-rieng.txt', data: content })).body.document;
     assert.equal((await parsed(user, doc.id)).status, 'SUCCEEDED');
-    const lowered = await request(`/api/documents/${doc.id}/details`, { method: 'DELETE', token: user.token });
-    assert.equal(lowered.status, 202);
+    await db.document.update({ where: { id: doc.id }, data: { privacyLevel: 'STRUCTURED_ONLY' } });
     const [original] = await copiesOf(doc.id);
+    await db.fileCopy.update({ where: { id: original.id }, data: { state: 'DELETE_PENDING', deleteRequestedAt: new Date() } });
     await eventually(copyDeleted(original.id), 'the original is removed when the document goes to level 1');
     await db.documentVersion.updateMany({ where: { documentId: doc.id }, data: { parseState: 'FAILED', parseErrorCode: 'SOURCE_UNAVAILABLE' } });
     const before = (await request('/api/documents/usage', { token: user.token })).body.encryptedBytes;
     const again = await upload(user, { name: 'muc-rieng.txt', data: content });
     assert.equal(again.status, 201);
     assert.equal(again.body.document.id, doc.id);
-    assert.equal(again.body.document.detailsDeleted, true);
     assert.equal(again.body.document.originalAvailable, false);
     const revived = (await copiesOf(doc.id)).filter((copy) => copy.id !== original.id);
     assert.equal(revived.length, 1);
@@ -741,137 +740,254 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal(level2.body.encryptedBytes, 0, 'temporary copies do not use the level-3 quota');
   });
 
-  test('P5: deleting an original keeps the document; the worker removes the blob and frees the quota', async () => {
-    const doc = (await upload(users.c, { name: 'xoa-ban-goc.pdf', data: pdf(40 * 1024) })).body.document;
-    const [copy] = await copiesOf(doc.id);
-    const before = (await request('/api/documents/usage', { token: users.c.token })).body.encryptedBytes;
-    assert.equal((await request(`/api/documents/${doc.id}/original`, { method: 'DELETE', token: users.a.token })).status, 404, 'other users cannot delete it');
-    const result = await request(`/api/documents/${doc.id}/original`, { method: 'DELETE', token: users.c.token });
-    assert.equal(result.status, 202);
-    assert.equal(result.body.originalAvailable, false);
-    assert.equal((await request('/api/documents/usage', { token: users.c.token })).body.encryptedBytes, before - Number(copy.byteSize));
-    assert.equal((await request(`/api/documents/${doc.id}/original`, { token: users.c.token })).status, 404);
-    await eventually(copyDeleted(copy.id), 'the worker should delete the blob');
-    assert.equal(await objectExists(copy.storageKey), false);
-    const after = await db.fileCopy.findUniqueOrThrow({ where: { id: copy.id } });
-    assert.ok(after.deleteRequestedAt && after.deletedAt);
-    assert.equal((await request(`/api/documents/${doc.id}`, { token: users.c.token })).status, 200, 'the document stays');
-    assert.equal((await request(`/api/documents/${doc.id}/original`, { method: 'DELETE', token: users.c.token })).status, 404);
-  });
+  const trashOf = async (user) => (await request('/api/trash', { token: user.token })).body.items;
+  const trashItem = async (user, kind, name) => {
+    const item = (await trashOf(user)).find((entry) => entry.kind === kind && entry.name === name);
+    assert.ok(item, `${kind} "${name}" should be in the trash`);
+    return item;
+  };
+  const gone = (documentId) => async () => (await db.document.count({ where: { id: documentId } })) === 0;
 
-  test('B5: deleting a document hides it everywhere, purges its text, extracted data and copies, keeps a tombstone, and the file can be uploaded again', async () => {
+  test('trash: a deleted document leaves every list but keeps everything, and restoring brings it back intact', async () => {
     const body = text();
-    const doc = (await upload(users.c, { name: 'xoa-tai-lieu.txt', data: body })).body.document;
+    const doc = (await upload(users.c, { name: 'vao-thung-rac.txt', data: body })).body.document;
     assert.equal((await parsed(users.c, doc.id)).status, 'SUCCEEDED');
     const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: doc.id } });
     const [copy] = await copiesOf(doc.id);
-    assert.ok(await db.documentChunk.count({ where: { documentId: doc.id } }) > 0);
+    const chunks = await db.documentChunk.count({ where: { documentId: doc.id } });
+    assert.ok(chunks > 0);
     const metadata = await db.extractedMetadata.create({ data: {
       userId: users.c.id, documentId: doc.id, versionId: version.id, modelId: 'test', promptVersion: 'p1', schemaVersion: 1,
       summary: 'Hợp đồng thuê nhà.', fields: { deposit: '16000000' }, evidence: { deposit: { quote: 'tiền cọc', charStart: 0, charEnd: 8 } },
     } });
-    const extract = await db.aIJob.create({ data: { userId: users.c.id, kind: 'EXTRACT', documentId: doc.id, versionId: version.id, idempotencyKey: `extract:${doc.id}` } });
-    const usageBefore = (await request('/api/documents/usage', { token: users.c.token })).body.encryptedBytes;
+    const obligation = await db.obligation.create({ data: {
+      userId: users.c.id, documentId: doc.id, versionId: version.id, metadataId: metadata.id, sourceKey: 'rent.monthly', title: 'Tiền thuê nhà',
+    } });
+    const usage = (await request('/api/documents/usage', { token: users.c.token })).body.encryptedBytes;
 
     assert.equal((await request(`/api/documents/${doc.id}`, { method: 'DELETE', token: users.a.token })).status, 404, 'other users cannot delete it');
     assert.equal((await request(`/api/documents/${doc.id}`, { method: 'DELETE', token: users.c.token, requestOrigin: 'https://evil.example' })).status, 403);
-    const removed = await request(`/api/documents/${doc.id}`, { method: 'DELETE', token: users.c.token });
-    assert.equal(removed.status, 204);
-
-    for (const [path, method] of [['', 'GET'], ['/original', 'GET'], ['/preview', 'GET'], ['', 'DELETE'], ['/original', 'DELETE']]) {
-      assert.equal((await request(`/api/documents/${doc.id}${path}`, { method, token: users.c.token })).status, 404, `${method} ${path || '/'} is locked`);
+    assert.equal((await request(`/api/documents/${doc.id}`, { method: 'DELETE', token: users.c.token })).status, 204);
+    for (const [path, method, payload] of [['', 'GET'], ['/original', 'GET'], ['/preview', 'GET'], ['', 'DELETE'], ['/original', 'DELETE'], ['', 'PATCH', { title: 'Sống lại' }]]) {
+      assert.equal((await request(`/api/documents/${doc.id}${path}`, { method, token: users.c.token, body: payload })).status, 404, `${method} ${path || '/'} is locked`);
     }
-    const listed = (await request('/api/documents?limit=50', { token: users.c.token })).body.items;
-    assert.equal(listed.some((item) => item.id === doc.id), false, 'the list no longer shows it');
-
-    const row = await db.document.findUniqueOrThrow({ where: { id: doc.id } });
-    assert.ok(row.deletedAt, 'the record stays, marked deleted');
-    assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), 0, 'text is purged at once');
-    const purged = await db.extractedMetadata.findUniqueOrThrow({ where: { id: metadata.id } });
-    assert.equal(purged.summary, null);
-    assert.deepEqual(purged.fields, {}, 'deleting everything leaves no extracted data');
-    assert.deepEqual(purged.evidence, {});
-    assert.equal((await db.aIJob.findUniqueOrThrow({ where: { id: extract.id } })).status, 'CANCELLED');
-    assert.notEqual((await db.fileCopy.findUniqueOrThrow({ where: { id: copy.id } })).state, 'AVAILABLE');
-    assert.equal((await request('/api/documents/usage', { token: users.c.token })).body.encryptedBytes, usageBefore - Number(copy.byteSize), 'quota is freed at once');
-    await eventually(copyDeleted(copy.id), 'the worker should delete the stored copy');
-    assert.equal(await objectExists(copy.storageKey), false);
+    assert.equal((await request('/api/documents?limit=50', { token: users.c.token })).body.items.some((item) => item.id === doc.id), false);
+    assert.equal((await request('/api/documents/usage', { token: users.c.token })).body.encryptedBytes, usage, 'the trash still counts against the quota');
+    assert.equal((await db.fileCopy.findUniqueOrThrow({ where: { id: copy.id } })).state, 'AVAILABLE');
+    assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), chunks, 'text is kept for a restore');
     await assert.rejects(db.documentChunk.create({ data: {
-      userId: users.c.id, documentId: doc.id, versionId: version.id, ordinal: 0, content: 'sống lại?', charStart: 0, charEnd: 9, chunkerVersion: 'c1',
-    } }), /text cannot be stored/);
+      userId: users.c.id, documentId: doc.id, versionId: version.id, ordinal: 999, content: 'trong thùng rác', charStart: 0, charEnd: 15, chunkerVersion: 'c1',
+    } }), /text cannot be stored/, 'nothing is processed while in the trash');
 
-    const again = await upload(users.c, { name: 'xoa-tai-lieu.txt', data: body });
-    assert.equal(again.status, 201, 'the same file can be uploaded again as a new document');
+    const item = await trashItem(users.c, 'DOCUMENT', 'vao-thung-rac');
+    assertPrivate(item);
+    assert.equal(item.location, null);
+    const days = (new Date(item.expiresAt) - new Date(item.deletedAt)) / 86_400_000;
+    assert.ok(Math.abs(days - 30) < 0.01, `kept 30 days, got ${days}`);
+    assert.equal((await trashOf(users.a)).some((entry) => entry.id === item.id), false, 'the trash is per user');
+    assert.equal((await request(`/api/trash/${item.id}/restore`, { method: 'POST', token: users.a.token })).status, 404);
+    assert.equal((await request(`/api/trash/${item.id}`, { method: 'DELETE', token: users.a.token })).status, 404);
+    assert.equal((await request('/api/trash')).status, 401);
+    assert.equal((await request(`/api/trash/${item.id}/restore`, { method: 'POST', token: users.c.token, requestOrigin: 'https://evil.example' })).status, 403);
+
+    const again = await upload(users.c, { name: 'vao-thung-rac.txt', data: body });
+    assert.equal(again.status, 201, 'the same file uploads as a new document while the old one is in the trash');
     assert.notEqual(again.body.document.id, doc.id);
-    assert.equal((await parsed(users.c, again.body.document.id)).status, 'SUCCEEDED');
+
+    const restored = await request(`/api/trash/${item.id}/restore`, { method: 'POST', token: users.c.token });
+    assert.equal(restored.status, 200);
+    assert.deepEqual([restored.body.kind, restored.body.name, restored.body.renamed, restored.body.moved], ['DOCUMENT', 'vao-thung-rac (2)', true, false], 'its old name was taken meanwhile');
+    assert.equal((await request(`/api/trash/${item.id}/restore`, { method: 'POST', token: users.c.token })).status, 404);
+    assert.equal((await trashOf(users.c)).some((entry) => entry.id === item.id), false);
+    const back = (await request(`/api/documents/${doc.id}`, { token: users.c.token })).body;
+    assert.deepEqual([back.title, back.status, back.originalAvailable, back.summary], ['vao-thung-rac (2)', 'SUCCEEDED', true, 'Hợp đồng thuê nhà.']);
+    assert.equal(sha256((await request(`/api/documents/${doc.id}/original`, { token: users.c.token })).raw), sha256(body));
+    assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), chunks);
+    assert.deepEqual((await db.extractedMetadata.findUniqueOrThrow({ where: { id: metadata.id } })).fields, { deposit: '16000000' });
+    assert.equal((await db.obligation.findUniqueOrThrow({ where: { id: obligation.id } })).status, 'ACTIVE');
   });
 
-  test('layers: the summary shows pages, summary and update time; deleting the original, then the details, hides each layer', async () => {
-    const doc = (await upload(users.c, { name: 'ba-lop.pdf', data: textPdf([['Hop dong thue nha'], [`Tien coc 16.000.000 ${randomUUID()}`]]) })).body.document;
-    const read = await parsed(users.c, doc.id);
-    assert.equal(read.status, 'SUCCEEDED');
-    assert.equal(read.pageCount, 2);
-    assert.ok(new Date(read.updatedAt) >= new Date(read.createdAt), 'parsing counts as an update');
-    assert.equal(read.summary, null);
-    assert.equal(read.detailsDeleted, false);
+  test('trash: a deleted original cannot be opened but restores at once; purging it keeps the document without file or text', async () => {
+    const body = text();
+    const doc = (await upload(users.c, { name: 'ban-goc.txt', data: body })).body.document;
+    const remove = (token = users.c.token) => request(`/api/documents/${doc.id}/original`, { method: 'DELETE', token });
+    await db.documentVersion.updateMany({ where: { documentId: doc.id, parseState: { in: ['PENDING', 'PROCESSING'] } }, data: { parseState: 'PROCESSING' } });
+    const early = await remove();
+    if ((await db.documentVersion.findFirstOrThrow({ where: { documentId: doc.id } })).parseState === 'PROCESSING') {
+      assert.equal(early.status, 409, 'the original stays until the document is processed');
+      await db.documentVersion.updateMany({ where: { documentId: doc.id, parseState: 'PROCESSING' }, data: { parseState: 'PENDING' } });
+    }
+    assert.equal((await parsed(users.c, doc.id, 30_000)).status, 'SUCCEEDED');
+    if (early.status === 202) await request(`/api/trash/${(await trashItem(users.c, 'ORIGINAL', 'ban-goc')).id}/restore`, { method: 'POST', token: users.c.token });
     const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: doc.id } });
     await db.extractedMetadata.create({ data: {
       userId: users.c.id, documentId: doc.id, versionId: version.id, modelId: 'test', promptVersion: 'p1', schemaVersion: 1,
-      summary: 'Hợp đồng thuê 12 tháng, cọc 16 triệu.', fields: { deposit: '16000000' },
+      summary: 'Tóm tắt còn lại.', fields: { rent: '8000000' },
     } });
-    assert.equal((await request(`/api/documents/${doc.id}`, { token: users.c.token })).body.summary, 'Hợp đồng thuê 12 tháng, cọc 16 triệu.');
-
     const [copy] = await copiesOf(doc.id);
-    const noOriginal = await request(`/api/documents/${doc.id}/original`, { method: 'DELETE', token: users.c.token });
-    assert.equal(noOriginal.status, 202);
-    assert.equal(noOriginal.body.originalAvailable, false);
-    assert.ok(await db.documentChunk.count({ where: { documentId: doc.id } }) > 0, 'text stays after deleting the original');
-    assert.ok(new Date(noOriginal.body.updatedAt) > new Date(read.updatedAt), 'deleting a layer moves the update time');
-    assert.ok(noOriginal.body.summary, 'summary stays after deleting the original');
+    const chunks = await db.documentChunk.count({ where: { documentId: doc.id } });
+    const usage = (await request('/api/documents/usage', { token: users.c.token })).body.encryptedBytes;
 
-    assert.equal((await request(`/api/documents/${doc.id}/details`, { method: 'DELETE', token: users.a.token })).status, 404, 'other users cannot');
-    const noDetails = await request(`/api/documents/${doc.id}/details`, { method: 'DELETE', token: users.c.token });
-    assert.equal(noDetails.status, 202);
-    assert.equal(noDetails.body.detailsDeleted, true);
-    assert.equal(noDetails.body.summary, null);
-    assert.equal(noDetails.body.problem, null);
-    assert.equal(noDetails.body.pageCount, 2, 'the info line stays');
-    assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), 0);
-    const { RetentionService, PrivacyPolicyChangedError } = await compiled('retention/retention.service.js');
-    const retention = new RetentionService(db, null, null);
-    await assert.rejects(db.$transaction(async (transaction) => {
-      await retention.assertMayStore(transaction, users.c.id, doc.id, 'TEXT_AND_EMBEDDINGS');
-      await transaction.documentChunk.create({ data: { userId: users.c.id, documentId: doc.id, versionId: version.id, ordinal: 0, content: 'sống lại?', charStart: 0, charEnd: 9, chunkerVersion: 'c1' } });
-    }), PrivacyPolicyChangedError, 'a stale worker cannot write the deleted text back');
-    assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), 0);
-    const raise = await request(`/api/documents/${doc.id}`, { method: 'PATCH', token: users.c.token, body: { privacyLevel: null } });
-    assert.equal(raise.status, 400, 'there is no API to bring a deleted layer back');
-    const metadata = await db.extractedMetadata.findFirstOrThrow({ where: { documentId: doc.id } });
-    assert.equal(metadata.summary, null);
-    assert.deepEqual(metadata.fields, { deposit: '16000000' }, 'structured info stays');
-    await eventually(copyDeleted(copy.id), 'the original blob should be deleted');
-    const listed = (await request('/api/documents?limit=50', { token: users.c.token })).body.items;
-    assert.ok(listed.some((item) => item.id === doc.id), 'the document stays in the list');
-    assert.equal((await request(`/api/documents/${doc.id}/details`, { method: 'DELETE', token: users.c.token })).status, 202, 'repeating is harmless');
-  });
-
-  test('layers: deleting the details while the file waits to be read stops the reading and drops the file', async () => {
-    const doc = (await upload(users.c, { name: 'chua-doc.txt', data: text() })).body.document;
-    const removed = await request(`/api/documents/${doc.id}/details`, { method: 'DELETE', token: users.c.token });
+    assert.equal((await remove(users.a.token)).status, 404, 'other users cannot delete it');
+    const removed = await remove();
     assert.equal(removed.status, 202);
-    assert.equal(removed.body.detailsDeleted, true);
-    for (const copy of await copiesOf(doc.id)) await eventually(copyDeleted(copy.id), 'the stored file should be deleted');
-    const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: doc.id } });
-    assert.ok(['FAILED', 'SUCCEEDED'].includes(version.parseState), version.parseState);
-    if (version.parseState === 'FAILED') assert.equal(version.parseErrorCode, 'DETAILS_DELETED');
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
-    assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), 0);
+    assert.deepEqual([removed.body.originalAvailable, removed.body.originalInTrash, removed.body.summary], [false, true, 'Tóm tắt còn lại.']);
+    assert.ok(new Date(removed.body.updatedAt) > new Date(doc.updatedAt));
+    assert.equal((await request(`/api/documents/${doc.id}/original`, { token: users.c.token })).status, 404);
+    assert.equal((await remove()).status, 404, 'it is already in the trash');
+    assert.equal((await request('/api/documents/usage', { token: users.c.token })).body.encryptedBytes, usage, 'still counted until purged');
+    assert.equal((await request(`/api/documents/${doc.id}`, { token: users.c.token })).status, 200, 'the document itself stays');
+
+    const item = await trashItem(users.c, 'ORIGINAL', 'ban-goc');
+    const restored = await request(`/api/trash/${item.id}/restore`, { method: 'POST', token: users.c.token });
+    assert.deepEqual([restored.status, restored.body.kind, restored.body.name], [200, 'ORIGINAL', 'ban-goc']);
+    assert.equal(sha256((await request(`/api/documents/${doc.id}/original`, { token: users.c.token })).raw), sha256(body), 'the file is back without re-uploading');
+    assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), chunks, 'and so is the text, without re-reading');
+
+    assert.equal((await remove()).status, 202);
+    const second = await trashItem(users.c, 'ORIGINAL', 'ban-goc');
+    assert.equal((await request(`/api/trash/${second.id}`, { method: 'DELETE', token: users.c.token })).status, 204);
+    assert.equal((await request(`/api/trash/${second.id}/restore`, { method: 'POST', token: users.c.token })).status, 404, 'a purged original cannot come back');
+    assert.equal((await request('/api/documents/usage', { token: users.c.token })).body.encryptedBytes, usage - Number(copy.byteSize), 'quota is freed at once');
+    assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), 0, 'the full text goes with the original');
+    await eventually(copyDeleted(copy.id), 'the worker should delete the blob');
+    assert.equal(await objectExists(copy.storageKey), false);
     const after = (await request(`/api/documents/${doc.id}`, { token: users.c.token })).body;
-    assert.equal(after.problem, null, 'no "could not read" message for a deliberate deletion');
-    assert.equal(after.status === 'PENDING' || after.status === 'PROCESSING', false, 'the page stops waiting');
+    assert.deepEqual([after.originalAvailable, after.originalInTrash, after.summary, after.title], [false, false, 'Tóm tắt còn lại.', 'ban-goc']);
+    assert.deepEqual((await db.extractedMetadata.findFirstOrThrow({ where: { documentId: doc.id } })).fields, { rent: '8000000' }, 'extracted info stays');
+    assert.equal((await remove()).status, 404);
   });
 
-  test('layers: details deleted just after the worker checked its lease never leave the document "being read"', async () => {
+  test('trash: a folder goes in as one item with everything inside and comes back whole, also what was deleted separately before', async () => {
+    const user = await createUser('trash-folders', 'ENCRYPTED_COPY');
+    const folder = async (name, parentId = null) => (await request('/api/folders', { method: 'POST', token: user.token, body: { name, parentId } })).body.folder.id;
+    const put = async (folderId, name) => {
+      const form = new FormData();
+      form.append('file', new Blob([text()], { type: 'text/plain' }), name);
+      if (folderId) form.append('folderId', folderId);
+      const response = await request('/api/documents', { method: 'POST', token: user.token, form });
+      assert.equal(response.status, 201, name);
+      return response.body.document.id;
+    };
+    const home = await folder('Nhà');
+    const bills = await folder('Hóa đơn', home);
+    const y2026 = await folder('2026', bills);
+    const old = await folder('Cũ', home);
+    const docs = { contract: await put(home, 'Hợp đồng.txt'), power: await put(bills, 'Điện.txt'), water: await put(y2026, 'Nước.txt'), junk: await put(bills, 'Nháp.txt'), loose: await put(null, 'Ngoài.txt') };
+    for (const id of Object.values(docs)) await parsed(user, id, 30_000);
+
+    assert.equal((await request(`/api/documents/${docs.junk}`, { method: 'DELETE', token: user.token })).status, 204);
+    assert.equal((await request(`/api/documents/${docs.power}/original`, { method: 'DELETE', token: user.token })).status, 202);
+    assert.deepEqual((await request(`/api/folders/${old}`, { method: 'DELETE', token: user.token })).body, { documentCount: 0, folderCount: 0 });
+    assert.equal((await trashItem(user, 'DOCUMENT', 'Nháp')).location, 'Nhà › Hóa đơn');
+
+    assert.equal((await request(`/api/folders/${home}`, { method: 'DELETE', token: users.a.token })).status, 404, 'other users cannot delete it');
+    assert.equal((await request(`/api/folders/${home}`, { method: 'DELETE', token: user.token, requestOrigin: 'https://evil.example' })).status, 403);
+    const removed = await request(`/api/folders/${home}`, { method: 'DELETE', token: user.token });
+    assert.deepEqual([removed.status, removed.body], [200, { documentCount: 3, folderCount: 2 }], 'counts what was still live inside');
+    assert.equal((await request(`/api/folders/${home}`, { method: 'DELETE', token: user.token })).status, 404);
+    const item = await trashItem(user, 'FOLDER', 'Nhà');
+    assert.deepEqual([item.documentCount, item.folderCount, item.location], [3, 2, null]);
+
+    const tree = (await request('/api/folders', { token: user.token })).body;
+    assert.deepEqual([tree.folders.length, tree.totalCount, tree.unfiledCount], [0, 1, 1]);
+    assert.deepEqual((await request('/api/documents?limit=50', { token: user.token })).body.items.map((entry) => entry.id), [docs.loose]);
+    assert.equal((await request(`/api/documents/${docs.contract}`, { token: user.token })).status, 404);
+    for (const [path, method, payload] of [[`/api/folders/${bills}`, 'PATCH', { name: 'Đổi' }], ['/api/folders', 'POST', { name: 'Con', parentId: home }], [`/api/documents/${docs.loose}`, 'PATCH', { folderId: bills }]]) {
+      assert.equal((await request(path, { method, token: user.token, body: payload })).status, 404, `${method} ${path} must not reach into the trash`);
+    }
+    const form = new FormData();
+    form.append('file', new Blob([text()], { type: 'text/plain' }), 'vao-thu-muc-da-xoa.txt');
+    form.append('folderId', home);
+    assert.equal((await request('/api/documents', { method: 'POST', token: user.token, form })).status, 404);
+    await assert.rejects(db.document.update({ where: { id: docs.loose }, data: { folderId: home } }), /deleted folder/);
+
+    const twin = await folder('nhà');
+    assert.equal((await request('/api/folders', { token: user.token })).body.folders[0].name, 'nhà', 'the name of a deleted folder is free');
+
+    const child = await trashItem(user, 'DOCUMENT', 'Nháp');
+    const lifted = await request(`/api/trash/${child.id}/restore`, { method: 'POST', token: user.token });
+    assert.deepEqual([lifted.status, lifted.body.moved, lifted.body.folderId, lifted.body.location], [200, true, null, null], 'its folder is in the trash, so it lands outside');
+    assert.equal((await request(`/api/documents/${docs.junk}`, { token: user.token })).body.folderId, null);
+
+    const restored = await request(`/api/trash/${item.id}/restore`, { method: 'POST', token: user.token });
+    assert.deepEqual([restored.status, restored.body.kind, restored.body.name, restored.body.renamed, restored.body.moved], [200, 'FOLDER', 'Nhà (2)', true, false]);
+    const after = (await request('/api/folders', { token: user.token })).body;
+    const byId = Object.fromEntries(after.folders.map((entry) => [entry.id, entry]));
+    assert.deepEqual([byId[home].name, byId[home].parentId, byId[bills].parentId, byId[y2026].parentId, byId[old].parentId], ['Nhà (2)', null, home, bills, home], 'the whole tree is back, also the subfolder deleted earlier');
+    assert.deepEqual([byId[home].documentCount, byId[bills].documentCount, byId[y2026].documentCount, byId[twin].documentCount], [1, 1, 1, 0]);
+    const power = (await request(`/api/documents/${docs.power}`, { token: user.token })).body;
+    assert.deepEqual([power.folderId, power.originalAvailable, power.originalInTrash], [bills, true, false], 'an original deleted separately inside comes back too');
+    assert.deepEqual(await trashOf(user), [], 'nothing of the folder is left in the trash');
+    assert.equal((await request(`/api/documents/${docs.water}/original`, { token: user.token })).status, 200);
+  });
+
+  test('trash: permanent delete removes every row and stored file; expired items and "empty trash" go the same way', async () => {
+    const user = await createUser('trash-purge', 'ENCRYPTED_COPY');
+    const body = text();
+    const first = (await upload(user, { name: 'xoa-han.txt', data: body })).body.document;
+    assert.equal((await parsed(user, first.id)).status, 'SUCCEEDED');
+    const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: first.id } });
+    const [copy] = await copiesOf(first.id);
+    const metadata = await db.extractedMetadata.create({ data: {
+      userId: user.id, documentId: first.id, versionId: version.id, modelId: 'test', promptVersion: 'p1', schemaVersion: 1,
+      status: 'CONFIRMED', summary: 'Tóm tắt.', fields: { rent: '8000000' }, confirmedFields: { rent: '8000000' }, confirmedAt: new Date(),
+    } });
+    const obligation = await db.obligation.create({ data: {
+      userId: user.id, documentId: first.id, versionId: version.id, metadataId: metadata.id, sourceKey: 'rent.monthly', title: 'Tiền thuê nhà',
+    } });
+    assert.equal((await request(`/api/documents/${first.id}`, { method: 'DELETE', token: user.token })).status, 204);
+    const item = await trashItem(user, 'DOCUMENT', 'xoa-han');
+    assert.equal((await request(`/api/trash/${item.id}`, { method: 'DELETE', token: user.token, requestOrigin: 'https://evil.example' })).status, 403);
+    assert.equal((await request(`/api/trash/${item.id}`, { method: 'DELETE', token: user.token })).status, 204);
+    assert.equal((await request(`/api/trash/${item.id}/restore`, { method: 'POST', token: user.token })).status, 404, 'permanent means permanent');
+    assert.equal((await request('/api/documents/usage', { token: user.token })).body.encryptedBytes, 0, 'quota is freed at once');
+    assert.equal(await db.documentChunk.count({ where: { documentId: first.id } }), 0);
+    await db.document.update({ where: { id: first.id }, data: { deletedAt: null } }).then(() => assert.fail('a purged document must not be restorable'), (error) => assert.match(String(error), /permanently deleted|P2025|not found/i));
+    await eventually(gone(first.id), 'the document row should be deleted once its file is gone');
+    assert.equal(await objectExists(copy.storageKey), false);
+    assert.deepEqual([
+      await db.fileCopy.count({ where: { id: copy.id } }), await db.documentVersion.count({ where: { sha256: sha256(body), userId: user.id } }),
+      await db.extractedMetadata.count({ where: { id: metadata.id } }), await db.obligation.count({ where: { id: obligation.id } }),
+      await db.aIJob.count({ where: { documentId: first.id } }),
+    ], [0, 0, 0, 0, 0], 'no copy, hash, extracted data, obligation or job is left');
+    const again = await upload(user, { name: 'xoa-han.txt', data: body });
+    assert.deepEqual([again.status, again.body.duplicate, again.body.document.title], [201, false, 'xoa-han'], 'the file is unknown again');
+
+    assert.equal((await request(`/api/documents/${again.body.document.id}`, { method: 'DELETE', token: user.token })).status, 204);
+    const expiring = await trashItem(user, 'DOCUMENT', 'xoa-han');
+    await db.trashItem.update({ where: { id: expiring.id }, data: { deletedAt: new Date(Date.now() - 31 * 86_400_000), expiresAt: new Date(Date.now() - 86_400_000) } });
+    await eventually(gone(again.body.document.id), 'the worker should purge an item older than 30 days');
+    assert.deepEqual(await trashOf(user), []);
+
+    const box = (await request('/api/folders', { method: 'POST', token: user.token, body: { name: 'Hộp' } })).body.folder.id;
+    const inner = (await request('/api/folders', { method: 'POST', token: user.token, body: { name: 'Trong', parentId: box } })).body.folder.id;
+    const form = new FormData();
+    form.append('file', new Blob([text()], { type: 'text/plain' }), 'trong-hop.txt');
+    form.append('folderId', inner);
+    const inside = (await request('/api/documents', { method: 'POST', token: user.token, form })).body.document.id;
+    const outside = (await upload(user, { name: 'ngoai-hop.txt', data: text() })).body.document.id;
+    const kept = (await upload(user, { name: 'giu-lai.txt', data: text() })).body.document.id;
+    for (const id of [inside, outside, kept]) await parsed(user, id);
+    assert.equal((await request(`/api/documents/${inside}`, { method: 'DELETE', token: user.token })).status, 204);
+    assert.equal((await request(`/api/folders/${box}`, { method: 'DELETE', token: user.token })).status, 200);
+    assert.equal((await request(`/api/documents/${outside}`, { method: 'DELETE', token: user.token })).status, 204);
+    assert.equal((await request(`/api/documents/${kept}/original`, { method: 'DELETE', token: user.token })).status, 202);
+    assert.equal((await trashOf(user)).length, 4);
+    assert.equal((await request('/api/trash', { method: 'DELETE', token: users.a.token })).body.purged, 0, 'emptying is per user');
+    const emptied = await request('/api/trash', { method: 'DELETE', token: user.token });
+    assert.equal(emptied.status, 200);
+    assert.ok(emptied.body.purged >= 3, `purged ${emptied.body.purged}`);
+    assert.deepEqual(await trashOf(user), []);
+    await eventually(async () => (await db.folder.count({ where: { userId: user.id } })) === 0 && (await db.document.count({ where: { userId: user.id } })) === 1,
+      'folders, the documents inside and the deleted document should all be removed');
+    const survivor = (await request(`/api/documents/${kept}`, { token: user.token })).body;
+    assert.deepEqual([survivor.originalAvailable, survivor.originalInTrash], [false, false]);
+    assert.equal(await db.fileCopy.count({ where: { userId: user.id, state: { not: 'DELETED' } } }), 0);
+    assert.equal((await request('/api/documents/usage', { token: user.token })).body.encryptedBytes, 0);
+  });
+
+  test('trash: a job cancelled just after the worker checked its lease never leaves the document "being read"', async () => {
     const { JobQueue } = await compiled('jobs/job-queue.service.js');
     const { ParseService } = await compiled('parsing/parse.service.js');
     const { RetentionService } = await compiled('retention/retention.service.js');
@@ -889,54 +1005,31 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
       const jobs = {
         extend: async (...args) => {
           const held = await queue.extend(...args);
-          assert.equal((await request(`/api/documents/${doc.id}/details`, { method: 'DELETE', token: users.c.token })).status, 202);
+          assert.equal((await request(`/api/documents/${doc.id}`, { method: 'DELETE', token: users.c.token })).status, 204);
           return held;
         },
         holds: (...args) => queue.holds(...args),
       };
-      const parser = new ParseService(db, null, null, new RetentionService(db, null, null), jobs);
+      const parser = new ParseService(db, null, null, new RetentionService(db, null), jobs);
       await assert.rejects(parser.handle(job), /LEASE_LOST/);
       const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: doc.id } });
-      assert.equal(version.parseState, 'FAILED', 'the cancelled job must not mark the version as being read');
-      assert.equal(version.parseErrorCode, 'DETAILS_DELETED');
-      const after = (await request(`/api/documents/${doc.id}`, { token: users.c.token })).body;
-      assert.equal(after.detailsDeleted, true);
-      assert.equal(after.problem, null);
+      assert.equal(version.parseState, 'PENDING', 'the cancelled job must not mark the version as being read');
+      assert.equal((await db.aIJob.findUniqueOrThrow({ where: { id: job.id } })).status, 'CANCELLED');
+      users.c.waiting = doc.id;
     } finally {
       startWorker();
     }
   });
 
-  test('layers: deleting everything also clears the extracted info and cancels the obligations', async () => {
-    const doc = (await upload(users.c, { name: 'xoa-het.txt', data: text() })).body.document;
-    assert.equal((await parsed(users.c, doc.id)).status, 'SUCCEEDED');
-    const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: doc.id } });
-    const metadata = await db.extractedMetadata.create({ data: {
-      userId: users.c.id, documentId: doc.id, versionId: version.id, modelId: 'test', promptVersion: 'p1', schemaVersion: 1,
-      status: 'CONFIRMED', summary: 'Tóm tắt.', fields: { rent: '8000000' }, confirmedFields: { rent: '8000000' }, confirmedAt: new Date(),
-      evidence: { rent: { quote: 'tiền thuê', charStart: 0, charEnd: 9 } },
-    } });
-    const obligation = await db.obligation.create({ data: {
-      userId: users.c.id, documentId: doc.id, versionId: version.id, metadataId: metadata.id, sourceKey: 'rent.monthly', title: 'Tiền thuê nhà',
-    } });
-    assert.equal((await request(`/api/documents/${doc.id}`, { method: 'DELETE', token: users.c.token })).status, 204);
-    const cleared = await db.extractedMetadata.findUniqueOrThrow({ where: { id: metadata.id } });
-    assert.deepEqual(cleared.fields, {});
-    assert.deepEqual(cleared.evidence, {});
-    assert.equal(cleared.confirmedFields, null);
-    assert.equal(cleared.summary, null);
-    assert.equal((await db.obligation.findUniqueOrThrow({ where: { id: obligation.id } })).status, 'CANCELLED');
-  });
-
-  test('B5: a document deleted while its parse job waits is never parsed back', async () => {
-    const doc = (await upload(users.a, { name: 'xoa-khi-dang-doc.txt', data: text() })).body.document;
-    assert.equal((await request(`/api/documents/${doc.id}`, { method: 'DELETE', token: users.a.token })).status, 204);
-    const jobs = await db.aIJob.findMany({ where: { documentId: doc.id, kind: 'PARSE' } });
-    assert.ok(jobs.length > 0);
-    for (const job of jobs) assert.ok(['CANCELLED', 'SUCCEEDED'].includes(job.status), `parse job is ${job.status}`);
-    for (const copy of await copiesOf(doc.id)) await eventually(copyDeleted(copy.id), 'the temporary copy should be deleted');
-    await new Promise((resolve) => setTimeout(resolve, 1_500));
-    assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), 0);
+  test('trash: a document deleted before it was read is not read in the trash, and is read once restored', async () => {
+    const id = users.c.waiting;
+    await delay(1_200);
+    assert.equal(await db.documentChunk.count({ where: { documentId: id } }), 0, 'nothing is read while in the trash');
+    assert.equal((await db.documentVersion.findFirstOrThrow({ where: { documentId: id } })).parseState, 'PENDING');
+    const item = await trashItem(users.c, 'DOCUMENT', 'xoa-luc-bat-dau-doc');
+    assert.equal((await request(`/api/trash/${item.id}/restore`, { method: 'POST', token: users.c.token })).status, 200);
+    assert.equal((await parsed(users.c, id, 30_000)).status, 'SUCCEEDED', 'reading resumes after the restore');
+    assert.ok(await db.documentChunk.count({ where: { documentId: id } }) > 0);
   });
 
   test('DOCX preview: level 3 owners get escaped HTML under a sandbox policy; other files, levels and users get 404', async () => {
@@ -1041,7 +1134,6 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
       await delay(5);
     }
     for (const id of Object.values(ids)) await parsed(user, id, 30_000);
-    assert.equal((await request(`/api/documents/${ids.txt}/details`, { method: 'DELETE', token: user.token })).status, 202);
     const list = async (query) => {
       const response = await request(`/api/documents?${query}`, { token: user.token });
       assert.equal(response.status, 200, query);

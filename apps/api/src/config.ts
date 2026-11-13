@@ -26,6 +26,7 @@ export interface Kek { id: string; key: Buffer }
 export interface FilesConfig {
   keks: Kek[];
   webSourceTtlMs: number;
+  trashTtlMs: number;
   encryptedQuotaBytes: number;
 }
 
@@ -113,6 +114,7 @@ export function readConfig(env: NodeJS.ProcessEnv): ApiConfig {
   const files: FilesConfig = {
     keks: parseKeks(env.FILE_KEKS),
     webSourceTtlMs: positiveNumber(env.WEB_SOURCE_MAX_DAYS, 30, 'WEB_SOURCE_MAX_DAYS') * 86_400_000,
+    trashTtlMs: positiveNumber(env.TRASH_DAYS, 30, 'TRASH_DAYS') * 86_400_000,
     encryptedQuotaBytes: Math.floor(positiveNumber(env.ENCRYPTED_QUOTA_MB, 1024, 'ENCRYPTED_QUOTA_MB') * 1024 * 1024),
   };
   const worker: WorkerConfig = {

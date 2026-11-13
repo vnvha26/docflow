@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ChangeEvent, DragEvent } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { Icon } from '../../components/Brand';
 import { ApiError, StaleSessionError } from '../../lib/api';
 import type { User } from '../../lib/api';
@@ -9,12 +9,14 @@ import {
   sortLabels, typeFilterLabels,
 } from '../../lib/documents';
 import type { DocumentFilters, DocumentSort, DocumentSummary, DocumentTypeFilter, StorageUsage } from '../../lib/documents';
-import { canCreateIn, foldersApi, MAX_FOLDER_DEPTH, moveProblem, pathLabel, pathOf, UNFILED } from '../../lib/folders';
+import { canCreateIn, childrenOf, foldersApi, MAX_FOLDER_DEPTH, moveProblem, pathLabel, pathOf, UNFILED } from '../../lib/folders';
 import type { Folder, FolderTree } from '../../lib/folders';
+import { folderContents, trashApi, undoTargets } from '../../lib/trash';
+import type { Undo } from '../../lib/trash';
 import { summarizeUploads } from '../../lib/upload-summary';
 import type { UploadItem } from '../../lib/upload-summary';
 import { DocumentOptions } from './DocumentOptions';
-import { ConfirmDialog, FolderFormDialog, MoveDialog, RenameDialog } from './FolderDialogs';
+import { FolderFormDialog, MoveDialog, RenameDialog } from './FolderDialogs';
 import { ActionMenu } from './ActionMenu';
 import { ALL, DOCUMENT_DRAG, FolderPane, hasFiles } from './FolderPane';
 import type { FolderAction } from './FolderPane';
@@ -37,8 +39,7 @@ function shortDate(value: string): string {
   return `${day}/${date.getFullYear()}`;
 }
 
-function statusTone(item: DocumentSummary): 'done' | 'waiting' | 'problem' | 'muted' {
-  if (item.detailsDeleted) return 'muted';
+function statusTone(item: DocumentSummary): 'done' | 'waiting' | 'problem' {
   if (isProcessing(item)) return 'waiting';
   return item.status === 'SUCCEEDED' ? 'done' : 'problem';
 }
@@ -49,9 +50,10 @@ type Dialog =
   | { kind: 'move-folder'; folder: Folder }
   | { kind: 'rename'; document: DocumentSummary }
   | { kind: 'move-document'; document: DocumentSummary }
-  | { kind: 'move-many'; ids: string[] }
-  | { kind: 'delete-many'; ids: string[] };
+  | { kind: 'move-many'; ids: string[] };
 
+const NOTICE_MS = 7_000;
+const NOTICE_UNDO_MS = 12_000;
 const POLL_FIRST_MS = 2_000;
 const POLL_MAX_MS = 10_000;
 const POLL_BATCH = 20;
@@ -72,6 +74,10 @@ export function DocumentsPage({ user }: { user: User }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [undo, setUndo] = useState<Undo | null>(null);
+  const [undoing, setUndoing] = useState(false);
+  const [reload, setReload] = useState(0);
+  const [over, setOver] = useState<string | null>(null);
   const [uploads, setUploads] = useState<UploadItem[]>([]);
   const [dragging, setDragging] = useState(false);
   const [summaryOf, setSummaryOf] = useState<DocumentSummary | null>(null);
@@ -101,6 +107,7 @@ export function DocumentsPage({ user }: { user: User }) {
 
   const select = useCallback((next: string) => {
     setNotice('');
+    setUndo(null);
     setParams(next === ALL ? {} : { folder: next });
   }, [setParams]);
 
@@ -152,7 +159,7 @@ export function DocumentsPage({ user }: { user: User }) {
       if (!(failure instanceof StaleSessionError)) setError(failureMessage(failure, 'Chưa thể tải danh sách tài liệu.'));
     }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [user.id, fileType, view, sort]);
+  }, [user.id, fileType, view, sort, reload]);
 
   const changingIds = documents.filter(isChanging).slice(0, POLL_BATCH).map((item) => item.id).join(',');
 
@@ -199,6 +206,8 @@ export function DocumentsPage({ user }: { user: User }) {
 
   function enqueue(files: File[], folderId: string | null = uploadFolderId) {
     if (!files.length) return;
+    setNotice('');
+    setUndo(null);
     const owner = user.id;
     const items = files.map((file) => ({ file, item: { key: crypto.randomUUID(), name: file.name, state: 'waiting' as const } }));
     setUploads((previous) => {
@@ -290,6 +299,7 @@ export function DocumentsPage({ user }: { user: User }) {
   }
 
   async function createFolder(parentId: string | null, folderName: string, purpose: string | null) {
+    setUndo(null);
     const result = await foldersApi.create({ name: folderName, purpose, parentId }, user.id);
     keep(result.folder);
     setNotice(result.renamed
@@ -299,12 +309,14 @@ export function DocumentsPage({ user }: { user: User }) {
   }
 
   async function editFolder(folder: Folder, folderName: string, purpose: string | null) {
+    setUndo(null);
     const result = await foldersApi.update(folder.id, { ...(folderName !== folder.name ? { name: folderName } : {}), purpose }, user.id);
     keep(result.folder);
     setNotice(result.renamed ? `Đã có thư mục cùng tên ở đây nên tên được lưu là ${quoted(result.folder.name)}.` : 'Đã lưu thư mục.');
   }
 
   async function moveFolder(folder: Folder, parentId: string | null) {
+    setUndo(null);
     const result = await foldersApi.update(folder.id, { parentId }, user.id);
     keep(result.folder);
     const place = parentId ? quoted(pathLabel(folders, parentId)) : 'cấp ngoài cùng';
@@ -312,12 +324,14 @@ export function DocumentsPage({ user }: { user: User }) {
   }
 
   async function renameDocument(item: DocumentSummary, title: string) {
+    setUndo(null);
     const result = await documentsApi.update(item.id, { title }, user.id);
     place(result.document);
     setNotice(result.renamed ? `Tên này đã có trong thư mục nên tài liệu được lưu là ${quoted(result.document.title)}.` : '');
   }
 
   async function moveDocument(item: DocumentSummary, folderId: string | null) {
+    setUndo(null);
     const result = await documentsApi.update(item.id, { folderId }, user.id);
     place(result.document);
     refreshTree();
@@ -326,6 +340,7 @@ export function DocumentsPage({ user }: { user: User }) {
   }
 
   async function moveDocuments(ids: string[], folderId: string | null) {
+    setUndo(null);
     const items = documents.filter((known) => ids.includes(known.id) && known.folderId !== folderId);
     if (items.length === 1) { await moveDocument(items[0], folderId); setSelected([]); return; }
     let moved = 0;
@@ -363,14 +378,36 @@ export function DocumentsPage({ user }: { user: User }) {
     setSelected((previous) => previous.filter((id) => !gone.includes(id)));
     refreshUsage();
     refreshTree();
-    setNotice(gone.length ? `Đã xóa ${gone.length} tài liệu.` : '');
+    setNotice(gone.length ? `Đã chuyển ${gone.length} tài liệu vào thùng rác.` : '');
+    setUndo(gone.length ? { kind: 'DOCUMENT', ids: gone } : null);
     if (gone.length < ids.length) setError(`Chưa xóa được ${ids.length - gone.length} tài liệu. Vui lòng thử lại.`);
+  }
+
+  async function removeFolder(folder: Folder) {
+    const inside = pathOf(folders, view).some((known) => known.id === folder.id);
+    await foldersApi.remove(folder.id, user.id);
+    if (inside) setParams(folder.parentId ? { folder: folder.parentId } : {});
+    else setDocuments((previous) => previous.filter((known) => !pathOf(folders, known.folderId).some((ancestor) => ancestor.id === folder.id)));
+    refreshTree();
+    refreshUsage();
+    setNotice(`Đã chuyển thư mục ${quoted(folder.name)} vào thùng rác.`);
+    setUndo({ kind: 'FOLDER', ids: [folder.id] });
+  }
+
+  function deleteNow(work: Promise<void>) {
+    setError('');
+    work.catch((failure: unknown) => {
+      if (failure instanceof StaleSessionError) return;
+      setError(failure instanceof ApiError ? failure.message : 'Chưa thể xóa. Vui lòng thử lại.');
+      refreshTree();
+    });
   }
 
   function folderAction(folderId: string, action: FolderAction) {
     const folder = folders.find((known) => known.id === folderId);
     if (!folder) return;
-    if (action === 'create') setDialog({ kind: 'create', parentId: folder.id });
+    if (action === 'delete') deleteNow(removeFolder(folder));
+    else if (action === 'create') setDialog({ kind: 'create', parentId: folder.id });
     else setDialog({ kind: action === 'edit' ? 'edit' : 'move-folder', folder });
   }
 
@@ -380,7 +417,47 @@ export function DocumentsPage({ user }: { user: User }) {
 
   const chosen = selected.filter((id) => documents.some((known) => known.id === id));
   const allChosen = documents.length > 0 && chosen.length === documents.length;
+  async function undoDelete() {
+    const target = undo;
+    if (!target) return;
+    setUndoing(true); setError('');
+    try {
+      let restored = 0;
+      for (const entry of undoTargets(await trashApi.list(), target)) {
+        try {
+          await trashApi.restore(entry.id, user.id);
+          restored++;
+        } catch (failure) {
+          if (failure instanceof StaleSessionError) throw failure;
+        }
+      }
+      setUndo(null);
+      setNotice(restored >= target.ids.length ? 'Đã hoàn tác: mục vừa xóa đã trở lại chỗ cũ.' : 'Chưa hoàn tác được hết; hãy xem các mục còn lại trong thùng rác.');
+      setReload((value) => value + 1);
+      refreshTree();
+      refreshUsage();
+    } catch (failure) {
+      if (!(failure instanceof StaleSessionError)) setError(failureMessage(failure, 'Chưa thể hoàn tác. Vui lòng thử lại.'));
+    } finally { setUndoing(false); }
+  }
+
   const uploadSummary = summarizeUploads(uploads);
+  const uploadTone = uploadSummary?.tone;
+  const subfolders = openFolder ? childrenOf(folders, openFolder.id) : [];
+
+  useEffect(() => {
+    if (!notice) return;
+    setUploads((previous) => previous.some((item) => item.state === 'waiting' || item.state === 'uploading') ? previous : []);
+    if (undoing) return;
+    const timer = setTimeout(() => { setNotice(''); setUndo(null); }, undo ? NOTICE_UNDO_MS : NOTICE_MS);
+    return () => clearTimeout(timer);
+  }, [notice, undo, undoing]);
+
+  useEffect(() => {
+    if (uploadTone !== 'done') return;
+    const timer = setTimeout(() => setUploads((previous) => previous.some((item) => item.state === 'waiting' || item.state === 'uploading') ? previous : []), NOTICE_MS);
+    return () => clearTimeout(timer);
+  }, [uploadTone, uploads.length]);
   const usagePercent = usage ? Math.min(100, (usage.encryptedBytes / usage.quotaBytes) * 100) : 0;
   const path = pathOf(folders, openFolder?.id ?? null);
   const viewLabel = openFolder ? pathLabel(folders, openFolder.id) : view === UNFILED ? UNFILED_LABEL : 'Tất cả tài liệu';
@@ -436,6 +513,7 @@ export function DocumentsPage({ user }: { user: User }) {
               { label: 'Thư mục con mới…', onSelect: () => setDialog({ kind: 'create', parentId: openFolder.id }), disabled: !mayNest, hint: mayNest ? undefined : `Thư mục chỉ được lồng tối đa ${MAX_FOLDER_DEPTH} cấp.` },
               { label: 'Sửa tên và mục đích…', onSelect: () => setDialog({ kind: 'edit', folder: openFolder }) },
               { label: 'Chuyển tới…', onSelect: () => setDialog({ kind: 'move-folder', folder: openFolder }) },
+              { label: 'Xóa thư mục', onSelect: () => deleteNow(removeFolder(openFolder)), danger: true, hint: 'Thư mục và mọi thứ bên trong vào thùng rác; khôi phục được trong 30 ngày.' },
             ]} />}
             <button type="button" className="button-primary upload-button" onClick={() => input.current?.click()}><Icon name="upload" size={16} />Tải tài liệu</button>
             <input ref={input} type="file" multiple hidden accept=".pdf,.docx,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain" onChange={choose} />
@@ -449,7 +527,7 @@ export function DocumentsPage({ user }: { user: User }) {
               {uploadSummary.details.length > 0 && <ul>{uploadSummary.details.map((detail) => <li key={detail}>{detail}</li>)}</ul>}
             </div>
           </div>}
-          {notice && <div className="upload-summary tone-done library-notice" role="status"><span className="upload-summary-icon" aria-hidden="true">✓</span><div><p>{notice}</p></div></div>}
+          {notice && <div className="upload-summary tone-done library-notice" role="status"><span className="upload-summary-icon" aria-hidden="true">✓</span><div><p>{notice}{undo && <> <button type="button" className="text-button" onClick={undoDelete} disabled={undoing}>{undoing ? 'Đang hoàn tác…' : 'Hoàn tác'}</button><i aria-hidden="true"> · </i><Link className="text-button" to="/trash">Mở thùng rác</Link></>}</p></div></div>}
           {error && <div className="form-alert documents-alert" role="alert"><span aria-hidden="true">!</span><p>{error}</p></div>}
           {(documents.length > 0 || filtered) && <div className="document-filters" role="group" aria-label="Lọc tài liệu">
             <div className="filter-chips">
@@ -464,21 +542,51 @@ export function DocumentsPage({ user }: { user: User }) {
           {chosen.length > 0 && <div className="bulk-bar" role="group" aria-label="Thao tác với tài liệu đã chọn">
             <strong>Đã chọn {chosen.length} tài liệu</strong>
             <button type="button" className="action-button" onClick={() => setDialog({ kind: 'move-many', ids: chosen })}><Icon name="folder" size={15} />Chuyển tới…</button>
-            <button type="button" className="action-button bulk-danger" onClick={() => setDialog({ kind: 'delete-many', ids: chosen })}>Xóa…</button>
+            <button type="button" className="action-button bulk-danger" title="Vào thùng rác; khôi phục được trong 30 ngày." onClick={() => deleteNow(removeDocuments(chosen))}>Xóa</button>
             <button type="button" className="text-button" onClick={() => setSelected([])}>Bỏ chọn</button>
           </div>}
-          {!loading && !documents.length && !error && <div className="documents-empty">
+          {!loading && !documents.length && !subfolders.length && !error && <div className="documents-empty">
             <span><Icon name="folder" size={26} /></span>
             <strong>{emptyText.title}</strong>
             <p>{emptyText.hint}</p>
             {filtered && <button type="button" className="button-secondary" onClick={() => setFileType(undefined)}>Bỏ lọc</button>}
           </div>}
           <ul className="document-list" aria-busy={loading}>
-            {documents.length > 0 && <li className="document-columns">
+            {(documents.length > 0 || subfolders.length > 0) && <li className="document-columns">
               <label className="document-check" title={allChosen ? 'Bỏ chọn tất cả' : 'Chọn tất cả tài liệu đang hiện'}>
-                <input type="checkbox" checked={allChosen} aria-label="Chọn tất cả tài liệu đang hiện" onChange={() => setSelected(allChosen ? [] : documents.map((item) => item.id))} />
+                <input type="checkbox" checked={allChosen} disabled={!documents.length} aria-label="Chọn tất cả tài liệu đang hiện" onChange={() => setSelected(allChosen ? [] : documents.map((item) => item.id))} />
               </label>
               <span aria-hidden="true" /><span aria-hidden="true">Tài liệu</span><span aria-hidden="true">Cập nhật</span><span aria-hidden="true" /></li>}
+            {subfolders.map((folder) => <li key={folder.id} className={`document-row folder-entry${over === folder.id ? ' drop-target' : ''}`}
+              onDragOver={(event) => {
+                if (!accepts(folder.id, hasFiles(event))) return;
+                event.preventDefault(); event.stopPropagation();
+                event.dataTransfer.dropEffect = hasFiles(event) ? 'copy' : 'move';
+                setOver(folder.id);
+              }}
+              onDragLeave={() => setOver((current) => current === folder.id ? null : current)}
+              onDrop={(event) => {
+                setOver(null); setDragging(false);
+                if (!accepts(folder.id, hasFiles(event))) return;
+                event.preventDefault(); event.stopPropagation();
+                dropOn(folder.id, Array.from(event.dataTransfer.files));
+              }}>
+              <span aria-hidden="true" />
+              <button type="button" className="document-type type-folder" onClick={() => select(folder.id)} aria-label={`Mở thư mục ${folder.name}`} tabIndex={-1}><Icon name="folder" size={19} /></button>
+              <div className="document-info">
+                <button type="button" className="document-title folder-open" onClick={() => select(folder.id)} title={folder.purpose ?? 'Mở thư mục'}>{folder.name}</button>
+                <p className="document-line">Thư mục · {folderContents(folders, folder.id).documents} tài liệu{folderContents(folders, folder.id).folders > 0 && ` · ${folderContents(folders, folder.id).folders} thư mục con`}</p>
+              </div>
+              <p className="document-updated"><span>Cập nhật </span><time dateTime={folder.updatedAt}>{shortDate(folder.updatedAt)}</time></p>
+              <div className="document-actions">
+                <ActionMenu label={`Tùy chọn cho thư mục ${folder.name}`} actions={[
+                  { label: 'Thư mục con mới…', onSelect: () => folderAction(folder.id, 'create'), disabled: !canCreateIn(folders, folder.id) },
+                  { label: 'Sửa tên và mục đích…', onSelect: () => folderAction(folder.id, 'edit') },
+                  { label: 'Chuyển tới…', onSelect: () => folderAction(folder.id, 'move') },
+                  { label: 'Xóa thư mục', onSelect: () => folderAction(folder.id, 'delete'), danger: true },
+                ]} />
+              </div>
+            </li>)}
             {documents.map((item) => <li key={item.id} draggable
               className={`document-row${drag?.kind === 'document' && drag.ids.includes(item.id) ? ' is-dragged' : ''}${chosen.includes(item.id) ? ' is-selected' : ''}`}
               onDragStart={(event) => {
@@ -491,9 +599,13 @@ export function DocumentsPage({ user }: { user: User }) {
               <label className="document-check">
                 <input type="checkbox" checked={chosen.includes(item.id)} aria-label={`Chọn ${item.title}`} onChange={() => toggleSelected(item.id)} />
               </label>
-              <span className={`document-type type-${fileTypeLabel(item).toLowerCase()}`}>{fileTypeLabel(item)}</span>
+              <button type="button" className={`document-type type-${fileTypeLabel(item).toLowerCase()}`} onClick={() => viewOriginal(item)} tabIndex={-1}
+                disabled={!canViewOriginal(item) || viewing !== null} aria-label={`Xem ${item.title}`}>{fileTypeLabel(item)}</button>
               <div className="document-info">
-                <strong className="document-title" title={`Tên tệp gốc: ${item.file.name}`}>{item.title}</strong>
+                {canViewOriginal(item)
+                  ? <button type="button" className="document-title file-open" onClick={() => viewOriginal(item)} disabled={viewing !== null}
+                    title={`Bấm để xem · Tên tệp gốc: ${item.file.name}`}>{item.title}{viewing === item.id && <em> · đang mở…</em>}</button>
+                  : <strong className="document-title" title={`Bản gốc không còn lưu nên không xem được · Tên tệp gốc: ${item.file.name}`}>{item.title}</strong>}
                 <p className={`document-line tone-${statusTone(item)}`}>
                   {isProcessing(item) ? <span className="spinner spinner-tiny" /> : <span className="status-dot" aria-hidden="true" />}
                   {infoLine(item)}{item.originalDeleting && ' · Đang xóa bản gốc…'}
@@ -509,15 +621,18 @@ export function DocumentsPage({ user }: { user: User }) {
                 <button type="button" className="action-button" onClick={() => setSummaryOf(item)}>
                   <Icon name="summary" size={15} />Xem tóm tắt
                 </button>
-                <button type="button" className="action-button action-primary" onClick={() => viewOriginal(item)} disabled={!canViewOriginal(item) || viewing !== null}
-                  title={canViewOriginal(item) ? undefined : 'Bản gốc không còn lưu nên không xem được.'}>
-                  <Icon name="eye" size={15} />{viewing === item.id ? 'Đang mở…' : 'Xem chi tiết'}
-                </button>
                 <DocumentOptions document={item}
                   onRename={() => setDialog({ kind: 'rename', document: item })}
                   onMove={() => setDialog({ kind: 'move-document', document: item })}
-                  onChange={(next) => { place(next); refreshUsage(); }}
-                  onRemove={() => { setDocuments((previous) => previous.filter((known) => known.id !== item.id)); refreshUsage(); refreshTree(); }} />
+                  onChange={(next) => {
+                    place(next); refreshUsage();
+                    if (next.originalInTrash) { setNotice(`Đã chuyển bản gốc của ${quoted(next.title)} vào thùng rác.`); setUndo({ kind: 'ORIGINAL', ids: [next.id] }); }
+                  }}
+                  onRemove={() => {
+                    setDocuments((previous) => previous.filter((known) => known.id !== item.id));
+                    refreshUsage(); refreshTree();
+                    setNotice(`Đã chuyển ${quoted(item.title)} vào thùng rác.`); setUndo({ kind: 'DOCUMENT', ids: [item.id] });
+                  }} />
               </div>
             </li>)}
           </ul>
@@ -543,10 +658,6 @@ export function DocumentsPage({ user }: { user: User }) {
         rootLabel={UNFILED_LABEL} onSubmit={(target) => moveDocument(dialog.document, target)} onClose={() => setDialog(null)} />}
       {dialog?.kind === 'move-many' && <MoveDialog kicker="CHUYỂN TÀI LIỆU" title={`${dialog.ids.length} tài liệu đã chọn`} folders={folders} currentId={undefined}
         rootLabel={UNFILED_LABEL} onSubmit={(target) => moveDocuments(dialog.ids, target)} onClose={() => setDialog(null)} />}
-      {dialog?.kind === 'delete-many' && <ConfirmDialog kicker="XÓA TÀI LIỆU" title={`Xóa ${dialog.ids.length} tài liệu đã chọn?`} label={`Xóa ${dialog.ids.length} tài liệu`}
-        onSubmit={() => removeDocuments(dialog.ids)} onClose={() => setDialog(null)}>
-        <p className="dialog-note danger"><strong>Mất vĩnh viễn:</strong> tệp gốc, nội dung, tóm tắt, thông tin, việc cần làm và nhắc hạn của các tài liệu này. Không khôi phục được.</p>
-      </ConfirmDialog>}
     </section>
   </>;
 }

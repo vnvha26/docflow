@@ -1,13 +1,8 @@
-import { ConflictException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
-import { JobKind, Prisma, PrivacyLevel } from '@prisma/client';
-import { randomUUID } from 'node:crypto';
+import { ConflictException, Inject, Injectable, Logger } from '@nestjs/common';
+import { Prisma, PrivacyLevel } from '@prisma/client';
 import { lockUserFiles } from '../database/locks';
 import { PrismaService } from '../database/prisma.service';
-import { JobQueue } from '../jobs/job-queue.service';
 import { ObjectStorage } from '../storage/object-storage';
-
-const DOCUMENT_JOBS: JobKind[] = ['PARSE', 'CLASSIFY', 'EXTRACT', 'SUMMARIZE', 'EMBED'];
-const DETAIL_JOBS: JobKind[] = ['PARSE', 'SUMMARIZE', 'EMBED'];
 
 export class PrivacyPolicyChangedError extends ConflictException {
   constructor() { super('Mức lưu trữ của tài liệu đã thay đổi; dữ liệu này không còn được giữ.'); }
@@ -22,7 +17,6 @@ export class RetentionService {
   constructor(
     @Inject(PrismaService) private readonly prisma: PrismaService,
     @Inject(ObjectStorage) private readonly storage: ObjectStorage,
-    @Inject(JobQueue) private readonly jobs: JobQueue,
   ) {}
 
   async assertMayStore(transaction: Prisma.TransactionClient, userId: string, documentId: string, minimum: PrivacyLevel): Promise<PrivacyLevel> {
@@ -35,70 +29,9 @@ export class RetentionService {
     return rows[0].level;
   }
 
-  async deleteDetails(userId: string, documentId: string): Promise<void> {
-    await this.prisma.$transaction(async (transaction) => {
-      await lockUserFiles(transaction, userId);
-      const document = await transaction.document.findFirst({ where: { id: documentId, userId, deletedAt: null }, select: { id: true } });
-      if (!document) throw new NotFoundException('Không tìm thấy tài liệu.');
-      await transaction.document.update({ where: { id: documentId }, data: { privacyLevel: 'STRUCTURED_ONLY', revision: { increment: 1 } } });
-      const copies = await transaction.fileCopy.updateMany({
-        where: { userId, documentId, state: { in: ['UPLOADING', 'AVAILABLE'] } },
-        data: { state: 'DELETE_PENDING', deleteRequestedAt: new Date(), revision: { increment: 1 } },
-      });
-      await this.jobs.cancel(transaction, { userId, kinds: DETAIL_JOBS, documentId });
-      await transaction.documentVersion.updateMany({
-        where: { documentId, parseState: { in: ['PENDING', 'PROCESSING'] } },
-        data: { parseState: 'FAILED', parseErrorCode: 'DETAILS_DELETED' },
-      });
-      const text = await this.purgeText(transaction, userId);
-      if (copies.count > 0 || text > 0) await this.queuePurge(transaction, userId);
-    });
-  }
-
-  async deleteOriginal(userId: string, documentId: string): Promise<void> {
-    await this.prisma.$transaction(async (transaction) => {
-      await lockUserFiles(transaction, userId);
-      const document = await transaction.document.findFirst({ where: { id: documentId, userId, deletedAt: null }, select: { id: true } });
-      if (!document) throw new NotFoundException('Không tìm thấy tài liệu.');
-      const changed = await transaction.fileCopy.updateMany({
-        where: { userId, documentId, kind: 'ENCRYPTED_COPY', state: { in: ['UPLOADING', 'AVAILABLE'] } },
-        data: { state: 'DELETE_PENDING', deleteRequestedAt: new Date(), revision: { increment: 1 } },
-      });
-      if (changed.count === 0) throw new NotFoundException('Tài liệu này không có bản gốc để xóa.');
-      await transaction.document.update({ where: { id: documentId }, data: { revision: { increment: 1 } } });
-      await this.queuePurge(transaction, userId);
-    });
-  }
-
-  async deleteDocument(userId: string, documentId: string): Promise<void> {
-    await this.prisma.$transaction(async (transaction) => {
-      await lockUserFiles(transaction, userId);
-      const deleted = await transaction.document.updateMany({
-        where: { id: documentId, userId, deletedAt: null },
-        data: { deletedAt: new Date(), revision: { increment: 1 } },
-      });
-      if (deleted.count === 0) throw new NotFoundException('Không tìm thấy tài liệu.');
-      const copies = await transaction.fileCopy.updateMany({
-        where: { userId, documentId, state: { in: ['UPLOADING', 'AVAILABLE'] } },
-        data: { state: 'DELETE_PENDING', deleteRequestedAt: new Date(), revision: { increment: 1 } },
-      });
-      await this.jobs.cancel(transaction, { userId, kinds: DOCUMENT_JOBS, documentId });
-      await transaction.extractedMetadata.updateMany({
-        where: { documentId },
-        data: { fields: {}, evidence: {}, summary: null, confirmedFields: Prisma.DbNull, revision: { increment: 1 } },
-      });
-      await transaction.obligation.updateMany({
-        where: { documentId, status: { in: ['ACTIVE', 'NEEDS_REVIEW'] } },
-        data: { status: 'CANCELLED', revision: { increment: 1 } },
-      });
-      const text = await this.purgeText(transaction, userId);
-      if (copies.count > 0 || text > 0) await this.queuePurge(transaction, userId);
-    });
-  }
-
   async purgeText(db: Prisma.TransactionClient, userId: string): Promise<number> {
     const level1 = Prisma.sql`d."userId" = ${userId}::uuid
-      AND (d."deletedAt" IS NOT NULL OR LEAST(u."privacyLevel", COALESCE(d."privacyLevel", u."privacyLevel")) = 'STRUCTURED_ONLY')`;
+      AND (d."purgedAt" IS NOT NULL OR LEAST(u."privacyLevel", COALESCE(d."privacyLevel", u."privacyLevel")) = 'STRUCTURED_ONLY')`;
     const chunks = await db.$executeRaw`
       DELETE FROM "DocumentChunk" c USING "Document" d JOIN "User" u ON u."id" = d."userId"
       WHERE c."documentId" = d."id" AND ${level1}`;
@@ -113,11 +46,6 @@ export class RetentionService {
       WHERE m."documentId" = d."id" AND ${level1}
         AND (m."summary" IS NOT NULL OR jsonb_path_exists(m."evidence", '$.*.quote'))`;
     return chunks + metadata;
-  }
-
-  private async queuePurge(transaction: Prisma.TransactionClient, userId: string): Promise<void> {
-    const waiting = await transaction.aIJob.count({ where: { userId, kind: 'PURGE', status: { in: ['QUEUED', 'FAILED'] } } });
-    if (!waiting) await this.jobs.enqueue(transaction, { userId, kind: 'PURGE', idempotencyKey: `purge:${userId}:${randomUUID()}`, priority: 10 });
   }
 
   async deletePendingBlobs(userId?: string, limit = 200): Promise<{ deleted: number; failed: number }> {
@@ -148,7 +76,31 @@ export class RetentionService {
     await this.prisma.$transaction(async (transaction) => {
       await lockUserFiles(transaction, userId);
       await this.purgeText(transaction, userId);
+      await this.removePurged(transaction, userId);
     });
     if (blobs.failed > 0) throw new Error('BLOB_DELETE_FAILED');
+  }
+
+  async removePurged(transaction: Prisma.TransactionClient, userId: string): Promise<{ documents: number; folders: number }> {
+    const gone = await transaction.document.findMany({
+      where: { userId, purgedAt: { not: null }, fileCopies: { none: { state: { not: 'DELETED' } } } }, take: 500, select: { id: true },
+    });
+    const ids = gone.map((document) => document.id);
+    if (ids.length) {
+      await transaction.$executeRaw`
+        DELETE FROM "Notification" n USING "Reminder" r, "Event" e, "Action" a, "Obligation" o
+        WHERE n."reminderId" = r."id" AND r."eventId" = e."id" AND e."actionId" = a."id" AND a."obligationId" = o."id"
+          AND o."userId" = ${userId}::uuid AND o."documentId"::text = ANY(${ids})`;
+      await transaction.obligation.deleteMany({ where: { userId, documentId: { in: ids } } });
+      await transaction.fileCopy.deleteMany({ where: { userId, documentId: { in: ids } } });
+      await transaction.document.deleteMany({ where: { userId, id: { in: ids } } });
+    }
+    let folders = 0;
+    for (let round = 0; round < 6; round++) {
+      const removed = await transaction.folder.deleteMany({ where: { userId, purgedAt: { not: null }, documents: { none: {} }, children: { none: {} } } });
+      folders += removed.count;
+      if (!removed.count) break;
+    }
+    return { documents: ids.length, folders };
   }
 }

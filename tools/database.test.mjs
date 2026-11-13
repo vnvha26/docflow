@@ -17,7 +17,7 @@ before(async () => {
   db = new PGlite();
   const dirs = (await readdir(MIGRATIONS, { withFileTypes: true }))
     .filter((d) => d.isDirectory()).map((d) => d.name).sort();
-  assert.equal(dirs.length, 10);
+  assert.equal(dirs.length, 11);
   for (const dir of dirs) await db.exec(await readFile(new URL(`${dir}/migration.sql`, MIGRATIONS), 'utf8'));
   await db.exec(`INSERT INTO "DocumentType" ("code","name","pathTemplate","fieldSchema")
                  VALUES ('RENTAL_CONTRACT','Hợp đồng thuê nhà','Hợp đồng/Thuê nhà/{year}','{"type":"object"}')`);
@@ -77,7 +77,7 @@ async function seedUser(tag) {
 
 test('migrations create the 20 CP1 tables including email challenges and folders', async () => {
   const { count } = await one(`SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'public'`);
-  assert.equal(count, 20);
+  assert.equal(count, 21);
 });
 
 test('accounts default to level 3 (ENCRYPTED_COPY)', async () => {
@@ -361,18 +361,21 @@ test('parsed text: chunks are non-empty ranges with consistent pages; a parsed v
   await db.query(`UPDATE "DocumentVersion" SET "parseState" = 'UNSUPPORTED', "parseErrorCode" = 'NO_TEXT_LAYER', "charCount" = NULL WHERE "id" = $1`, [a.version]);
 });
 
-test('a deleted document stays deleted and never receives new text or live stored copies', async () => {
+test('a document in the trash can be restored but takes no new text or stored copies; a purged one is gone for good', async () => {
   const a = await seedUser('a');
   const live = [a.user, a.doc, a.version, 'ENCRYPTED_COPY', 'AVAILABLE', 'encrypted/a/live', 10, hex('c'), 'v1.k.x', null, null, null];
   await db.query(copySql, live);
   await db.query(`UPDATE "Document" SET "deletedAt" = now() WHERE "id" = $1`, [a.doc]);
-  await rejects(`UPDATE "Document" SET "deletedAt" = NULL WHERE "id" = $1`, [a.doc], /cannot be restored/);
   await rejects(`INSERT INTO "DocumentChunk" ("userId","documentId","versionId","ordinal","content","charStart","charEnd","chunkerVersion")
                  VALUES ($1,$2,$3,9,'sống lại?',0,9,'c1')`, [a.user, a.doc, a.version], /text cannot be stored/);
   await rejects(copySql, [a.user, a.doc, a.version, 'WEB_SOURCE', 'UPLOADING', 'web-source/a/new', 10, null, null, new Date(), null, null], /live stored copy/);
+  await db.query(`UPDATE "Document" SET "deletedAt" = NULL WHERE "id" = $1`, [a.doc]);
+  await rejects(`UPDATE "Document" SET "purgedAt" = now() WHERE "id" = $1`, [a.doc], 'Document_purged_is_deleted_check');
+  await db.query(`UPDATE "Document" SET "deletedAt" = now(), "purgedAt" = now() WHERE "id" = $1`, [a.doc]);
+  await rejects(`UPDATE "Document" SET "deletedAt" = NULL, "purgedAt" = NULL WHERE "id" = $1`, [a.doc], /permanently deleted/);
+  await rejects(`UPDATE "Document" SET "purgedAt" = NULL WHERE "id" = $1`, [a.doc], /permanently deleted/);
   await db.query(`UPDATE "FileCopy" SET "state" = 'DELETE_PENDING', "deleteRequestedAt" = now() WHERE "storageKey" = 'encrypted/a/live'`);
   await rejects(`UPDATE "FileCopy" SET "state" = 'AVAILABLE', "deleteRequestedAt" = NULL WHERE "storageKey" = 'encrypted/a/live'`, [], /live stored copy/);
-  await db.query(`UPDATE "FileCopy" SET "state" = 'DELETED', "deletedAt" = now() WHERE "storageKey" = 'encrypted/a/live'`);
   await db.query(`UPDATE "Document" SET "title" = 'Đã xóa' WHERE "id" = $1`, [a.doc]);
 });
 
@@ -441,4 +444,48 @@ test('documents: live titles are unique inside a folder, not across folders, use
   await db.query(`UPDATE "Document" SET "folderId" = NULL WHERE "id" = $1`, [moved]);
   await db.query(insert, [a.user, 'Hợp đồng thuê (2)', null]);
   assert.equal((await one(`SELECT "title" FROM "Document" WHERE "id" = $1`, [b.doc])).title, 'Hợp đồng thuê');
+});
+
+test('trash: nothing live sits inside a deleted folder, deleted names are free, and a purged folder is final', async () => {
+  const a = await seedUser('a');
+  const home = await folder(a.user, 'Nhà');
+  const bills = await folder(a.user, 'Hóa đơn', home);
+  await db.query(`UPDATE "Document" SET "folderId" = $1 WHERE "id" = $2`, [bills, a.doc]);
+  await db.query(`UPDATE "Document" SET "deletedAt" = now() WHERE "id" = $1`, [a.doc]);
+  await db.query(`UPDATE "Folder" SET "deletedAt" = now() WHERE "id" IN ($1,$2)`, [home, bills]);
+  await rejects(`UPDATE "Document" SET "deletedAt" = NULL WHERE "id" = $1`, [a.doc], 'Document_live_folder');
+  await rejects(`INSERT INTO "Document" ("userId","title","source","folderId") VALUES ($1,'Mới','WEB_UPLOAD',$2)`, [a.user, bills], 'Document_live_folder');
+  await rejects(`UPDATE "Folder" SET "deletedAt" = NULL WHERE "id" = $1`, [bills], 'Folder_live_parent');
+  await rejects(`INSERT INTO "Folder" ("userId","name","parentId") VALUES ($1,'Con',$2)`, [a.user, home], 'Folder_live_parent');
+  const twin = await folder(a.user, 'nhà');
+  await rejects(`UPDATE "Folder" SET "deletedAt" = NULL WHERE "id" = $1`, [home], 'Folder_sibling_name_key');
+  await db.query(`UPDATE "Folder" SET "deletedAt" = NULL, "name" = 'Nhà (2)' WHERE "id" = $1`, [home]);
+  await db.query(`UPDATE "Folder" SET "deletedAt" = NULL WHERE "id" = $1`, [bills]);
+  await db.query(`UPDATE "Document" SET "deletedAt" = NULL WHERE "id" = $1`, [a.doc]);
+  await rejects(`UPDATE "Folder" SET "purgedAt" = now() WHERE "id" = $1`, [twin], 'Folder_purged_is_deleted_check');
+  await db.query(`UPDATE "Folder" SET "deletedAt" = now(), "purgedAt" = now() WHERE "id" = $1`, [twin]);
+  await rejects(`UPDATE "Folder" SET "deletedAt" = NULL, "purgedAt" = NULL WHERE "id" = $1`, [twin], /permanently deleted/);
+});
+
+test('trash items: one per target, the right target for each kind, a real expiry, and they go with their target', async () => {
+  const a = await seedUser('a');
+  const b = await seedUser('b');
+  const box = await folder(a.user, 'Hộp');
+  const insert = `INSERT INTO "TrashItem" ("userId","kind","documentId","folderId","name","expiresAt") VALUES ($1,$2,$3,$4,'x', now() + interval '30 days')`;
+  await rejects(insert, [b.user, 'DOCUMENT', a.doc, null], 'TrashItem_documentId_userId_fkey');
+  await rejects(insert, [b.user, 'FOLDER', null, box], 'TrashItem_folderId_userId_fkey');
+  await db.query(insert, [a.user, 'DOCUMENT', a.doc, null]);
+  await db.query(insert, [a.user, 'ORIGINAL', a.doc, null]);
+  await db.query(insert, [a.user, 'FOLDER', null, box]);
+  await rejects(insert, [a.user, 'DOCUMENT', a.doc, null], 'TrashItem_document_kind_key');
+  await rejects(insert, [a.user, 'FOLDER', null, box], 'TrashItem_folder_key');
+  for (const [kind, documentId, folderId] of [['FOLDER', a.doc, null], ['DOCUMENT', null, box], ['ORIGINAL', a.doc, box], ['DOCUMENT', null, null]]) {
+    await rejects(insert, [a.user, kind, documentId, folderId], 'TrashItem_target_check');
+  }
+  await rejects(`INSERT INTO "TrashItem" ("userId","kind","documentId","name","expiresAt") VALUES ($1,'DOCUMENT',$2,'x', now() - interval '1 day')`, [b.user, b.doc], 'TrashItem_expiry_check');
+  await rejects(`INSERT INTO "TrashItem" ("userId","kind","documentId","name","expiresAt","documentCount") VALUES ($1,'DOCUMENT',$2,'x', now() + interval '1 day', -1)`, [b.user, b.doc], 'TrashItem_counts_check');
+  await db.query(`DELETE FROM "Folder" WHERE "id" = $1`, [box]);
+  assert.equal((await one(`SELECT count(*)::int AS count FROM "TrashItem" WHERE "userId" = $1`, [a.user])).count, 2);
+  await db.query(`DELETE FROM "User" WHERE "id" = $1`, [a.user]);
+  assert.equal((await one(`SELECT count(*)::int AS count FROM "TrashItem"`)).count, 0);
 });

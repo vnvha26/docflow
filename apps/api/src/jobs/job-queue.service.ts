@@ -109,11 +109,12 @@ export class JobQueue {
     return dead ? 'dead' : 'retry';
   }
 
-  async cancel(db: Prisma.TransactionClient, where: { userId: string; kinds: JobKind[]; documentId?: string }): Promise<number> {
+  async cancel(db: Prisma.TransactionClient, where: { userId: string; kinds: JobKind[]; documentId?: string; documentIds?: string[] }): Promise<number> {
     const result = await db.aIJob.updateMany({
       where: {
         userId: where.userId, kind: { in: where.kinds }, status: { in: ['QUEUED', 'FAILED', 'RUNNING'] },
         ...(where.documentId ? { documentId: where.documentId } : {}),
+        ...(where.documentIds ? { documentId: { in: where.documentIds } } : {}),
       },
       data: { status: 'CANCELLED', finishedAt: new Date(), leaseOwner: null, leaseUntil: null, lastErrorCode: 'POLICY_CHANGED' },
     });
