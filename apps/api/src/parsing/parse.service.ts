@@ -1,12 +1,12 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { ParseState, Prisma, PrivacyLevel } from '@prisma/client';
+import { ParseState } from '@prisma/client';
 import { Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { FileVault } from '../crypto/file-vault.service';
 import { lockUserFiles } from '../database/locks';
 import { PrismaService } from '../database/prisma.service';
 import { ClaimedJob, JobQueue } from '../jobs/job-queue.service';
-import { PrivacyPolicyChangedError, RetentionService } from '../retention/retention.service';
+import { DocumentUnavailableError, RetentionService } from '../retention/retention.service';
 import { ObjectNotFoundError, ObjectStorage } from '../storage/object-storage';
 import { CHUNKER_VERSION, chunkText } from './chunker';
 import { extractPages, ParserCrashedError } from './text-extract';
@@ -15,7 +15,6 @@ import { assertRawLength, assessText, normalizePages, PARSER_VERSION, ParserFail
 const PARSE_LEASE_SECONDS = 300;
 const STORE_TRANSACTION = { maxWait: 10_000, timeout: 60_000 };
 const DONE: ParseState[] = ['SUCCEEDED', 'UNSUPPORTED'];
-const RANK: Record<PrivacyLevel, number> = { STRUCTURED_ONLY: 1, TEXT_AND_EMBEDDINGS: 2, ENCRYPTED_COPY: 3 };
 
 type Outcome =
   | { kind: 'parsed'; text: string; pageStarts: number[] | null; pageCount: number | null }
@@ -121,22 +120,21 @@ export class ParseService {
 
   private async store(target: Target, outcome: Outcome, job?: ClaimedJob): Promise<void> {
     const { userId, documentId, versionId } = target;
-    const released = await this.prisma.$transaction(async (transaction) => {
-      let level: PrivacyLevel;
+    await this.prisma.$transaction(async (transaction) => {
       try {
-        level = await this.retention.assertMayStore(transaction, userId, documentId, 'STRUCTURED_ONLY');
+        await this.retention.assertMayStore(transaction, userId, documentId);
       } catch (error) {
-        if (error instanceof PrivacyPolicyChangedError) return false;
+        if (error instanceof DocumentUnavailableError) return;
         throw error;
       }
       if (job && !await this.jobs.holds(transaction, job)) throw new Error('LEASE_LOST');
       const current = await transaction.documentVersion.findFirst({ where: { id: versionId, documentId }, select: { parseState: true } });
-      if (!current || DONE.includes(current.parseState)) return false;
+      if (!current || DONE.includes(current.parseState)) return;
       await transaction.documentChunk.deleteMany({ where: { versionId } });
       await transaction.document.update({ where: { id: documentId }, data: { revision: { increment: 1 } } });
       if (outcome.kind === 'failed') {
         await transaction.documentVersion.update({ where: { id: versionId }, data: { parseState: 'FAILED', parseErrorCode: outcome.code.slice(0, 64) } });
-        return false;
+        return;
       }
       if (outcome.kind === 'unsupported') {
         await transaction.documentVersion.update({
@@ -144,12 +142,10 @@ export class ParseService {
           data: { parseState: 'UNSUPPORTED', parseErrorCode: outcome.code, parserVersion: PARSER_VERSION, pageCount: null, charCount: null },
         });
       } else {
-        if (RANK[level] >= RANK.TEXT_AND_EMBEDDINGS) {
-          const chunks = chunkText(outcome.text, outcome.pageStarts);
-          await transaction.documentChunk.createMany({
-            data: chunks.map((chunk) => ({ ...chunk, userId, documentId, versionId, chunkerVersion: CHUNKER_VERSION })),
-          });
-        }
+        const chunks = chunkText(outcome.text, outcome.pageStarts);
+        await transaction.documentChunk.createMany({
+          data: chunks.map((chunk) => ({ ...chunk, userId, documentId, versionId, chunkerVersion: CHUNKER_VERSION })),
+        });
         await transaction.documentVersion.update({
           where: { id: versionId },
           data: {
@@ -157,18 +153,7 @@ export class ParseService {
             pageCount: outcome.pageCount, charCount: outcome.text.length,
           },
         });
-        if (level === 'STRUCTURED_ONLY') return false;
       }
-      return this.releaseSource(transaction, versionId);
     }, STORE_TRANSACTION);
-    if (released) await this.retention.deletePendingBlobs(userId).catch(() => undefined);
-  }
-
-  private async releaseSource(transaction: Prisma.TransactionClient, versionId: string): Promise<boolean> {
-    const result = await transaction.fileCopy.updateMany({
-      where: { versionId, kind: 'WEB_SOURCE', state: 'AVAILABLE' },
-      data: { state: 'DELETE_PENDING', deleteRequestedAt: new Date(), revision: { increment: 1 } },
-    });
-    return result.count > 0;
   }
 }

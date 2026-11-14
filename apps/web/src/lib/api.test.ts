@@ -4,7 +4,7 @@ import { ApiError, AuthClient, fileNameFrom, StaleSessionError } from './api.ts'
 import type { Exclusive, User } from './api.ts';
 import { clearChallenge, pendingChallenge, readChallenge, saveChallenge } from './challenge.ts';
 
-const user: User = { id: 'u-1', email: 'ban@example.com', displayName: 'Minh An', timezone: 'Asia/Ho_Chi_Minh', privacyLevel: 'TEXT_AND_EMBEDDINGS' };
+const user: User = { id: 'u-1', email: 'ban@example.com', displayName: 'Minh An', timezone: 'Asia/Ho_Chi_Minh' };
 const session = (token: string) => Response.json({ accessToken: token, expiresIn: 900, user });
 const unauthorized = () => Response.json({ message: 'Phiên đã hết hạn.' }, { status: 401 });
 /** One tab's view of navigator.locks: exclusive, FIFO, not re-entrant. */

@@ -124,7 +124,7 @@ const childEnv = (port) => ({
   ...process.env, NODE_ENV: 'test', DATABASE_URL: databaseUrl, ...(port ? { PORT: String(port) } : {}), WEB_ORIGIN: origin,
   JWT_SECRET: 'docflow-documents-integration-secret-32-chars', FILE_KEKS: fileKeks,
   S3_ENDPOINT: s3.endpoint, S3_ACCESS_KEY: s3.accessKeyId, S3_SECRET_KEY: s3.secretAccessKey, S3_BUCKET: s3.bucket,
-  ENCRYPTED_QUOTA_MB: '1', WEB_SOURCE_MAX_DAYS: '30', WORKER_POLL_MS: '100', WORKER_MAINTENANCE_MS: '400',
+  ENCRYPTED_QUOTA_MB: '64', WORKER_POLL_MS: '100', WORKER_MAINTENANCE_MS: '400',
 });
 
 function startWorker() {
@@ -203,11 +203,27 @@ function upload(user, files, { title, requestOrigin } = {}) {
   return request('/api/documents', { method: 'POST', token: user?.token, form, requestOrigin });
 }
 
-async function createUser(tag, privacyLevel = 'TEXT_AND_EMBEDDINGS') {
+async function ballast(user, bytes) {
+  const document = await db.document.create({ data: { userId: user.id, title: `Chiếm chỗ ${randomUUID()}`, source: 'WEB_UPLOAD' } });
+  const version = await db.documentVersion.create({ data: {
+    userId: user.id, documentId: document.id, number: 1, sha256: createHash('sha256').update(randomUUID()).digest('hex'), byteSize: BigInt(bytes),
+    mimeType: 'text/plain', originalFilename: 'chiem-cho.txt', source: 'WEB_UPLOAD', parseState: 'UNSUPPORTED', parseErrorCode: 'FILE_DAMAGED', parserVersion: 'p2',
+  } });
+  const copy = await db.fileCopy.create({ data: {
+    userId: user.id, documentId: document.id, versionId: version.id, kind: 'ENCRYPTED_COPY', state: 'AVAILABLE', storageKey: `encrypted/${user.id}/${randomUUID()}`,
+    contentType: 'application/octet-stream', byteSize: BigInt(bytes), sha256: createHash('sha256').update('ballast').digest('hex'), encryptionKeyRef: 'w1.it.x',
+  } });
+  return async () => {
+    await db.fileCopy.delete({ where: { id: copy.id } });
+    await db.document.delete({ where: { id: document.id } });
+  };
+}
+
+async function createUser(tag) {
   const argon2 = await import('argon2');
   const email = `${prefix}${tag}@example.test`;
   const user = await db.user.create({
-    data: { email, passwordHash: await argon2.hash(password, { type: argon2.argon2id }), emailVerifiedAt: new Date(), privacyLevel },
+    data: { email, passwordHash: await argon2.hash(password, { type: argon2.argon2id }), emailVerifiedAt: new Date() },
   });
   const login = await request('/api/auth/login', { method: 'POST', body: { email, password } });
   assert.equal(login.status, 200);
@@ -258,8 +274,8 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     startWorker();
     users.a = await createUser('a');
     users.b = await createUser('b');
-    users.c = await createUser('c', 'ENCRYPTED_COPY');
-    users.d = await createUser('d', 'ENCRYPTED_COPY');
+    users.c = await createUser('c');
+    users.d = await createUser('d');
     users.e = await createUser('e');
   });
 
@@ -287,7 +303,7 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal(await documentCount(users.a), 0);
   });
 
-  test('level 2 keeps only an encrypted temporary copy, and the original cannot be downloaded', async (t) => {
+  test('an upload is kept as one encrypted original, never in plaintext, and the worker reads its text', async (t) => {
     await stopWorker();
     t.after(() => { if (!worker || worker.exitCode !== null) startWorker(); });
     const content = text();
@@ -298,25 +314,24 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal(result.body.duplicate, false);
     assert.equal(document.title, 'Ghi chú thuê nhà');
     assert.deepEqual(document.file, { name: 'Ghi chú thuê nhà.txt', mimeType: 'text/plain', byteSize: content.length });
-    assert.equal(document.privacyLevel, undefined, 'storage levels are internal');
-    assert.equal(document.privacyOverride, undefined);
+    assert.equal(document.privacyLevel, undefined, 'there are no storage levels');
     assert.equal(document.status, 'PENDING');
-    assert.equal(document.originalAvailable, false);
+    assert.equal(document.originalAvailable, true);
     const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: document.id } });
     assert.equal(version.sha256, sha256(content));
     const [copy, ...others] = await copiesOf(document.id);
     assert.equal(others.length, 0);
-    assert.equal(copy.kind, 'WEB_SOURCE');
+    assert.equal(copy.kind, 'ENCRYPTED_COPY');
     assert.equal(copy.state, 'AVAILABLE');
-    assert.match(copy.storageKey, new RegExp(`^web-source/${users.a.id}/[0-9a-f-]{36}$`));
+    assert.match(copy.storageKey, new RegExp(`^encrypted/${users.a.id}/[0-9a-f-]{36}$`));
     assert.match(copy.encryptionKeyRef, new RegExp(`^w1\\.${kekId}\\.`));
-    assert.ok(Math.abs(copy.expiresAt.getTime() - (Date.now() + 30 * 86_400_000)) < 60_000, 'kept at most 30 days');
+    assert.equal(copy.expiresAt, null, 'originals do not expire');
     const stored = await object(copy.storageKey);
     assert.equal(stored.length, Number(copy.byteSize));
     assert.equal(sha256(stored), copy.sha256);
     assert.equal(stored.subarray(0, 4).toString(), 'DFE1');
     assert.equal(stored.includes(content.subarray(0, 24)), false, 'no plaintext in object storage');
-    assert.equal((await request(`/api/documents/${document.id}/original`, { token: users.a.token })).status, 404);
+    assert.equal((await request(`/api/documents/${document.id}/original`, { token: users.a.token })).status, 200);
     const detail = await request(`/api/documents/${document.id}`, { token: users.a.token });
     assert.deepEqual(detail.body, document);
     startWorker();
@@ -329,8 +344,8 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     const after = await db.documentVersion.findUniqueOrThrow({ where: { id: version.id } });
     assert.equal(after.parserVersion, 'p2');
     assert.equal(after.charCount, chunks[0].content.length);
-    await eventually(copyDeleted(copy.id), 'the temporary copy goes once the text is kept');
-    assert.equal(await objectExists(copy.storageKey), false);
+    assert.equal((await copiesOf(document.id))[0].state, 'AVAILABLE', 'the original stays after its text is read');
+    assert.equal(await objectExists(copy.storageKey), true);
   });
 
   test('identical content is deduplicated per user, including concurrent uploads', async () => {
@@ -358,7 +373,7 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     const inFlight = async (content, createdAt = new Date()) => {
       const document = await db.document.create({ data: { userId: user.id, title: `Đang tải ${randomUUID()}`, source: 'WEB_UPLOAD' } });
       const version = await db.documentVersion.create({ data: { userId: user.id, documentId: document.id, number: 1, sha256: sha256(content), byteSize: BigInt(content.length), mimeType: 'text/plain', originalFilename: 'dang-tai.txt', source: 'WEB_UPLOAD' } });
-      const copy = await db.fileCopy.create({ data: { userId: user.id, documentId: document.id, versionId: version.id, kind: 'WEB_SOURCE', state: 'UPLOADING', storageKey: `web-source/${user.id}/${randomUUID()}`, contentType: 'application/octet-stream', byteSize: 7n, encryptionKeyRef: 'w1.it.x', createdAt } });
+      const copy = await db.fileCopy.create({ data: { userId: user.id, documentId: document.id, versionId: version.id, kind: 'ENCRYPTED_COPY', state: 'UPLOADING', storageKey: `encrypted/${user.id}/${randomUUID()}`, contentType: 'application/octet-stream', byteSize: 7n, encryptionKeyRef: 'w1.it.x', createdAt } });
       return { document, version, copy };
     };
     const track = (promise) => { const state = { done: false }; promise.finally(() => { state.done = true; }); return state; };
@@ -398,16 +413,13 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.ok(Date.now() - started < 5_000, 'no waiting on an abandoned upload');
   });
 
-  test('B4: PDF, DOCX and TXT are read by the worker; text is kept only from level 2, temporary copies go once processed', async () => {
-    const level2 = await createUser('parse-2');
-    const level1 = await createUser('parse-1', 'STRUCTURED_ONLY');
-    const level3 = await createUser('parse-3', 'ENCRYPTED_COPY');
-    const pdfDoc = (await upload(level2, { name: 'thue-nha.pdf', data: textPdf([['Hop dong thue nha so 12', 'Tien coc 16.000.000 VND'], ['Thoi han 12 thang']]) })).body.document;
-    const docxDoc = (await upload(level2, { name: 'bao-hanh.docx', data: docxWith(['Phiếu bảo hành', 'Bảo hành 12 tháng kể từ ngày giao hàng.']) })).body.document;
-    const privateDoc = (await upload(level1, { name: 'rieng.txt', data: text() })).body.document;
-    const originalDoc = (await upload(level3, { name: 'goc.txt', data: text() })).body.document;
+  test('B4: PDF, DOCX and TXT are read by the worker; the text is kept and the original stays', async () => {
+    const reader = await createUser('parse-2');
+    const pdfDoc = (await upload(reader, { name: 'thue-nha.pdf', data: textPdf([['Hop dong thue nha so 12', 'Tien coc 16.000.000 VND'], ['Thoi han 12 thang']]) })).body.document;
+    const docxDoc = (await upload(reader, { name: 'bao-hanh.docx', data: docxWith(['Phiếu bảo hành', 'Bảo hành 12 tháng kể từ ngày giao hàng.']) })).body.document;
+    const originalDoc = (await upload(reader, { name: 'goc.txt', data: text() })).body.document;
 
-    assert.equal((await parsed(level2, pdfDoc.id)).status, 'SUCCEEDED');
+    assert.equal((await parsed(reader, pdfDoc.id)).status, 'SUCCEEDED');
     const pdfVersion = await db.documentVersion.findFirstOrThrow({ where: { documentId: pdfDoc.id } });
     assert.equal(pdfVersion.pageCount, 2);
     const pdfChunks = await db.documentChunk.findMany({ where: { documentId: pdfDoc.id }, orderBy: { ordinal: 'asc' } });
@@ -415,25 +427,19 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal(pdfChunks[0].pageFrom, 1);
     assert.equal(pdfChunks.at(-1).pageTo, 2);
     const [pdfCopy] = await copiesOf(pdfDoc.id);
-    await eventually(copyDeleted(pdfCopy.id), 'level 2: the temporary copy is deleted after parsing');
+    assert.deepEqual([pdfCopy.kind, pdfCopy.state], ['ENCRYPTED_COPY', 'AVAILABLE']);
 
-    assert.equal((await parsed(level2, docxDoc.id)).status, 'SUCCEEDED');
+    assert.equal((await parsed(reader, docxDoc.id)).status, 'SUCCEEDED');
     const docxText = (await db.documentChunk.findMany({ where: { documentId: docxDoc.id } })).map((chunk) => chunk.content).join(' ');
     assert.match(docxText, /Phiếu bảo hành\s+Bảo hành 12 tháng kể từ ngày giao hàng\./);
 
-    assert.equal((await parsed(level1, privateDoc.id)).status, 'SUCCEEDED');
-    assert.equal(await db.documentChunk.count({ where: { documentId: privateDoc.id } }), 0, 'level 1 keeps no text');
-    assert.ok((await db.documentVersion.findFirstOrThrow({ where: { documentId: privateDoc.id } })).charCount > 0);
-    const [privateCopy] = await copiesOf(privateDoc.id);
-    assert.equal(privateCopy.state, 'AVAILABLE', 'level 1 keeps the encrypted source for extraction, at most 30 days');
-
-    assert.equal((await parsed(level3, originalDoc.id)).status, 'SUCCEEDED');
+    assert.equal((await parsed(reader, originalDoc.id)).status, 'SUCCEEDED');
     assert.ok(await db.documentChunk.count({ where: { documentId: originalDoc.id } }) > 0);
     const [original] = await copiesOf(originalDoc.id);
     assert.equal(original.kind, 'ENCRYPTED_COPY');
     assert.equal(original.state, 'AVAILABLE');
-    assert.equal((await request(`/api/documents/${originalDoc.id}/original`, { token: level3.token })).status, 200);
-    assert.equal(await db.aIJob.count({ where: { documentId: { in: [pdfDoc.id, docxDoc.id, privateDoc.id, originalDoc.id] }, kind: 'PARSE', status: { not: 'SUCCEEDED' } } }), 0);
+    assert.equal((await request(`/api/documents/${originalDoc.id}/original`, { token: reader.token })).status, 200);
+    assert.equal(await db.aIJob.count({ where: { documentId: { in: [pdfDoc.id, docxDoc.id, originalDoc.id] }, kind: 'PARSE', status: { not: 'SUCCEEDED' } } }), 0);
   });
 
   test('B4: short notes and one-line PDFs are text, and emoji on a chunk boundary are stored intact', async () => {
@@ -469,12 +475,13 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
       assert.equal(done.problem, code, name);
       assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), 0);
       const [copy] = await copiesOf(doc.id);
-      await eventually(copyDeleted(copy.id), `${name}: an unusable temporary copy is not kept`);
+      assert.deepEqual([copy.kind, copy.state], ['ENCRYPTED_COPY', 'AVAILABLE'], `${name}: the original is kept even when its text cannot be read`);
+      assert.equal((await request(`/api/documents/${doc.id}/original`, { token: user.token })).status, 200);
     }
   });
 
   test('B4: a newer parser version re-reads files it could not read before, while the stored copy still exists', async () => {
-    const user = await createUser('parse-version', 'ENCRYPTED_COPY');
+    const user = await createUser('parse-version');
     const doc = (await upload(user, { name: 'scan-cu.pdf', data: textPdf([[]]) })).body.document;
     assert.equal((await parsed(user, doc.id)).status, 'UNSUPPORTED');
     const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: doc.id } });
@@ -517,7 +524,7 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
   });
 
   test('B4: a document that failed to parse while its file is still stored is retried by uploading the same file again', async () => {
-    const user = await createUser('parse-retry', 'ENCRYPTED_COPY');
+    const user = await createUser('parse-retry');
     const content = text();
     const doc = (await upload(user, { name: 'thu-lai.txt', data: content })).body.document;
     assert.equal((await parsed(user, doc.id)).status, 'SUCCEEDED');
@@ -575,29 +582,6 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     await db.fileCopy.update({ where: { id: copy.id }, data: { state: 'AVAILABLE' } });
   });
 
-  test('B4 review: uploading a lost file again keeps the document\'s own lower level (no encrypted original, no quota)', async () => {
-    const user = users.c;
-    const content = text();
-    const doc = (await upload(user, { name: 'muc-rieng.txt', data: content })).body.document;
-    assert.equal((await parsed(user, doc.id)).status, 'SUCCEEDED');
-    await db.document.update({ where: { id: doc.id }, data: { privacyLevel: 'STRUCTURED_ONLY' } });
-    const [original] = await copiesOf(doc.id);
-    await db.fileCopy.update({ where: { id: original.id }, data: { state: 'DELETE_PENDING', deleteRequestedAt: new Date() } });
-    await eventually(copyDeleted(original.id), 'the original is removed when the document goes to level 1');
-    await db.documentVersion.updateMany({ where: { documentId: doc.id }, data: { parseState: 'FAILED', parseErrorCode: 'SOURCE_UNAVAILABLE' } });
-    const before = (await request('/api/documents/usage', { token: user.token })).body.encryptedBytes;
-    const again = await upload(user, { name: 'muc-rieng.txt', data: content });
-    assert.equal(again.status, 201);
-    assert.equal(again.body.document.id, doc.id);
-    assert.equal(again.body.document.originalAvailable, false);
-    const revived = (await copiesOf(doc.id)).filter((copy) => copy.id !== original.id);
-    assert.equal(revived.length, 1);
-    assert.equal(revived[0].kind, 'WEB_SOURCE', 'a level-1 document never gets an encrypted original back');
-    assert.equal((await request('/api/documents/usage', { token: user.token })).body.encryptedBytes, before);
-    assert.equal((await parsed(user, doc.id)).status, 'SUCCEEDED');
-    assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), 0);
-  });
-
   test('the type comes from the bytes; size, emptiness and the multipart shape are enforced', async (t) => {
     const before = await documentCount(users.b);
     const invalid = [
@@ -639,7 +623,7 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal(junkFirst.body.document.file.name, 'no-extension.pdf');
   });
 
-  test('level 3 keeps an encrypted original that only its owner can download, byte for byte', async () => {
+  test('the encrypted original can be downloaded only by its owner, byte for byte', async () => {
     const content = pdf(200 * 1024);
     const name = 'Hợp đồng (bản ký) 05/2026.pdf';
     const result = await upload(users.c, { name, data: content, type: 'application/pdf' });
@@ -689,7 +673,7 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     const done = await parsed(user, result.body.document.id, 60_000);
     assert.equal(done.status, 'UNSUPPORTED');
     assert.equal(done.problem, 'FILE_DAMAGED');
-    await eventually(copyDeleted(copy.id), 'an unreadable temporary copy is not kept', 30_000);
+    assert.equal((await copiesOf(result.body.document.id))[0].state, 'AVAILABLE', 'the original is kept even when it cannot be read');
   });
 
   test('tampered ciphertext and swapped key references never yield plaintext', async () => {
@@ -725,11 +709,13 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
   });
 
   test('encrypted originals count against the quota, and usage is reported', async () => {
+    const filled = 63 * MiB;
+    const release = await ballast(users.d, filled);
     const accepted = await upload(users.d, { name: 'a.pdf', data: pdf(600 * 1024) });
     assert.equal(accepted.status, 201);
     const usage = await request('/api/documents/usage', { token: users.d.token });
     const [copy] = await copiesOf(accepted.body.document.id);
-    assert.deepEqual(usage.body, { encryptedBytes: Number(copy.byteSize), quotaBytes: MiB });
+    assert.deepEqual(usage.body, { encryptedBytes: filled + Number(copy.byteSize), quotaBytes: 64 * MiB });
     const before = await documentCount(users.d);
     const refused = await upload(users.d, { name: 'b.pdf', data: pdf(600 * 1024) });
     assert.equal(refused.status, 413);
@@ -741,8 +727,8 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal((await request(`/api/trash/${binned.id}/restore`, { method: 'POST', token: users.d.token })).status, 200);
     assert.equal(await documentCount(users.d), before);
     assert.equal((await upload(users.d, { name: 'small.txt', data: text() })).status, 201);
-    const level2 = await request('/api/documents/usage', { token: users.a.token });
-    assert.equal(level2.body.encryptedBytes, 0, 'temporary copies do not use the level-3 quota');
+    await release();
+    assert.equal((await upload(users.d, { name: 'b.pdf', data: pdf(600 * 1024) })).status, 201, 'room again once space is freed');
   });
 
   const trashOf = async (user) => (await request('/api/trash', { token: user.token })).body.items;
@@ -864,7 +850,7 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
   });
 
   test('trash: a folder goes in as one item and comes back with exactly what went in with it; earlier deletes stay in the trash, like Windows', async () => {
-    const user = await createUser('trash-folders', 'ENCRYPTED_COPY');
+    const user = await createUser('trash-folders');
     const folder = async (name, parentId = null) => (await request('/api/folders', { method: 'POST', token: user.token, body: { name, parentId } })).body.folder.id;
     const put = async (folderId, name) => {
       const form = new FormData();
@@ -956,7 +942,7 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
   });
 
   test('trash: permanent delete removes every row and stored file; expired items and "empty trash" go the same way', async () => {
-    const user = await createUser('trash-purge', 'ENCRYPTED_COPY');
+    const user = await createUser('trash-purge');
     const body = text();
     const first = (await upload(user, { name: 'xoa-han.txt', data: body })).body.document;
     assert.equal((await parsed(user, first.id)).status, 'SUCCEEDED');
@@ -1066,7 +1052,7 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
   });
 
   test('duplicates: the server is asked first by hash, and an upload carries the choice: new, supplement the original, or nothing', async () => {
-    const user = await createUser('duplicates', 'ENCRYPTED_COPY');
+    const user = await createUser('duplicates');
     users.dup = user;
     const folder = async (name) => (await request('/api/folders', { method: 'POST', token: user.token, body: { name } })).body.folder.id;
     const here = await folder('Hợp đồng');
@@ -1291,18 +1277,17 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal((await request(`/api/documents/${doc}/original`, { method: 'DELETE', token: user.token })).status, 202);
     const item = (await trashOf(user)).find((entry) => entry.kind === 'ORIGINAL');
     assert.equal((await request(`/api/trash/${item.id}`, { method: 'DELETE', token: user.token })).status, 204);
-    for (const name of ['day-1.txt', 'day-2.txt']) {
-      const filler = Buffer.concat([text(), randomBytes(330 * 1024).map((byte) => 97 + (byte % 26))]);
-      assert.equal((await upload(user, { name, data: filler })).status, 201);
-    }
+    const used = (await request('/api/documents/usage', { token: user.token })).body;
+    const release = await ballast(user, used.quotaBytes - used.encryptedBytes - 100 * 1024);
     const full = await upload(user, { name: 'lon.txt', data: body });
+    await release();
     assert.equal(full.status, 413, 'supplementing an original needs room in the quota');
     const after = (await request(`/api/documents/${doc}`, { token: user.token })).body;
     assert.deepEqual([after.status, after.originalAvailable, after.problem], ['SUCCEEDED', false, null], 'the document is not turned into a failed one');
     assert.equal(await db.fileCopy.count({ where: { documentId: doc, state: { in: ['UPLOADING', 'AVAILABLE'] } } }), 0);
   });
 
-  test('DOCX preview: level 3 owners get escaped HTML under a sandbox policy; other files, levels and users get 404', async () => {
+  test('DOCX preview: owners get escaped HTML under a sandbox policy; other files and users get 404', async () => {
     const docx = (await upload(users.c, { name: 'xem-truoc.docx', data: docxWith(['Hợp đồng thuê nhà', '&lt;script&gt;alert(1)&lt;/script&gt;', randomUUID()]) })).body.document;
     const preview = await request(`/api/documents/${docx.id}/preview`, { token: users.c.token });
     assert.equal(preview.status, 200);
@@ -1316,24 +1301,17 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal((await request(`/api/documents/${docx.id}/preview`, { token: users.a.token })).status, 404, 'other users');
     const txt = (await upload(users.c, { name: 'khong-phai-docx.txt', data: text() })).body.document;
     assert.equal((await request(`/api/documents/${txt.id}/preview`, { token: users.c.token })).status, 404, 'only DOCX');
-    const level2 = (await upload(users.a, { name: 'muc-2.docx', data: docxWith(['Mức 2', randomUUID()]) })).body.document;
-    assert.equal((await request(`/api/documents/${level2.id}/preview`, { token: users.a.token })).status, 404, 'no original below level 3');
     const broken = (await upload(users.c, { name: 'hong.docx', data: brokenDocx() })).body.document;
     assert.equal((await request(`/api/documents/${broken.id}/preview`, { token: users.c.token })).status, 422);
   });
 
-  test('housekeeping: expired temporary copies and abandoned uploads are cleaned up', async () => {
+  test('housekeeping: abandoned uploads are cleaned up', async () => {
     const user = await createUser('housekeeping');
-    const doc = (await upload(user, { name: 'tam.txt', data: text() })).body.document;
-    const [temporary] = await copiesOf(doc.id);
-    await db.fileCopy.update({ where: { id: temporary.id }, data: { expiresAt: new Date(Date.now() - 1_000) } });
-    await eventually(copyDeleted(temporary.id), 'expired WEB_SOURCE should be deleted');
-    assert.equal(await objectExists(temporary.storageKey), false);
     const abandoned = await db.document.create({ data: { userId: user.id, title: 'Bỏ dở', source: 'WEB_UPLOAD' } });
     const version = await db.documentVersion.create({ data: { userId: user.id, documentId: abandoned.id, number: 1, sha256: sha256('x'), byteSize: 1n, mimeType: 'text/plain', originalFilename: 'bo-do.txt', source: 'WEB_UPLOAD' } });
-    const key = `web-source/${user.id}/${randomUUID()}`;
+    const key = `encrypted/${user.id}/${randomUUID()}`;
     await storage.send(new S3.PutObjectCommand({ Bucket: s3.bucket, Key: key, Body: Buffer.from('partial') }));
-    await db.fileCopy.create({ data: { userId: user.id, documentId: abandoned.id, versionId: version.id, kind: 'WEB_SOURCE', state: 'UPLOADING', storageKey: key, contentType: 'application/octet-stream', byteSize: 7n, encryptionKeyRef: 'w1.it.x', createdAt: new Date(Date.now() - 2 * 3_600_000) } });
+    await db.fileCopy.create({ data: { userId: user.id, documentId: abandoned.id, versionId: version.id, kind: 'ENCRYPTED_COPY', state: 'UPLOADING', storageKey: key, contentType: 'application/octet-stream', byteSize: 7n, encryptionKeyRef: 'w1.it.x', createdAt: new Date(Date.now() - 2 * 3_600_000) } });
     await eventually(async () => (await db.document.count({ where: { id: abandoned.id } })) === 0, 'abandoned upload should be swept');
     assert.equal(await objectExists(key), false);
   });
@@ -1392,7 +1370,7 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
   });
 
   test('B5 filters: by file type, paginated and only for the owner; there is no status filter', async () => {
-    const user = await createUser('filters', 'ENCRYPTED_COPY');
+    const user = await createUser('filters');
     const ids = {};
     for (const [key, file] of [
       ['pdf', { name: 'doc.pdf', data: textPdf([[`Hop dong ${randomUUID()}`]]) }],
@@ -1428,7 +1406,7 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
   });
 
   test('folders: create, rename and move keep sibling names unique, the tree within 5 levels, and stay per user', async () => {
-    const user = await createUser('folders', 'ENCRYPTED_COPY');
+    const user = await createUser('folders');
     users.f = user;
     const api = (path, method, body, token = user.token) => request(`/api/folders${path}`, { method, token, body });
     assert.equal((await request('/api/folders')).status, 401);

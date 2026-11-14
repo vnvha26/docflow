@@ -17,7 +17,7 @@ before(async () => {
   db = new PGlite();
   const dirs = (await readdir(MIGRATIONS, { withFileTypes: true }))
     .filter((d) => d.isDirectory()).map((d) => d.name).sort();
-  assert.equal(dirs.length, 12);
+  assert.equal(dirs.length, 13);
   for (const dir of dirs) await db.exec(await readFile(new URL(`${dir}/migration.sql`, MIGRATIONS), 'utf8'));
   await db.exec(`INSERT INTO "DocumentType" ("code","name","pathTemplate","fieldSchema")
                  VALUES ('RENTAL_CONTRACT','Hợp đồng thuê nhà','Hợp đồng/Thuê nhà/{year}','{"type":"object"}')`);
@@ -80,14 +80,11 @@ test('migrations create the 20 CP1 tables including email challenges and folders
   assert.equal(count, 21);
 });
 
-test('accounts default to level 3 (ENCRYPTED_COPY)', async () => {
-  const row = await one(`INSERT INTO "User" ("email","passwordHash") VALUES ('default@example.com','x') RETURNING "privacyLevel"`);
-  assert.equal(row.privacyLevel, 'ENCRYPTED_COPY');
-});
-
-test('privacy enum is ordered so LEAST() gives the effective level', async () => {
-  const row = await one(`SELECT LEAST('ENCRYPTED_COPY'::"PrivacyLevel", 'STRUCTURED_ONLY', 'TEXT_AND_EMBEDDINGS') AS level`);
-  assert.equal(row.level, 'STRUCTURED_ONLY');
+test('storage levels are gone: accounts and documents have no privacy level, and the enum no longer exists', async () => {
+  const columns = await db.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND column_name = 'privacyLevel'`);
+  assert.equal(columns.rows.length, 0);
+  const types = await db.query(`SELECT 1 FROM pg_type WHERE typname = 'PrivacyLevel'`);
+  assert.equal(types.rows.length, 0);
 });
 
 // Auth data must be valid even when written outside the HTTP API.

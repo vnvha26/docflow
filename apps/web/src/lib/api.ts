@@ -3,7 +3,6 @@ export interface User {
   email: string;
   displayName: string | null;
   timezone: string;
-  privacyLevel: 'STRUCTURED_ONLY' | 'TEXT_AND_EMBEDDINGS' | 'ENCRYPTED_COPY';
 }
 
 interface SessionResponse {

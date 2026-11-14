@@ -12,9 +12,8 @@ const accountSchema = {
   properties: {
     id: { type: 'string', format: 'uuid' }, email: { type: 'string', format: 'email' },
     displayName: { type: 'string', nullable: true }, timezone: { type: 'string', example: 'Asia/Ho_Chi_Minh' },
-    privacyLevel: { type: 'string', enum: ['STRUCTURED_ONLY', 'TEXT_AND_EMBEDDINGS', 'ENCRYPTED_COPY'] },
   },
-  required: ['id', 'email', 'displayName', 'timezone', 'privacyLevel'],
+  required: ['id', 'email', 'displayName', 'timezone'],
 };
 
 @ApiTags('Account')

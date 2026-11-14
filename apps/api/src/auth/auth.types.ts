@@ -1,12 +1,10 @@
 import { Request } from 'express';
-import { PrivacyLevel } from '@prisma/client';
 
 export interface PublicUser {
   id: string;
   email: string;
   displayName: string | null;
   timezone: string;
-  privacyLevel: PrivacyLevel;
 }
 
 export const PUBLIC_USER_SELECT = {
@@ -14,7 +12,6 @@ export const PUBLIC_USER_SELECT = {
   email: true,
   displayName: true,
   timezone: true,
-  privacyLevel: true,
 } as const;
 
 export interface AccessClaims {

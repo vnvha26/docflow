@@ -3,7 +3,7 @@ import { JobKind } from '@prisma/client';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { API_CONFIG, ApiConfig } from '../config';
 import { ClaimedJob, JobQueue } from '../jobs/job-queue.service';
-import { PrivacyPolicyChangedError, RetentionService } from '../retention/retention.service';
+import { DocumentUnavailableError, RetentionService } from '../retention/retention.service';
 import { MaintenanceService } from '../retention/maintenance.service';
 import { ParseService } from '../parsing/parse.service';
 
@@ -46,7 +46,7 @@ export class WorkerRunner {
       await handler(job);
       await this.jobs.complete(job);
     } catch (error) {
-      const code = error instanceof PrivacyPolicyChangedError ? 'POLICY_CHANGED'
+      const code = error instanceof DocumentUnavailableError ? 'DOCUMENT_UNAVAILABLE'
         : error instanceof Error && /^[A-Z_]{3,64}$/.test(error.message) ? error.message : 'HANDLER_FAILED';
       const outcome = await this.jobs.fail(job, code).catch(() => 'lost' as const);
       if (outcome !== 'retry') this.logger.warn(`Job ${job.kind} ${job.id}: ${code} (${outcome}).`);
