@@ -2,7 +2,7 @@ import {
   ConflictException, HttpException, HttpStatus, Inject, Injectable, Logger, NotFoundException,
   ServiceUnavailableException, UnprocessableEntityException, UnsupportedMediaTypeException,
 } from '@nestjs/common';
-import { FileCopyKind, ParseState, Prisma, PrivacyLevel } from '@prisma/client';
+import { ParseState, Prisma } from '@prisma/client';
 import { createHash, randomUUID } from 'node:crypto';
 import { Readable, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -21,7 +21,6 @@ import { ObjectStorage, storageKey } from '../storage/object-storage';
 import { cleanTitle, downloadName, sanitizeFileName, titleFromFileName } from './file-name';
 import { Candidate, classifyDuplicates, DuplicateCheck, rankCandidates } from './duplicates';
 import { detectFileType } from './file-type';
-import { effectivePrivacy } from './privacy';
 import {
   DocumentChange, DocumentFilters, DocumentSort, DocumentSummary, DocumentTypeFilter, MAX_UPLOAD_BYTES, RenameResult, StorageUsage,
   TOO_LARGE_MESSAGE, UNFILED, UploadResult,
@@ -40,19 +39,18 @@ const PREVIEW_LIMITS = { timeoutMs: 60_000, memoryMb: 512 };
 const UPLOAD_IN_PROGRESS ='Một bản giống hệt tệp này đang được tải lên. Vui lòng thử lại sau ít giây.';
 
 interface Found extends Candidate {
-  versionId: string; documentLevel: PrivacyLevel | null; inFlight: boolean; retryable: boolean;
+  versionId: string; inFlight: boolean; retryable: boolean;
   previous: { parseState: ParseState; parseErrorCode: string | null };
 }
 interface Reserved {
-  kind: FileCopyKind; key: string; documentId: string; versionId: string; revived: boolean; renamed: boolean;
+  key: string; documentId: string; versionId: string; revived: boolean; renamed: boolean;
   previous: Found['previous'] | null;
 }
 interface Blocked { conflict: DuplicateCheck; documentId: string; retryVersionId: string | null }
 type Plan = Blocked | Reserved;
 export interface UploadDecision { mode: 'new' | 'supplement'; targetId?: string }
 const SUMMARY_SELECT = {
-  id: true, title: true, createdAt: true, updatedAt: true, typeCode: true, privacyLevel: true, folderId: true, originalTrashedAt: true,
-  user: { select: { privacyLevel: true } },
+  id: true, title: true, createdAt: true, updatedAt: true, typeCode: true, folderId: true, originalTrashedAt: true,
   versions: {
     orderBy: { number: 'desc' }, take: 1,
     select: { id: true, originalFilename: true, mimeType: true, byteSize: true, parseState: true, parseErrorCode: true, pageCount: true, updatedAt: true },
@@ -64,20 +62,17 @@ type SummaryRow = Prisma.DocumentGetPayload<{ select: typeof SUMMARY_SELECT }>;
 
 function toSummary(row: SummaryRow): DocumentSummary {
   const version = row.versions[0];
-  const privacyLevel = effectivePrivacy(row.user.privacyLevel, row.privacyLevel);
-  const textRemoved = row.privacyLevel === 'STRUCTURED_ONLY';
   const originalInTrash = row.originalTrashedAt !== null;
   return {
     id: row.id, title: row.title, createdAt: row.createdAt, typeCode: row.typeCode, folderId: row.folderId,
     status: version.parseState,
-    problem: !textRemoved && (version.parseState === 'FAILED' || version.parseState === 'UNSUPPORTED') ? version.parseErrorCode : null,
+    problem: version.parseState === 'FAILED' || version.parseState === 'UNSUPPORTED' ? version.parseErrorCode : null,
     file: { name: version.originalFilename, mimeType: version.mimeType, byteSize: Number(version.byteSize) },
-    originalAvailable: !originalInTrash && privacyLevel === 'ENCRYPTED_COPY'
-      && row.fileCopies.some((copy) => copy.versionId === version.id && copy.state === 'AVAILABLE'),
+    originalAvailable: !originalInTrash && row.fileCopies.some((copy) => copy.versionId === version.id && copy.state === 'AVAILABLE'),
     originalDeleting: row.fileCopies.some((copy) => copy.versionId === version.id && copy.state === 'DELETE_PENDING'),
     updatedAt: row.updatedAt > version.updatedAt ? row.updatedAt : version.updatedAt,
     pageCount: version.pageCount,
-    summary: privacyLevel === 'STRUCTURED_ONLY' ? null : row.extractedMetadata[0]?.summary ?? null,
+    summary: row.extractedMetadata[0]?.summary ?? null,
     originalInTrash,
   };
 }
@@ -175,8 +170,8 @@ export class DocumentsService {
       select: {
         id: true, documentId: true, parseState: true, parseErrorCode: true, createdAt: true,
         document: { select: {
-          title: true, folderId: true, privacyLevel: true, deletedAt: true, originalTrashedAt: true, trashedById: true,
-          user: { select: { privacyLevel: true } }, trashItems: { select: { id: true, kind: true } },
+          title: true, folderId: true, deletedAt: true, originalTrashedAt: true, trashedById: true,
+          trashItems: { select: { id: true, kind: true } },
         } },
         fileCopies: { where: { state: { in: [...LIVE] } }, select: { state: true, kind: true } },
       },
@@ -214,14 +209,11 @@ export class DocumentsService {
         state = 'original-trashed';
         trashId = item('ORIGINAL');
       } else {
-        const level = effectivePrivacy(document.user.privacyLevel, document.privacyLevel);
-        const lacksOriginal = (level === 'ENCRYPTED_COPY' && !fileCopies.some((copy) => copy.kind === 'ENCRYPTED_COPY'))
-          || (version.parseState === 'FAILED' && fileCopies.length === 0);
-        state = lacksOriginal ? 'no-original' : 'full';
+        state = fileCopies.some((copy) => copy.kind === 'ENCRYPTED_COPY') ? 'full' : 'no-original';
       }
       found.push({
         documentId: version.documentId, versionId: version.id, title: document.title, folderId: document.folderId, location: label(document.folderId),
-        state, trashId, trashFolder, createdAt: version.createdAt, documentLevel: document.privacyLevel,
+        state, trashId, trashFolder, createdAt: version.createdAt,
         inFlight: !document.deletedAt && fileCopies.some((copy) => copy.state === 'UPLOADING'),
         retryable: !document.deletedAt && version.parseState === 'FAILED' && fileCopies.some((copy) => copy.state === 'AVAILABLE'),
         previous: { parseState: version.parseState, parseErrorCode: version.parseErrorCode },
@@ -360,12 +352,8 @@ export class DocumentsService {
       if (conflict.situation !== 'auto-supplement') return blocked();
       duplicate = first;
     }
-    const user = await transaction.user.findUnique({ where: { id: userId }, select: { privacyLevel: true } });
-    if (!user) throw new NotFoundException('Không tìm thấy tài khoản.');
-    const level = effectivePrivacy(user.privacyLevel, duplicate?.documentLevel ?? null);
-    const kind: FileCopyKind = level === 'ENCRYPTED_COPY' ? 'ENCRYPTED_COPY' : 'WEB_SOURCE';
-    if (kind === 'ENCRYPTED_COPY') await this.checkQuota(transaction, userId, storedBytes);
-    const key = storageKey(kind === 'ENCRYPTED_COPY' ? 'encrypted' : 'web-source', userId, copyId);
+    await this.checkQuota(transaction, userId, storedBytes);
+    const key = storageKey('encrypted', userId, copyId);
     const target = duplicate
       ? { documentId: duplicate.documentId, versionId: duplicate.versionId }
       : { documentId, versionId };
@@ -387,12 +375,11 @@ export class DocumentsService {
     }
     await transaction.fileCopy.create({
       data: {
-        id: copyId, userId, documentId: target.documentId, versionId: target.versionId, kind, state: 'UPLOADING', storageKey: key,
+        id: copyId, userId, documentId: target.documentId, versionId: target.versionId, kind: 'ENCRYPTED_COPY', state: 'UPLOADING', storageKey: key,
         contentType: 'application/octet-stream', byteSize: BigInt(storedBytes), encryptionKeyRef: keyRef,
-        expiresAt: kind === 'WEB_SOURCE' ? new Date(Date.now() + this.config.files.webSourceTtlMs) : null,
       },
     });
-    return { kind, key, ...target, revived: Boolean(duplicate), renamed, previous: duplicate?.previous ?? null };
+    return { key, ...target, revived: Boolean(duplicate), renamed, previous: duplicate?.previous ?? null };
   }
 
   private async assertFolder(transaction: Prisma.TransactionClient, userId: string, folderId: string | null): Promise<void> {
@@ -427,7 +414,7 @@ export class DocumentsService {
     const quota = this.config.files.encryptedQuotaBytes;
     if (used + incoming > quota) {
       throw fieldError('file',
-        `Vượt hạn mức lưu bản gốc: đã dùng ${formatBytes(used)} / ${formatBytes(quota)}. Tệp trong thùng rác vẫn tính vào hạn mức: hãy dọn thùng rác, xóa vĩnh viễn bản gốc không cần nữa hoặc chọn mức lưu trữ thấp hơn.`,
+        `Vượt hạn mức lưu bản gốc: đã dùng ${formatBytes(used)} / ${formatBytes(quota)}. Tệp trong thùng rác vẫn tính vào hạn mức: hãy dọn thùng rác hoặc xóa vĩnh viễn bản gốc không cần nữa.`,
         HttpStatus.PAYLOAD_TOO_LARGE);
     }
   }
@@ -523,13 +510,12 @@ export class DocumentsService {
     const row = await this.prisma.document.findFirst({
       where: { id: documentId, userId, deletedAt: null },
       select: {
-        title: true, privacyLevel: true, originalTrashedAt: true, user: { select: { privacyLevel: true } },
+        title: true, originalTrashedAt: true,
         versions: { orderBy: { number: 'desc' }, take: 1, select: { id: true, originalFilename: true, mimeType: true, byteSize: true } },
       },
     });
     const version = row?.versions[0];
-    const level: PrivacyLevel | null = row ? effectivePrivacy(row.user.privacyLevel, row.privacyLevel) : null;
-    const copy = version && level === 'ENCRYPTED_COPY' && !row?.originalTrashedAt
+    const copy = version && !row?.originalTrashedAt
       ? await this.prisma.fileCopy.findFirst({
         where: { userId, documentId, versionId: version.id, kind: 'ENCRYPTED_COPY', state: 'AVAILABLE' },
         select: { id: true, storageKey: true, encryptionKeyRef: true },

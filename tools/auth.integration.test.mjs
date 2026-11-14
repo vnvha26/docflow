@@ -315,7 +315,7 @@ describe('auth over HTTP with PostgreSQL and local SMTP delivery', {
     assertChallenge(pendingRegistration, 202, email);
     assertAuthResult(registration);
     assert.equal(registration.body.user.displayName, 'Integration Owner');
-    assert.equal(registration.body.user.privacyLevel, 'ENCRYPTED_COPY', 'new accounts start at level 3');
+    assert.equal(registration.body.user.privacyLevel, undefined, 'accounts have no storage level');
     assert.equal(await db.user.count({ where: { email } }), 1);
     const user = await db.user.findUniqueOrThrow({ where: { email } });
     assert.ok(user.emailVerifiedAt);
@@ -856,7 +856,7 @@ describe('auth over HTTP with PostgreSQL and local SMTP delivery', {
         ['UTC offset', { timezone: '+07:00' }, 'timezone'],
         ['unknown zone', { timezone: 'Mars/Olympus_Mons' }, 'timezone'],
         ['null zone', { timezone: null }, 'timezone'],
-        ['the storage level is not editable', { privacyLevel: 'ENCRYPTED_COPY' }, 'privacyLevel'],
+        ['there is no storage level to set', { privacyLevel: 'ENCRYPTED_COPY' }, 'privacyLevel'],
         ['email is not editable', { email: 'someone@example.test' }, 'email'],
       ];
       for (const [label, body, field] of cases) {

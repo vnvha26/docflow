@@ -116,7 +116,7 @@ export class JobQueue {
         ...(where.documentId ? { documentId: where.documentId } : {}),
         ...(where.documentIds ? { documentId: { in: where.documentIds } } : {}),
       },
-      data: { status: 'CANCELLED', finishedAt: new Date(), leaseOwner: null, leaseUntil: null, lastErrorCode: 'POLICY_CHANGED' },
+      data: { status: 'CANCELLED', finishedAt: new Date(), leaseOwner: null, leaseUntil: null, lastErrorCode: 'CANCELLED' },
     });
     return result.count;
   }

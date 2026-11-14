@@ -7,12 +7,6 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-enum PrivacyLevel {
-  STRUCTURED_ONLY
-  TEXT_AND_EMBEDDINGS
-  ENCRYPTED_COPY
-}
-
 enum TrashKind {
   DOCUMENT
   FOLDER
@@ -137,7 +131,6 @@ model User {
   displayName        String?            @db.VarChar(100)
   timezone           String             @default("Asia/Ho_Chi_Minh") @db.VarChar(64)
   locale             String             @default("vi") @db.VarChar(16)
-  privacyLevel       PrivacyLevel       @default(ENCRYPTED_COPY)
   notificationDetail NotificationDetail @default(MINIMAL)
   revision           BigInt             @default(1)
   createdAt          DateTime           @default(now()) @db.Timestamptz(3)
@@ -226,7 +219,6 @@ model Document {
   source       DocumentSource
   typeCode     String?        @db.VarChar(64)
   folderId     String?        @db.Uuid
-  privacyLevel PrivacyLevel?
   deletedAt    DateTime?      @db.Timestamptz(3)
   purgedAt     DateTime?      @db.Timestamptz(3)
   originalTrashedAt DateTime? @db.Timestamptz(3)

@@ -12,7 +12,7 @@ export class ObjectNotFoundError extends Error {
 
 const SAFE_SEGMENT = /^[a-z0-9][a-z0-9-]*$/;
 
-export function storageKey(kind: 'web-source' | 'encrypted', userId: string, copyId: string): string {
+export function storageKey(kind: 'encrypted', userId: string, copyId: string): string {
   for (const part of [userId, copyId]) if (!SAFE_SEGMENT.test(part)) throw new Error('Unsafe storage key segment.');
   return `${kind}/${userId}/${copyId}`;
 }

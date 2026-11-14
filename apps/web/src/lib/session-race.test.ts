@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { AuthClient } from './api.ts';
 import type { Exclusive, User } from './api.ts';
 
-const user: User = { id: 'u-1', email: 'ban@example.com', displayName: null, timezone: 'Asia/Ho_Chi_Minh', privacyLevel: 'TEXT_AND_EMBEDDINGS' };
+const user: User = { id: 'u-1', email: 'ban@example.com', displayName: null, timezone: 'Asia/Ho_Chi_Minh' };
 
 /** Same-origin lock shared by every "tab", like navigator.locks. */
 function sharedLock(): Exclusive {

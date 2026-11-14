@@ -17,9 +17,8 @@ const userSchema = {
   properties: {
     id: { type: 'string', format: 'uuid' }, email: { type: 'string', format: 'email' },
     displayName: { type: 'string', nullable: true }, timezone: { type: 'string' },
-    privacyLevel: { type: 'string', enum: ['STRUCTURED_ONLY', 'TEXT_AND_EMBEDDINGS', 'ENCRYPTED_COPY'] },
   },
-  required: ['id', 'email', 'displayName', 'timezone', 'privacyLevel'],
+  required: ['id', 'email', 'displayName', 'timezone'],
 };
 const authSchema = {
   type: 'object',

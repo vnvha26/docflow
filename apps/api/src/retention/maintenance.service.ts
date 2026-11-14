@@ -20,14 +20,6 @@ export class MaintenanceService {
     @Inject(TrashService) private readonly trash: TrashService,
   ) {}
 
-  async expireTemporaryCopies(): Promise<number> {
-    const result = await this.prisma.fileCopy.updateMany({
-      where: { kind: 'WEB_SOURCE', state: 'AVAILABLE', expiresAt: { lt: new Date() } },
-      data: { state: 'DELETE_PENDING', deleteRequestedAt: new Date(), revision: { increment: 1 } },
-    });
-    return result.count;
-  }
-
   async sweepAbandonedUploads(): Promise<number> {
     const stale = await this.prisma.fileCopy.findMany({
       where: { state: 'UPLOADING', createdAt: { lt: new Date(Date.now() - ABANDONED_UPLOAD_MS) } },
@@ -131,14 +123,13 @@ export class MaintenanceService {
     return rewrapped;
   }
 
-  async runOnce(): Promise<{ expired: number; trashPurged: number; deleted: number; removed: number; abandoned: number; rewrapped: number; parseQueued: number; parseFailed: number }> {
-    const expired = await this.expireTemporaryCopies();
+  async runOnce(): Promise<{ trashPurged: number; deleted: number; removed: number; abandoned: number; rewrapped: number; parseQueued: number; parseFailed: number }> {
     const trashPurged = await this.trash.purgeExpired();
     const { deleted } = await this.retention.deletePendingBlobs();
     const removed = await this.retention.sweepPurged();
     const abandoned = await this.sweepAbandonedUploads();
     const rewrapped = await this.rewrapKeys();
     const parse = await this.resumeParsing();
-    return { expired, trashPurged, deleted, removed, abandoned, rewrapped, parseQueued: parse.queued, parseFailed: parse.failed };
+    return { trashPurged, deleted, removed, abandoned, rewrapped, parseQueued: parse.queued, parseFailed: parse.failed };
   }
 }
