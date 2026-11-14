@@ -9,6 +9,7 @@ export interface DuplicateMatch {
   state: MatchState;
   sameFolder: boolean;
   trashId: string | null;
+  trashFolder?: string | null;
 }
 
 export interface DuplicateCheck {
@@ -30,7 +31,7 @@ export function defaultChoice(check: Pick<DuplicateCheck, 'options'>): Duplicate
 export function choiceLabel(choice: DuplicateChoice, check: Pick<DuplicateCheck, 'primary'>): string {
   const primary = check.primary;
   if (choice === 'skip') return 'Không tải';
-  if (choice === 'restore') return 'Khôi phục từ thùng rác';
+  if (choice === 'restore') return primary?.trashFolder ? `Khôi phục thư mục ${quoted(primary.trashFolder)} từ thùng rác` : 'Khôi phục từ thùng rác';
   if (choice === 'supplement') return primary ? `Bổ sung bản gốc cho ${quoted(primary.title)} ở ${placeOf(primary)}` : 'Bổ sung bản gốc';
   return primary?.state === 'no-original' ? 'Tải mới vào đây' : 'Tải mới';
 }
@@ -39,7 +40,9 @@ export function situationText(check: Pick<DuplicateCheck, 'primary' | 'matches'>
   const primary = check.primary;
   if (!primary) return '';
   const where = primary.sameFolder ? 'ngay trong thư mục này' : `ở ${placeOf(primary)}`;
-  const main = primary.state === 'trashed' ? `Tài liệu ${quoted(primary.title)} có cùng nội dung đang nằm trong thùng rác (vị trí cũ: ${placeOf(primary)}).`
+  const main = primary.state === 'trashed' && primary.trashFolder
+    ? `Tài liệu ${quoted(primary.title)} có cùng nội dung nằm trong thư mục ${quoted(primary.trashFolder)} đang ở thùng rác; khôi phục sẽ trả lại cả thư mục đó.`
+    : primary.state === 'trashed' ? `Tài liệu ${quoted(primary.title)} có cùng nội dung đang nằm trong thùng rác (vị trí cũ: ${placeOf(primary)}).`
     : primary.state === 'original-trashed' ? `Bản gốc của ${quoted(primary.title)} (${where}) đang nằm trong thùng rác.`
       : primary.state === 'no-original' ? `Tài liệu ${quoted(primary.title)} ${where} có cùng nội dung nhưng không còn bản gốc.`
         : `Tệp này đã có: ${quoted(primary.title)} ${where}.`;
