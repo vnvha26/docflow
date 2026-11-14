@@ -89,12 +89,16 @@ export class MaintenanceService {
         AND NOT EXISTS (SELECT 1 FROM "FileCopy" c WHERE c."versionId" = v."id" AND c."state" IN ('UPLOADING', 'AVAILABLE'))`;
     const queued = await this.prisma.$executeRaw`
       INSERT INTO "AIJob" ("userId", "kind", "documentId", "versionId", "idempotencyKey", "maxAttempts", "updatedAt")
-      SELECT v."userId", 'PARSE', v."documentId", v."id", 'parse:' || v."id" || ':' || c."id" || ':' || ${PARSER_VERSION}, 3, now()
+      SELECT v."userId", 'PARSE', v."documentId", v."id",
+        'parse:' || v."id" || ':' || c."id" || ':' || ${PARSER_VERSION} || CASE WHEN n."total" = 0 THEN '' ELSE ':r' || n."total"::text END, 3, now()
       FROM "DocumentVersion" v
       JOIN "Document" d ON d."id" = v."documentId" AND d."deletedAt" IS NULL
       JOIN LATERAL (
         SELECT "id" FROM "FileCopy" WHERE "versionId" = v."id" AND "state" = 'AVAILABLE' ORDER BY "createdAt" DESC LIMIT 1
       ) c ON true
+      JOIN LATERAL (
+        SELECT count(*) AS "total" FROM "AIJob" a WHERE a."versionId" = v."id" AND a."kind" = 'PARSE'
+      ) n ON true
       WHERE v."parseState" = 'PENDING'
         AND NOT EXISTS (
           SELECT 1 FROM "AIJob" a WHERE a."versionId" = v."id" AND a."kind" = 'PARSE' AND a."status" IN ('QUEUED', 'RUNNING', 'FAILED'))
@@ -127,13 +131,14 @@ export class MaintenanceService {
     return rewrapped;
   }
 
-  async runOnce(): Promise<{ expired: number; trashPurged: number; deleted: number; abandoned: number; rewrapped: number; parseQueued: number; parseFailed: number }> {
+  async runOnce(): Promise<{ expired: number; trashPurged: number; deleted: number; removed: number; abandoned: number; rewrapped: number; parseQueued: number; parseFailed: number }> {
     const expired = await this.expireTemporaryCopies();
     const trashPurged = await this.trash.purgeExpired();
     const { deleted } = await this.retention.deletePendingBlobs();
+    const removed = await this.retention.sweepPurged();
     const abandoned = await this.sweepAbandonedUploads();
     const rewrapped = await this.rewrapKeys();
     const parse = await this.resumeParsing();
-    return { expired, trashPurged, deleted, abandoned, rewrapped, parseQueued: parse.queued, parseFailed: parse.failed };
+    return { expired, trashPurged, deleted, removed, abandoned, rewrapped, parseQueued: parse.queued, parseFailed: parse.failed };
   }
 }

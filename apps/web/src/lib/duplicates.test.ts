@@ -26,6 +26,9 @@ test('each situation is described with the document and where it is', () => {
   assert.match(situationText(check(match({ state: 'no-original', sameFolder: false }), ['supplement', 'new', 'skip'])), /không còn bản gốc\.$/);
   assert.match(situationText(check(match({ state: 'trashed', trashId: 't1' }), ['restore', 'new', 'skip'])), /đang nằm trong thùng rác \(vị trí cũ: “Nhà › Hợp đồng”\)\.$/);
   assert.match(situationText(check(match({ state: 'original-trashed', trashId: 't1' }), ['restore', 'new', 'skip'])), /^Bản gốc của “Hợp đồng thuê nhà” \(ngay trong thư mục này\)/);
+  const inFolder = check(match({ state: 'trashed', trashId: 't9', trashFolder: 'Nhà cũ' }), ['restore', 'new', 'skip']);
+  assert.equal(situationText(inFolder), 'Tài liệu “Hợp đồng thuê nhà” có cùng nội dung nằm trong thư mục “Nhà cũ” đang ở thùng rác; khôi phục sẽ trả lại cả thư mục đó.');
+  assert.equal(choiceLabel('restore', inFolder), 'Khôi phục thư mục “Nhà cũ” từ thùng rác');
   const several = check(match(), ['new', 'skip'], [match({ documentId: 'd2', title: 'Bản sao', location: null }), match({ documentId: 'd3', title: 'Cũ', state: 'trashed' })]);
   assert.match(situationText(several), /Cũng có ở: “Bản sao” \(Chưa phân loại\), “Cũ” \(thùng rác\)\.$/);
 });

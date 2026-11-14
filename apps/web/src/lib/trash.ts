@@ -22,6 +22,7 @@ export interface RestoreResult {
   moved: boolean;
   folderId: string | null;
   location: string | null;
+  inTrash?: boolean;
 }
 
 export const TRASH_DAYS = 30;
@@ -58,12 +59,16 @@ export function locationLabel(entry: Pick<TrashEntry, 'kind' | 'location'>): str
 }
 
 export function restoreMessage(result: RestoreResult): string {
-  if (result.kind === 'ORIGINAL') return `Đã khôi phục bản gốc của ${quoted(result.name)}; xem và tải lại được ngay.`;
+  if (result.kind === 'ORIGINAL') {
+    return result.inTrash
+      ? `Đã khôi phục bản gốc của ${quoted(result.name)}, nhưng tài liệu này vẫn đang nằm trong thùng rác; hãy khôi phục cả tài liệu để xem được.`
+      : `Đã khôi phục bản gốc của ${quoted(result.name)}; xem và tải lại được ngay.`;
+  }
   const what = result.kind === 'FOLDER' ? 'thư mục' : 'tài liệu';
   const place = result.location ? quoted(result.location) : result.kind === 'FOLDER' ? 'cấp ngoài cùng' : quoted('Chưa phân loại');
   const where = result.moved ? `Thư mục cũ không còn nên ${what} được đưa về ${place}` : `Đã khôi phục ${what} về ${place}`;
   const name = result.renamed ? `, lưu với tên ${quoted(result.name)} vì ở đó đã có tên trùng` : '';
-  return result.moved ? `${where}${name}.` : `${where}${name}.`;
+  return `${where}${name}.`;
 }
 
 export interface Undo { kind: TrashKind; ids: string[] }

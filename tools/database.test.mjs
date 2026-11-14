@@ -17,7 +17,7 @@ before(async () => {
   db = new PGlite();
   const dirs = (await readdir(MIGRATIONS, { withFileTypes: true }))
     .filter((d) => d.isDirectory()).map((d) => d.name).sort();
-  assert.equal(dirs.length, 11);
+  assert.equal(dirs.length, 12);
   for (const dir of dirs) await db.exec(await readFile(new URL(`${dir}/migration.sql`, MIGRATIONS), 'utf8'));
   await db.exec(`INSERT INTO "DocumentType" ("code","name","pathTemplate","fieldSchema")
                  VALUES ('RENTAL_CONTRACT','Hợp đồng thuê nhà','Hợp đồng/Thuê nhà/{year}','{"type":"object"}')`);
@@ -465,6 +465,21 @@ test('trash: nothing live sits inside a deleted folder, deleted names are free, 
   await rejects(`UPDATE "Folder" SET "purgedAt" = now() WHERE "id" = $1`, [twin], 'Folder_purged_is_deleted_check');
   await db.query(`UPDATE "Folder" SET "deletedAt" = now(), "purgedAt" = now() WHERE "id" = $1`, [twin]);
   await rejects(`UPDATE "Folder" SET "deletedAt" = NULL, "purgedAt" = NULL WHERE "id" = $1`, [twin], /permanently deleted/);
+});
+
+test('trash batches: a document or folder only points at a trash item while it is in the trash, and loses the link when the item goes', async () => {
+  const a = await seedUser('a');
+  const box = await folder(a.user, 'Hộp');
+  const item = await id(`INSERT INTO "TrashItem" ("userId","kind","folderId","name","expiresAt") VALUES ($1,'FOLDER',$2,'Hộp', now() + interval '30 days')`, [a.user, box]);
+  await rejects(`UPDATE "Document" SET "trashedById" = $1 WHERE "id" = $2`, [item, a.doc], 'Document_trashed_by_check');
+  await rejects(`UPDATE "Folder" SET "trashedById" = $1 WHERE "id" = $2`, [item, box], 'Folder_trashed_by_check');
+  await rejects(`UPDATE "Document" SET "deletedAt" = now(), "trashedById" = gen_random_uuid() WHERE "id" = $1`, [a.doc], 'Document_trashedById_fkey');
+  await db.query(`UPDATE "Folder" SET "deletedAt" = now(), "trashedById" = $1 WHERE "id" = $2`, [item, box]);
+  await db.query(`UPDATE "Document" SET "deletedAt" = now(), "trashedById" = $1 WHERE "id" = $2`, [item, a.doc]);
+  await rejects(`UPDATE "Document" SET "purgedAt" = now() WHERE "id" = $1`, [a.doc], 'Document_trashed_by_check');
+  await db.query(`DELETE FROM "TrashItem" WHERE "id" = $1`, [item]);
+  assert.equal((await one(`SELECT "trashedById" FROM "Document" WHERE "id" = $1`, [a.doc])).trashedById, null);
+  assert.equal((await one(`SELECT "trashedById" FROM "Folder" WHERE "id" = $1`, [box])).trashedById, null);
 });
 
 test('trash items: one per target, the right target for each kind, a real expiry, and they go with their target', async () => {

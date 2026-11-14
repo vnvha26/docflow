@@ -17,6 +17,7 @@ type FolderRow = Prisma.FolderGetPayload<{ select: typeof FOLDER_SELECT }>;
 
 const NAME_INVALID = `Tên thư mục cần 1–${MAX_FOLDER_NAME} ký tự và không chứa dấu / hoặc \\.`;
 const TOO_DEEP = `Thư mục chỉ được lồng tối đa ${MAX_FOLDER_DEPTH} cấp.`;
+const TOO_DEEP_WITH_TRASH = `Thư mục chỉ được lồng tối đa ${MAX_FOLDER_DEPTH} cấp, tính cả thư mục con đang nằm trong thùng rác. Hãy khôi phục hoặc xóa vĩnh viễn các thư mục con đó rồi thử lại.`;
 const MAX_FOLDERS = 500;
 
 function toSummary(row: FolderRow): FolderSummary {
@@ -83,6 +84,8 @@ export class FoldersService {
         if (parentId && !nodes.some((node) => node.id === parentId)) throw fieldError('parentId', 'Không tìm thấy thư mục đích.', HttpStatus.NOT_FOUND);
         if (isInside(nodes, parentId, current.id)) throw fieldError('parentId', 'Không thể chuyển thư mục vào chính nó hoặc thư mục con của nó.');
         if (depthOf(nodes, parentId) + 1 + heightOf(nodes, current.id) > MAX_FOLDER_DEPTH) throw fieldError('parentId', TOO_DEEP);
+        const stored = await transaction.folder.findMany({ where: { userId }, select: { id: true, parentId: true } });
+        if (depthOf(nodes, parentId) + 1 + heightOf(stored, current.id) > MAX_FOLDER_DEPTH) throw fieldError('parentId', TOO_DEEP_WITH_TRASH);
       }
       const free = await freeFolderName(transaction, userId, parentId, wanted ?? current.name, current.id);
       const row = await transaction.folder.update({

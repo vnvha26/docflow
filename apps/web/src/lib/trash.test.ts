@@ -35,7 +35,8 @@ test('the restore message says where the item went and whether its name changed'
   assert.equal(restoreMessage(result({ moved: true })), 'Thư mục cũ không còn nên tài liệu được đưa về “Chưa phân loại”.');
   assert.equal(restoreMessage(result({ kind: 'FOLDER', name: 'Nhà' })), 'Đã khôi phục thư mục về cấp ngoài cùng.');
   assert.equal(restoreMessage(result({ kind: 'FOLDER', moved: true, location: 'Gốc' })), 'Thư mục cũ không còn nên thư mục được đưa về “Gốc”.');
-  assert.match(restoreMessage(result({ kind: 'ORIGINAL' })), /^Đã khôi phục bản gốc của “Hợp đồng”/);
+  assert.equal(restoreMessage(result({ kind: 'ORIGINAL' })), 'Đã khôi phục bản gốc của “Hợp đồng”; xem và tải lại được ngay.');
+  assert.equal(restoreMessage(result({ kind: 'ORIGINAL', inTrash: true })), 'Đã khôi phục bản gốc của “Hợp đồng”, nhưng tài liệu này vẫn đang nằm trong thùng rác; hãy khôi phục cả tài liệu để xem được.');
 });
 
 test('a folder about to be deleted counts every subfolder and document inside', () => {

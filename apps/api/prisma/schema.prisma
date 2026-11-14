@@ -230,6 +230,7 @@ model Document {
   deletedAt    DateTime?      @db.Timestamptz(3)
   purgedAt     DateTime?      @db.Timestamptz(3)
   originalTrashedAt DateTime? @db.Timestamptz(3)
+  trashedById  String?        @db.Uuid
   revision     BigInt         @default(1)
   createdAt    DateTime       @default(now()) @db.Timestamptz(3)
   updatedAt    DateTime       @default(now()) @updatedAt @db.Timestamptz(3)
@@ -260,6 +261,7 @@ model Folder {
   purpose   String?  @db.VarChar(500)
   deletedAt DateTime? @db.Timestamptz(3)
   purgedAt  DateTime? @db.Timestamptz(3)
+  trashedById String? @db.Uuid
   revision  BigInt   @default(1)
   createdAt DateTime @default(now()) @db.Timestamptz(3)
   updatedAt DateTime @default(now()) @updatedAt @db.Timestamptz(3)

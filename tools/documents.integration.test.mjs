@@ -734,6 +734,11 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     const refused = await upload(users.d, { name: 'b.pdf', data: pdf(600 * 1024) });
     assert.equal(refused.status, 413);
     assert.match(refused.body.fieldErrors.file, /hạn mức/);
+    assert.match(refused.body.fieldErrors.file, /thùng rác/, 'the hint points at the trash, where deleted files still count');
+    assert.equal((await request(`/api/documents/${accepted.body.document.id}`, { method: 'DELETE', token: users.d.token })).status, 204);
+    assert.equal((await upload(users.d, { name: 'b.pdf', data: pdf(600 * 1024) })).status, 413, 'a file in the trash still uses its space');
+    const binned = (await request('/api/trash', { token: users.d.token })).body.items.find((entry) => entry.documentId === accepted.body.document.id);
+    assert.equal((await request(`/api/trash/${binned.id}/restore`, { method: 'POST', token: users.d.token })).status, 200);
     assert.equal(await documentCount(users.d), before);
     assert.equal((await upload(users.d, { name: 'small.txt', data: text() })).status, 201);
     const level2 = await request('/api/documents/usage', { token: users.a.token });
@@ -858,7 +863,7 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.equal((await remove()).status, 404);
   });
 
-  test('trash: a folder goes in as one item with everything inside and comes back whole, also what was deleted separately before', async () => {
+  test('trash: a folder goes in as one item and comes back with exactly what went in with it; earlier deletes stay in the trash, like Windows', async () => {
     const user = await createUser('trash-folders', 'ENCRYPTED_COPY');
     const folder = async (name, parentId = null) => (await request('/api/folders', { method: 'POST', token: user.token, body: { name, parentId } })).body.folder.id;
     const put = async (folderId, name) => {
@@ -914,12 +919,40 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.deepEqual([restored.status, restored.body.kind, restored.body.name, restored.body.renamed, restored.body.moved], [200, 'FOLDER', 'Nhà (2)', true, false]);
     const after = (await request('/api/folders', { token: user.token })).body;
     const byId = Object.fromEntries(after.folders.map((entry) => [entry.id, entry]));
-    assert.deepEqual([byId[home].name, byId[home].parentId, byId[bills].parentId, byId[y2026].parentId, byId[old].parentId], ['Nhà (2)', null, home, bills, home], 'the whole tree is back, also the subfolder deleted earlier');
+    assert.deepEqual([byId[home].name, byId[home].parentId, byId[bills].parentId, byId[y2026].parentId], ['Nhà (2)', null, home, bills], 'the tree deleted with the folder is back');
+    assert.equal(byId[old], undefined, 'a subfolder deleted before the folder stays in the trash');
     assert.deepEqual([byId[home].documentCount, byId[bills].documentCount, byId[y2026].documentCount, byId[twin].documentCount], [1, 1, 1, 0]);
     const power = (await request(`/api/documents/${docs.power}`, { token: user.token })).body;
-    assert.deepEqual([power.folderId, power.originalAvailable, power.originalInTrash], [bills, true, false], 'an original deleted separately inside comes back too');
-    assert.deepEqual(await trashOf(user), [], 'nothing of the folder is left in the trash');
+    assert.deepEqual([power.folderId, power.originalAvailable, power.originalInTrash], [bills, false, true], 'an original deleted before stays in the trash');
+    assert.deepEqual((await trashOf(user)).map((entry) => `${entry.kind}:${entry.name}`).sort(), ['FOLDER:Cũ', 'ORIGINAL:Điện'], 'each earlier delete keeps its own trash item');
     assert.equal((await request(`/api/documents/${docs.water}/original`, { token: user.token })).status, 200);
+
+    const subfolder = await request(`/api/trash/${(await trashItem(user, 'FOLDER', 'Cũ')).id}/restore`, { method: 'POST', token: user.token });
+    assert.deepEqual([subfolder.status, subfolder.body.moved, subfolder.body.folderId, subfolder.body.location], [200, false, old, 'Nhà (2)'], 'restored on its own, it goes back into its folder');
+    const original = await request(`/api/trash/${(await trashItem(user, 'ORIGINAL', 'Điện')).id}/restore`, { method: 'POST', token: user.token });
+    assert.equal(original.status, 200);
+    assert.equal((await request(`/api/documents/${docs.power}`, { token: user.token })).body.originalAvailable, true);
+    assert.deepEqual(await trashOf(user), []);
+
+    const box = await folder('Tạm');
+    const note = await put(box, 'Ghi chú.txt');
+    const memo = await put(box, 'Bản nháp.txt');
+    for (const id of [note, memo]) await parsed(user, id, 30_000);
+    assert.equal((await request(`/api/documents/${note}`, { method: 'DELETE', token: user.token })).status, 204);
+    assert.deepEqual((await request(`/api/folders/${box}`, { method: 'DELETE', token: user.token })).body, { documentCount: 1, folderCount: 0 });
+    const undo = await request(`/api/trash/${(await trashItem(user, 'FOLDER', 'Tạm')).id}/restore`, { method: 'POST', token: user.token });
+    assert.equal(undo.status, 200, 'undo is a restore of the item just created');
+    assert.equal((await request(`/api/documents/${memo}`, { token: user.token })).body.folderId, box);
+    assert.equal((await request(`/api/documents/${note}`, { token: user.token })).status, 404, 'undoing the folder delete does not bring back the note deleted before');
+    assert.deepEqual((await trashOf(user)).map((entry) => `${entry.kind}:${entry.name}`), ['DOCUMENT:Ghi chú']);
+
+    assert.equal((await request(`/api/folders/${box}`, { method: 'DELETE', token: user.token })).status, 200);
+    assert.equal((await request(`/api/trash/${(await trashItem(user, 'FOLDER', 'Tạm')).id}`, { method: 'DELETE', token: user.token })).status, 204);
+    await eventually(gone(memo), 'purging the folder removes what went in with it');
+    const orphan = await request(`/api/trash/${(await trashItem(user, 'DOCUMENT', 'Ghi chú')).id}/restore`, { method: 'POST', token: user.token });
+    assert.deepEqual([orphan.status, orphan.body.moved, orphan.body.folderId], [200, true, null], 'a document deleted before survives the purge of its folder and lands at the nearest live level');
+    assert.equal((await request(`/api/documents/${note}`, { token: user.token })).body.folderId, null);
+    await eventually(async () => (await db.folder.count({ where: { id: box } })) === 0, 'the purged folder row goes once nothing points into it');
   });
 
   test('trash: permanent delete removes every row and stored file; expired items and "empty trash" go the same way', async () => {
@@ -1076,7 +1109,7 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     const same = (await check(here)).body;
     assertPrivate(same);
     assert.deepEqual([same.situation, same.options, same.matches.length], ['ask', ['new', 'skip'], 1]);
-    assert.deepEqual(same.primary, { documentId: doc, title: 'thue-nha', folderId: here, location: 'Hợp đồng', state: 'full', sameFolder: true, trashId: null });
+    assert.deepEqual(same.primary, { documentId: doc, title: 'thue-nha', folderId: here, location: 'Hợp đồng', state: 'full', sameFolder: true, trashId: null, trashFolder: null });
     const elsewhere = (await check(there)).body;
     assert.deepEqual([elsewhere.situation, elsewhere.primary.sameFolder, elsewhere.primary.location, elsewhere.options], ['ask', false, 'Hợp đồng', ['new', 'skip']]);
     assert.equal((await check(null, users.a.token)).body.situation, 'new', 'another user never learns the file exists');
@@ -1145,6 +1178,109 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     const fresh = await put(here);
     assert.deepEqual([fresh.status, fresh.body.duplicate, fresh.body.document.title], [201, false, 'thue-nha'], 'the trash never blocks an upload; restoring is only offered before sending');
     assert.equal((await request(`/api/trash/${binned.primary.trashId}/restore`, { method: 'POST', token: user.token })).status, 200);
+  });
+
+  test('review: restoring an original whose document is itself in the trash says so, and the document comes back whole afterwards', async () => {
+    const user = users.c;
+    const doc = (await upload(user, { name: 'goc-truoc-tai-lieu-sau.txt', data: text() })).body.document;
+    await parsed(user, doc.id, 30_000);
+    assert.equal((await request(`/api/documents/${doc.id}/original`, { method: 'DELETE', token: user.token })).status, 202);
+    assert.equal((await request(`/api/documents/${doc.id}`, { method: 'DELETE', token: user.token })).status, 204);
+    const original = await request(`/api/trash/${(await trashItem(user, 'ORIGINAL', 'goc-truoc-tai-lieu-sau')).id}/restore`, { method: 'POST', token: user.token });
+    assert.deepEqual([original.status, original.body.kind, original.body.inTrash], [200, 'ORIGINAL', true]);
+    assert.equal((await request(`/api/documents/${doc.id}`, { token: user.token })).status, 404, 'the document itself is still in the trash');
+    assert.equal((await request(`/api/documents/${doc.id}/original`, { token: user.token })).status, 404);
+    const whole = await request(`/api/trash/${(await trashItem(user, 'DOCUMENT', 'goc-truoc-tai-lieu-sau')).id}/restore`, { method: 'POST', token: user.token });
+    assert.deepEqual([whole.status, whole.body.kind, whole.body.inTrash], [200, 'DOCUMENT', undefined]);
+    const back = (await request(`/api/documents/${doc.id}`, { token: user.token })).body;
+    assert.deepEqual([back.originalAvailable, back.originalInTrash], [true, false]);
+    assert.equal((await request(`/api/documents/${doc.id}/original`, { token: user.token })).status, 200);
+
+    const other = (await upload(user, { name: 'goc-binh-thuong.txt', data: text() })).body.document;
+    await parsed(user, other.id, 30_000);
+    assert.equal((await request(`/api/documents/${other.id}/original`, { method: 'DELETE', token: user.token })).status, 202);
+    const plain = await request(`/api/trash/${(await trashItem(user, 'ORIGINAL', 'goc-binh-thuong')).id}/restore`, { method: 'POST', token: user.token });
+    assert.deepEqual([plain.status, plain.body.inTrash], [200, false]);
+  });
+
+  test('review: a file that went into the trash with its folder is still recognised, and the offer is to restore that folder', async () => {
+    const user = users.dup;
+    const data = Buffer.from(`Biên bản bàn giao nhà ${randomUUID()}`);
+    const ask = (folderId) => request('/api/documents/check', { method: 'POST', token: user.token, body: { sha256: createHash('sha256').update(data).digest('hex'), size: data.length, folderId } });
+    const box = (await request('/api/folders', { method: 'POST', token: user.token, body: { name: 'Nhà cũ', parentId: null } })).body.folder.id;
+    const doc = (await upload(user, { name: 'ban-giao.txt', data })).body.document.id;
+    assert.equal((await request(`/api/documents/${doc}`, { method: 'PATCH', token: user.token, body: { folderId: box } })).status, 200);
+    await parsed(user, doc, 30_000);
+    assert.equal((await request(`/api/folders/${box}`, { method: 'DELETE', token: user.token })).status, 200);
+    const item = await trashItem(user, 'FOLDER', 'Nhà cũ');
+    const found = (await ask(null)).body;
+    assert.deepEqual([found.situation, found.options, found.primary.state, found.primary.trashId, found.primary.trashFolder],
+      ['ask', ['restore', 'new', 'skip'], 'trashed', item.id, 'Nhà cũ']);
+    assert.equal((await request(`/api/trash/${item.id}/restore`, { method: 'POST', token: user.token })).status, 200);
+    const back = (await ask(box)).body;
+    assert.deepEqual([back.primary.documentId, back.primary.state, back.primary.sameFolder, back.primary.trashFolder], [doc, 'full', true, null]);
+  });
+
+  test('review: a document deleted and restored twice before it was read is still read', async () => {
+    const { MaintenanceService } = await compiled('retention/maintenance.service.js');
+    const maintenance = Object.assign(Object.create(MaintenanceService.prototype), { prisma: db });
+    await stopWorker();
+    try {
+      const doc = (await upload(users.c, { name: 'xoa-hai-lan.txt', data: text() })).body.document;
+      const version = await db.documentVersion.findFirstOrThrow({ where: { documentId: doc.id } });
+      const waiting = () => db.aIJob.count({ where: { versionId: version.id, kind: 'PARSE', status: 'QUEUED' } });
+      for (const round of [1, 2, 3]) {
+        assert.equal((await request(`/api/documents/${doc.id}`, { method: 'DELETE', token: users.c.token })).status, 204);
+        assert.equal(await waiting(), 0, 'the job is cancelled while the document is in the trash');
+        const item = await trashItem(users.c, 'DOCUMENT', 'xoa-hai-lan');
+        assert.equal((await request(`/api/trash/${item.id}/restore`, { method: 'POST', token: users.c.token })).status, 200);
+        await maintenance.resumeParsing();
+        assert.equal(await waiting(), 1, `restore ${round} queues the read again`);
+        await maintenance.resumeParsing();
+        assert.equal(await waiting(), 1, 'and never twice');
+      }
+      users.c.twice = doc.id;
+    } finally {
+      startWorker();
+    }
+    assert.equal((await parsed(users.c, users.c.twice, 30_000)).status, 'SUCCEEDED');
+  });
+
+  test('review: rows of permanently deleted documents go even when the purge job itself never finished', async () => {
+    const user = users.c;
+    const doc = (await upload(user, { name: 'xoa-han-khi-job-chet.txt', data: text() })).body.document;
+    await parsed(user, doc.id, 30_000);
+    await stopWorker();
+    try {
+      assert.equal((await request(`/api/documents/${doc.id}`, { method: 'DELETE', token: user.token })).status, 204);
+      const item = await trashItem(user, 'DOCUMENT', 'xoa-han-khi-job-chet');
+      assert.equal((await request(`/api/trash/${item.id}`, { method: 'DELETE', token: user.token })).status, 204);
+      const dead = await db.aIJob.updateMany({ where: { userId: user.id, kind: 'PURGE', status: 'QUEUED' }, data: { status: 'DEAD', finishedAt: new Date(), lastErrorCode: 'BLOB_DELETE_FAILED' } });
+      assert.ok(dead.count > 0, 'the purge job is given up on');
+    } finally {
+      startWorker();
+    }
+    await eventually(gone(doc.id), 'housekeeping removes the rows once the stored files are gone', 15_000);
+  });
+
+  test('review: moving a folder counts subfolders still in the trash, and says so instead of failing', async () => {
+    const user = users.dup;
+    const make = async (name, parentId = null) => (await request('/api/folders', { method: 'POST', token: user.token, body: { name, parentId } })).body.folder.id;
+    const tall = await make('Cao');
+    const a = await make('a', tall);
+    const b = await make('b', a);
+    await make('c', b);
+    const deep = await make('Q', await make('P'));
+    assert.equal((await request(`/api/folders/${a}`, { method: 'DELETE', token: user.token })).status, 200);
+    const move = () => request(`/api/folders/${tall}`, { method: 'PATCH', token: user.token, body: { parentId: deep } });
+    const refused = await move();
+    assert.equal(refused.status, 400, 'not a server error');
+    assert.match(refused.body.fieldErrors.parentId, /thùng rác/);
+    const item = await trashItem(user, 'FOLDER', 'a');
+    assert.equal((await request(`/api/trash/${item.id}`, { method: 'DELETE', token: user.token })).status, 204);
+    await eventually(async () => (await db.folder.count({ where: { id: a } })) === 0, 'the purged subfolders are removed');
+    const moved = await move();
+    assert.deepEqual([moved.status, moved.body.folder.parentId], [200, deep]);
   });
 
   test('duplicates: a failed supplement leaves the document as it was', async () => {

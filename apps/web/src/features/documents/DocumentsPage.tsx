@@ -291,7 +291,7 @@ export function DocumentsPage({ user }: { user: User }) {
           try {
             const restored = await trashApi.restore(trashId, owner);
             if (currentUser.current !== owner) return;
-            update(question.key, { state: 'restored', target: primary.state === 'original-trashed' ? `bản gốc của ${primary.title}` : restored.name });
+            update(question.key, { state: 'restored', target: primary.state === 'original-trashed' ? `bản gốc của ${primary.title}` : primary.trashFolder ? `thư mục ${restored.name}` : restored.name });
             setReload((value) => value + 1);
             refreshTree();
             refreshUsage();

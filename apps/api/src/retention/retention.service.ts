@@ -81,6 +81,30 @@ export class RetentionService {
     if (blobs.failed > 0) throw new Error('BLOB_DELETE_FAILED');
   }
 
+  async sweepPurged(limit = 50): Promise<number> {
+    const owners = await this.prisma.$queryRaw<{ userId: string }[]>`
+      SELECT d."userId" FROM "Document" d
+      WHERE d."purgedAt" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM "FileCopy" c WHERE c."documentId" = d."id" AND c."state" <> 'DELETED')
+      UNION
+      SELECT f."userId" FROM "Folder" f
+      WHERE f."purgedAt" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM "Document" d WHERE d."folderId" = f."id")
+        AND NOT EXISTS (SELECT 1 FROM "Folder" c WHERE c."parentId" = f."id")
+      LIMIT ${limit}`;
+    let removed = 0;
+    for (const { userId } of owners) {
+      try {
+        removed += await this.prisma.$transaction(async (transaction) => {
+          await lockUserFiles(transaction, userId);
+          const result = await this.removePurged(transaction, userId);
+          return result.documents + result.folders;
+        });
+      } catch {
+        this.logger.warn('Chưa dọn được dữ liệu đã xóa vĩnh viễn của một tài khoản; sẽ thử lại.');
+      }
+    }
+    return removed;
+  }
+
   async removePurged(transaction: Prisma.TransactionClient, userId: string): Promise<{ documents: number; folders: number }> {
     const gone = await transaction.document.findMany({
       where: { userId, purgedAt: { not: null }, fileCopies: { none: { state: { not: 'DELETED' } } } }, take: 500, select: { id: true },

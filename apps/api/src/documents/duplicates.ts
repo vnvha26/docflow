@@ -10,6 +10,7 @@ export interface DuplicateMatch {
   state: MatchState;
   sameFolder: boolean;
   trashId: string | null;
+  trashFolder: string | null;
 }
 
 export interface DuplicateCheck {
@@ -26,6 +27,7 @@ export interface Candidate {
   location: string | null;
   state: MatchState;
   trashId: string | null;
+  trashFolder: string | null;
   createdAt: Date;
 }
 
@@ -48,7 +50,7 @@ export function rankCandidates<T extends Candidate>(candidates: readonly T[], fo
 export function classifyDuplicates(candidates: readonly Candidate[], folderId: string | null): DuplicateCheck {
   const matches = rankCandidates(candidates, folderId).map((candidate): DuplicateMatch => ({
     documentId: candidate.documentId, title: candidate.title, folderId: candidate.folderId, location: candidate.location,
-    state: candidate.state, sameFolder: candidate.folderId === folderId, trashId: candidate.trashId,
+    state: candidate.state, sameFolder: candidate.folderId === folderId, trashId: candidate.trashId, trashFolder: candidate.trashFolder,
   }));
   const primary = matches[0] ?? null;
   if (!primary) return { situation: 'new', primary: null, matches: [], options: [] };

@@ -175,7 +175,7 @@ export class DocumentsService {
       select: {
         id: true, documentId: true, parseState: true, parseErrorCode: true, createdAt: true,
         document: { select: {
-          title: true, folderId: true, privacyLevel: true, deletedAt: true, originalTrashedAt: true,
+          title: true, folderId: true, privacyLevel: true, deletedAt: true, originalTrashedAt: true, trashedById: true,
           user: { select: { privacyLevel: true } }, trashItems: { select: { id: true, kind: true } },
         } },
         fileCopies: { where: { state: { in: [...LIVE] } }, select: { state: true, kind: true } },
@@ -191,14 +191,23 @@ export class DocumentsService {
       }
       return names.join(' › ') || null;
     };
+    const batchIds = versions.flatMap((version) => version.document.deletedAt && version.document.trashedById ? [version.document.trashedById] : []);
+    const batches = new Map((batchIds.length
+      ? await db.trashItem.findMany({ where: { userId, id: { in: batchIds }, kind: 'FOLDER' }, select: { id: true, name: true } })
+      : []).map((entry) => [entry.id, entry.name]));
     const found: Found[] = [];
     for (const version of versions) {
       const { document, fileCopies } = version;
       const item = (kind: 'DOCUMENT' | 'ORIGINAL') => document.trashItems.find((entry) => entry.kind === kind)?.id ?? null;
       let state: Found['state'];
       let trashId: string | null = null;
+      let trashFolder: string | null = null;
       if (document.deletedAt) {
         trashId = item('DOCUMENT');
+        if (!trashId && document.trashedById && batches.has(document.trashedById)) {
+          trashId = document.trashedById;
+          trashFolder = batches.get(document.trashedById) ?? null;
+        }
         if (!trashId) continue;
         state = 'trashed';
       } else if (document.originalTrashedAt) {
@@ -212,7 +221,7 @@ export class DocumentsService {
       }
       found.push({
         documentId: version.documentId, versionId: version.id, title: document.title, folderId: document.folderId, location: label(document.folderId),
-        state, trashId, createdAt: version.createdAt, documentLevel: document.privacyLevel,
+        state, trashId, trashFolder, createdAt: version.createdAt, documentLevel: document.privacyLevel,
         inFlight: !document.deletedAt && fileCopies.some((copy) => copy.state === 'UPLOADING'),
         retryable: !document.deletedAt && version.parseState === 'FAILED' && fileCopies.some((copy) => copy.state === 'AVAILABLE'),
         previous: { parseState: version.parseState, parseErrorCode: version.parseErrorCode },
@@ -418,7 +427,7 @@ export class DocumentsService {
     const quota = this.config.files.encryptedQuotaBytes;
     if (used + incoming > quota) {
       throw fieldError('file',
-        `Vượt hạn mức lưu bản gốc: đã dùng ${formatBytes(used)} / ${formatBytes(quota)}. Hãy xóa bớt bản gốc hoặc chọn mức lưu trữ thấp hơn.`,
+        `Vượt hạn mức lưu bản gốc: đã dùng ${formatBytes(used)} / ${formatBytes(quota)}. Tệp trong thùng rác vẫn tính vào hạn mức: hãy dọn thùng rác, xóa vĩnh viễn bản gốc không cần nữa hoặc chọn mức lưu trữ thấp hơn.`,
         HttpStatus.PAYLOAD_TOO_LARGE);
     }
   }
