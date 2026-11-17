@@ -34,6 +34,17 @@ export interface WorkerConfig {
   maintenanceMs: number;
 }
 
+export interface AiConfig {
+  baseUrl: string;
+  apiKey?: string;
+  model: string;
+  embedModel?: string;
+  timeoutMs: number;
+  maxInputChars: number;
+  maxOutputTokens: number;
+  extraBody: Record<string, unknown>;
+}
+
 export interface ApiConfig {
   databaseUrl: string;
   jwtSecret: string;
@@ -44,6 +55,7 @@ export interface ApiConfig {
   storage: StorageConfig;
   files: FilesConfig;
   worker: WorkerConfig;
+  ai: AiConfig;
 }
 
 const KEK_ID = /^[a-z0-9][a-z0-9-]{0,31}$/;
@@ -67,6 +79,44 @@ function positiveNumber(value: string | undefined, fallback: number, name: strin
   const parsed = Number(value ?? fallback);
   if (!Number.isFinite(parsed) || parsed <= 0) throw new Error(`${name} phải là số dương.`);
   return parsed;
+}
+
+const RESERVED_AI_FIELDS = ['model', 'messages', 'input', 'response_format', 'max_tokens', 'stream'];
+
+export function readAiConfig(env: NodeJS.ProcessEnv): AiConfig {
+  const production = env.NODE_ENV === 'production';
+  const baseUrl = (env.AI_BASE_URL?.trim() || (production ? '' : 'http://127.0.0.1:11434/v1')).replace(/\/+$/, '');
+  if (!baseUrl) throw new Error('Production cần cấu hình AI_BASE_URL.');
+  try {
+    if (!['http:', 'https:'].includes(new URL(baseUrl).protocol)) throw new Error();
+  } catch {
+    throw new Error('AI_BASE_URL phải là URL HTTP/HTTPS, ví dụ http://127.0.0.1:11434/v1.');
+  }
+  let extraBody: unknown = { reasoning_effort: 'none' };
+  if (env.AI_EXTRA_BODY !== undefined) {
+    try { extraBody = JSON.parse(env.AI_EXTRA_BODY || '{}'); } catch { extraBody = null; }
+  }
+  if (typeof extraBody !== 'object' || extraBody === null || Array.isArray(extraBody)) {
+    throw new Error('AI_EXTRA_BODY phải là một đối tượng JSON, ví dụ {"reasoning_effort":"none"}.');
+  }
+  if (Object.keys(extraBody).some((key) => RESERVED_AI_FIELDS.includes(key))) {
+    throw new Error(`AI_EXTRA_BODY không được ghi đè ${RESERVED_AI_FIELDS.join(', ')}.`);
+  }
+  const integer = (value: string | undefined, fallback: number, name: string) => {
+    const parsed = positiveNumber(value, fallback, name);
+    if (!Number.isInteger(parsed)) throw new Error(`${name} phải là số nguyên dương.`);
+    return parsed;
+  };
+  return {
+    baseUrl,
+    ...(env.AI_API_KEY?.trim() ? { apiKey: env.AI_API_KEY.trim() } : {}),
+    model: env.AI_MODEL?.trim() || 'qwen3.5:9b',
+    ...(env.AI_EMBED_MODEL?.trim() ? { embedModel: env.AI_EMBED_MODEL.trim() } : {}),
+    timeoutMs: integer(env.AI_TIMEOUT_MS, 180_000, 'AI_TIMEOUT_MS'),
+    maxInputChars: integer(env.AI_MAX_INPUT_CHARS, 36_000, 'AI_MAX_INPUT_CHARS'),
+    maxOutputTokens: integer(env.AI_MAX_OUTPUT_TOKENS, 2_048, 'AI_MAX_OUTPUT_TOKENS'),
+    extraBody: extraBody as Record<string, unknown>,
+  };
 }
 
 export function readConfig(env: NodeJS.ProcessEnv): ApiConfig {
@@ -133,6 +183,7 @@ export function readConfig(env: NodeJS.ProcessEnv): ApiConfig {
     storage,
     files,
     worker,
+    ai: readAiConfig(env),
   };
 }
 
