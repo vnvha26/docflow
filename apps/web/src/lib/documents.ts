@@ -24,7 +24,7 @@ export const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordproc
 
 export const isProcessing = (document: Pick<DocumentSummary, 'status'>) => document.status === 'PENDING' || document.status === 'PROCESSING';
 
-export type DocumentTypeFilter = 'pdf' | 'docx' | 'txt';
+export type DocumentTypeFilter = 'pdf' | 'docx' | 'txt' | 'md' | 'image';
 export type DocumentSort = 'created' | 'updated' | 'name' | 'name-desc';
 export interface DocumentFilters { type?: DocumentTypeFilter; folder?: string; sort?: DocumentSort }
 export const sortLabels: Record<DocumentSort, string> = {
@@ -32,12 +32,19 @@ export const sortLabels: Record<DocumentSort, string> = {
 };
 export const UNFILED = 'none';
 
-export const typeFilterLabels: Record<DocumentTypeFilter, string> = { pdf: 'PDF', docx: 'DOCX', txt: 'TXT' };
-const filterMime: Record<DocumentTypeFilter, string> = { pdf: 'application/pdf', docx: DOCX_MIME, txt: 'text/plain' };
+export const IMAGE_MIMES = ['image/png', 'image/jpeg', 'image/webp'];
+export const MARKDOWN_MIME = 'text/markdown';
+export const isImage = (document: Pick<DocumentSummary, 'file'>) => IMAGE_MIMES.includes(document.file.mimeType);
+
+export const TYPE_FILTERS: DocumentTypeFilter[] = ['pdf', 'docx', 'txt', 'md', 'image'];
+export const typeFilterLabels: Record<DocumentTypeFilter, string> = { pdf: 'PDF', docx: 'DOCX', txt: 'TXT', md: 'Markdown', image: 'Ảnh' };
+const filterMime: Record<DocumentTypeFilter, string[]> = {
+  pdf: ['application/pdf'], docx: [DOCX_MIME], txt: ['text/plain'], md: [MARKDOWN_MIME], image: IMAGE_MIMES,
+};
 
 export function matchesFilters(document: Pick<DocumentSummary, 'file' | 'folderId'>, filters: DocumentFilters): boolean {
   if (filters.folder !== undefined && document.folderId !== (filters.folder === UNFILED ? null : filters.folder)) return false;
-  if (filters.type && document.file.mimeType !== filterMime[filters.type]) return false;
+  if (filters.type && !filterMime[filters.type].includes(document.file.mimeType)) return false;
   return true;
 }
 
@@ -58,6 +65,7 @@ const problemMessages: Record<string, string> = {
 
 export function problemMessage(document: Pick<DocumentSummary, 'status' | 'problem'>): string | null {
   if (document.status !== 'FAILED' && document.status !== 'UNSUPPORTED') return null;
+  if (document.problem === IMAGE_NO_TEXT) return null;
   return (document.problem && problemMessages[document.problem])
     ?? (document.status === 'FAILED' ? 'Chưa đọc được tệp do lỗi tạm thời. Tải lại đúng tệp này để thử lại.' : 'Không đọc được nội dung tệp này.');
 }
@@ -69,12 +77,18 @@ export interface StorageUsage { encryptedBytes: number; quotaBytes: number }
 
 export const MAX_UPLOAD_MB = 50;
 export const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
-export const ACCEPTED_EXTENSIONS = ['pdf', 'docx', 'txt'];
+export const ACCEPTED_EXTENSIONS = ['pdf', 'docx', 'txt', 'md', 'markdown', 'png', 'jpg', 'jpeg', 'webp'];
+export const ACCEPT_ATTRIBUTE = [...ACCEPTED_EXTENSIONS.map((extension) => `.${extension}`), 'application/pdf', DOCX_MIME, 'text/plain', MARKDOWN_MIME, ...IMAGE_MIMES].join(',');
+const IMAGE_NO_TEXT = 'IMAGE_NO_TEXT';
 
 const typeLabels: Record<string, string> = {
   'application/pdf': 'PDF',
   [DOCX_MIME]: 'DOCX',
   'text/plain': 'TXT',
+  [MARKDOWN_MIME]: 'Markdown',
+  'image/png': 'Ảnh PNG',
+  'image/jpeg': 'Ảnh JPG',
+  'image/webp': 'Ảnh WebP',
 };
 
 export const fileTypeLabel = (document: Pick<DocumentSummary, 'file'>) => typeLabels[document.file.mimeType] ?? 'TỆP';
@@ -83,12 +97,12 @@ const statusLabels: Record<DocumentStatus, string> = {
   PENDING: 'Chờ đọc nội dung…', PROCESSING: 'Đang đọc nội dung…', SUCCEEDED: 'Đã đọc nội dung', FAILED: 'Chưa đọc được', UNSUPPORTED: 'Không đọc được',
 };
 
-type InfoFields = 'file' | 'pageCount' | 'status' | 'originalInTrash' | 'originalAvailable' | 'originalDeleting';
+type InfoFields = 'file' | 'pageCount' | 'status' | 'problem' | 'originalInTrash' | 'originalAvailable' | 'originalDeleting';
 
 export function infoLine(document: Pick<DocumentSummary, InfoFields>): string {
   const parts = [fileTypeLabel(document)];
   if (document.pageCount) parts.push(`${document.pageCount.toLocaleString('vi-VN')} trang`);
-  if (document.status === 'SUCCEEDED') parts.push(formatBytes(document.file.byteSize));
+  if (document.status === 'SUCCEEDED' || document.problem === IMAGE_NO_TEXT) parts.push(formatBytes(document.file.byteSize));
   else parts.push(statusLabels[document.status]);
   if (document.originalInTrash) parts.push('Bản gốc trong thùng rác');
   else if (!isProcessing(document) && !document.originalAvailable && !document.originalDeleting) parts.push('Không còn bản gốc');
@@ -96,11 +110,11 @@ export function infoLine(document: Pick<DocumentSummary, InfoFields>): string {
 }
 
 export const canViewOriginal = (document: Pick<DocumentSummary, 'file' | 'originalAvailable'>) =>
-  document.originalAvailable && ['application/pdf', 'text/plain', DOCX_MIME].includes(document.file.mimeType);
+  document.originalAvailable && ['application/pdf', 'text/plain', MARKDOWN_MIME, DOCX_MIME, ...IMAGE_MIMES].includes(document.file.mimeType);
 
 export function precheck(file: File): string | null {
   const extension = file.name.includes('.') ? file.name.slice(file.name.lastIndexOf('.') + 1).toLowerCase() : '';
-  if (!ACCEPTED_EXTENSIONS.includes(extension)) return 'Chỉ hỗ trợ tệp PDF, DOCX và TXT.';
+  if (!ACCEPTED_EXTENSIONS.includes(extension)) return 'Chỉ hỗ trợ tệp PDF, DOCX, TXT, Markdown và ảnh PNG, JPG, WebP.';
   if (file.size === 0) return 'Tệp rỗng, không có gì để lưu.';
   if (file.size > MAX_UPLOAD_BYTES) return `Tệp vượt quá ${MAX_UPLOAD_MB} MB.`;
   return null;

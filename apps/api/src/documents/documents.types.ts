@@ -23,7 +23,7 @@ export interface DocumentSummary {
 }
 
 
-export const DOCUMENT_TYPE_FILTERS = ['pdf', 'docx', 'txt'] as const;
+export const DOCUMENT_TYPE_FILTERS = ['pdf', 'docx', 'txt', 'md', 'image'] as const;
 export type DocumentTypeFilter = (typeof DOCUMENT_TYPE_FILTERS)[number];
 
 export const UNFILED = 'none';

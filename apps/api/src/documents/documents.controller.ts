@@ -19,6 +19,7 @@ import { DuplicateCheck } from './duplicates';
 import { DocumentsService, UploadedFile as StoredUpload } from './documents.service';
 import { DocumentSummary, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, RenameResult, StorageUsage, UploadResult } from './documents.types';
 import { contentDisposition } from './file-name';
+import { TEXT_MIME_TYPES } from './file-type';
 import { UploadErrorsFilter } from './upload-errors.filter';
 import { UploadGuard } from './upload.guard';
 
@@ -168,14 +169,14 @@ export class DocumentsController {
 
   @Get(':id/original')
   @HttpCode(200)
-  @ApiOperation({ summary: 'Tải bản gốc (chỉ tài liệu mức 3 còn bản gốc mã hóa). Giải mã và gửi dạng luồng.' })
+  @ApiOperation({ summary: 'Tải bản gốc mã hóa còn giữ. Giải mã và gửi dạng luồng.' })
   @ApiProduces('application/octet-stream')
   @ApiOkResponse({ schema: { type: 'string', format: 'binary' } })
-  @ApiNotFoundResponse({ description: 'Không phải tài liệu của bạn, không ở mức 3 hoặc không còn bản gốc.' })
+  @ApiNotFoundResponse({ description: 'Không phải tài liệu của bạn hoặc không còn bản gốc.' })
   async original(@Param('id', new ParseUUIDPipe()) id: string, @Req() request: AuthRequest, @Res() response: Response): Promise<void> {
     const file = await this.documents.openOriginal(request.auth!.user.id, id);
     response.status(200).set({
-      'Content-Type': file.mimeType === 'text/plain' ? 'text/plain; charset=utf-8' : file.mimeType,
+      'Content-Type': TEXT_MIME_TYPES.includes(file.mimeType) ? `${file.mimeType}; charset=utf-8` : file.mimeType,
       'Content-Length': String(file.byteSize),
       'Content-Disposition': contentDisposition(file.fileName),
       'Cache-Control': 'private, no-store',

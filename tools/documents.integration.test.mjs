@@ -97,6 +97,8 @@ function textPdf(pages) {
   return Buffer.from(out, 'latin1');
 }
 const pdf = (bytes = 2048) => Buffer.concat([Buffer.from('%PDF-1.7\n'), randomBytes(bytes), Buffer.from('\n%%EOF\n')]);
+const png = () => Buffer.concat([Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489', 'hex'), Buffer.from('0000000d49444154789c6360f8cf000000030101005a1d2fd20000000049454e44ae426082', 'hex')]);
+const jpeg = () => Buffer.concat([Buffer.from('ffd8ffe000104a46494600010100000100010000', 'hex'), Buffer.alloc(64, 0x20), Buffer.from('ffd9', 'hex')]);
 const text = (body = `Hợp đồng thuê nhà — tiền cọc 16.000.000 VNĐ. ${randomUUID()}\n`) => Buffer.from(body, 'utf8');
 
 function assertPrivate(body) {
@@ -582,12 +584,48 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     await db.fileCopy.update({ where: { id: copy.id }, data: { state: 'AVAILABLE' } });
   });
 
+  test('images and Markdown are stored like any file: an image has no text yet, Markdown is read as text', async () => {
+    const user = await createUser('kinds');
+    const image = png();
+    const photo = await upload(user, { name: 'Ảnh CCCD.JPEG', data: jpeg() });
+    assert.equal(photo.status, 201);
+    assert.deepEqual(photo.body.document.file, { name: 'Ảnh CCCD.jpeg', mimeType: 'image/jpeg', byteSize: jpeg().length });
+    const picture = await upload(user, { name: 'so-do.bin', data: image });
+    assert.equal(picture.status, 201);
+    assert.equal(picture.body.document.file.mimeType, 'image/png', 'the type comes from the bytes');
+    assert.equal(picture.body.document.file.name, 'so-do.bin.png');
+    const note = await upload(user, { name: 'Việc cần làm.md', data: Buffer.from('# Việc cần làm\n\n- Gia hạn bảo hiểm xe trước 20/12/2026\n') });
+    assert.equal(note.status, 201);
+    assert.equal(note.body.document.file.mimeType, 'text/markdown');
+    for (const doc of [photo.body.document, picture.body.document]) {
+      const done = await parsed(user, doc.id, 30_000);
+      assert.equal(done.status, 'UNSUPPORTED');
+      assert.equal(done.problem, 'IMAGE_NO_TEXT');
+      assert.equal(done.originalAvailable, true);
+      assert.equal(await db.documentChunk.count({ where: { documentId: doc.id } }), 0);
+    }
+    const read = await parsed(user, note.body.document.id, 30_000);
+    assert.equal(read.status, 'SUCCEEDED');
+    const chunks = await db.documentChunk.findMany({ where: { documentId: note.body.document.id } });
+    assert.match(chunks.map((chunk) => chunk.content).join(' '), /Gia hạn bảo hiểm xe/);
+    const original = await request(`/api/documents/${picture.body.document.id}/original`, { token: user.token });
+    assert.equal(original.status, 200);
+    assert.equal(original.headers.get('content-type'), 'image/png');
+    assert.equal(sha256(original.raw), sha256(image));
+    const markdown = await request(`/api/documents/${note.body.document.id}/original`, { token: user.token });
+    assert.equal(markdown.headers.get('content-type'), 'text/markdown; charset=utf-8');
+    assert.equal(markdown.headers.get('content-security-policy'), "default-src 'none'; sandbox");
+    const again = await upload(user, { name: 'ban-sao.png', data: image });
+    assert.equal(again.body.duplicate, true, 'duplicate detection works for images too');
+  });
+
   test('the type comes from the bytes; size, emptiness and the multipart shape are enforced', async (t) => {
     const before = await documentCount(users.b);
     const invalid = [
-      ['PNG named .pdf', { name: 'scan.pdf', data: Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex') }, 415],
+      ['PNG cut off after its header', { name: 'scan.png', data: Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex') }, 415],
+      ['SVG image', { name: 'logo.svg', data: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>') }, 415],
       ['legacy-encoded text', { name: 'ghi-chu.txt', data: Buffer.from([0x48, 0xe4, 0x20, 0xf5, 0x6f, 0xff]) }, 415],
-      ['UTF-8 text with another extension', { name: 'notes.md', data: text() }, 415],
+      ['UTF-8 text with another extension', { name: 'notes.rtf', data: text() }, 415],
       ['ZIP that is not a Word document', { name: 'fake.docx', data: zip([{ name: 'a.txt', data: Buffer.from('x') }]) }, 415],
       ['text with NUL bytes', { name: 'bin.txt', data: Buffer.from('abc\u0000def') }, 415],
       ['empty file', { name: 'empty.txt', data: Buffer.alloc(0) }, 400],
@@ -1376,6 +1414,8 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
       ['pdf', { name: 'doc.pdf', data: textPdf([[`Hop dong ${randomUUID()}`]]) }],
       ['docx', { name: 'doc.docx', data: docxWith([`Hợp đồng ${randomUUID()}`]) }],
       ['txt', { name: 'doc.txt', data: text() }],
+      ['md', { name: 'doc.md', data: Buffer.from(`# Ghi chú ${randomUUID()}`) }],
+      ['png', { name: 'anh.png', data: png() }],
       ['broken', { name: 'hong.pdf', data: pdf(4096) }],
     ]) {
       ids[key] = (await upload(user, file)).body.document.id;
@@ -1390,11 +1430,13 @@ describe('documents over HTTP with PostgreSQL and S3 storage', {
     assert.deepEqual(await list('type=pdf'), [ids.broken, ids.pdf]);
     assert.deepEqual(await list('type=docx'), [ids.docx]);
     assert.deepEqual(await list('type=txt'), [ids.txt]);
+    assert.deepEqual(await list('type=md'), [ids.md]);
+    assert.deepEqual(await list('type=image'), [ids.png]);
     const first = await request('/api/documents?type=pdf&limit=1', { token: user.token });
     assert.deepEqual(first.body.items.map((item) => item.id), [ids.broken]);
     assert.equal(typeof first.body.nextCursor, 'string');
     assert.deepEqual(await list(`type=pdf&limit=1&cursor=${first.body.nextCursor}`), [ids.pdf], 'the cursor keeps the filter');
-    for (const query of ['type=png', 'status=read', 'type=PDF']) {
+    for (const query of ['type=png', 'type=jpg', 'status=read', 'type=PDF']) {
       const response = await request(`/api/documents?${query}`, { token: user.token });
       assert.equal(response.status, 400, query);
       assert.ok(response.body.fieldErrors?.[query.split('=')[0]], query);

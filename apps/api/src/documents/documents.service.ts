@@ -20,7 +20,7 @@ import { ParserFailedError, UnsupportedDocumentError } from '../parsing/text';
 import { ObjectStorage, storageKey } from '../storage/object-storage';
 import { cleanTitle, downloadName, sanitizeFileName, titleFromFileName } from './file-name';
 import { Candidate, classifyDuplicates, DuplicateCheck, rankCandidates } from './duplicates';
-import { detectFileType } from './file-type';
+import { detectFileType, IMAGE_MIME_TYPES } from './file-type';
 import {
   DocumentChange, DocumentFilters, DocumentSort, DocumentSummary, DocumentTypeFilter, MAX_UPLOAD_BYTES, RenameResult, StorageUsage,
   TOO_LARGE_MESSAGE, UNFILED, UploadResult,
@@ -77,13 +77,15 @@ function toSummary(row: SummaryRow): DocumentSummary {
   };
 }
 
-const TYPE_MIME: Record<DocumentTypeFilter, string> = {
-  pdf: 'application/pdf',
-  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  txt: 'text/plain',
+const TYPE_MIME: Record<DocumentTypeFilter, readonly string[]> = {
+  pdf: ['application/pdf'],
+  docx: ['application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+  txt: ['text/plain'],
+  md: ['text/markdown'],
+  image: IMAGE_MIME_TYPES,
 };
 function versionFilter(filters: DocumentFilters): Prisma.DocumentVersionWhereInput {
-  return filters.type ? { mimeType: TYPE_MIME[filters.type] } : {};
+  return filters.type ? { mimeType: { in: [...TYPE_MIME[filters.type]] } } : {};
 }
 
 function folderFilter(folder?: string): Prisma.DocumentWhereInput {
@@ -250,7 +252,7 @@ export class DocumentsService {
     if (file.size > MAX_UPLOAD_BYTES) throw fieldError('file', TOO_LARGE_MESSAGE, HttpStatus.PAYLOAD_TOO_LARGE);
     const type = detectFileType(file.buffer, file.originalname);
     if (!type) {
-      throw new UnsupportedMediaTypeException('Chỉ hỗ trợ PDF, DOCX và TXT (mã hóa UTF-8). Hãy lưu lại tệp ở một trong các định dạng này.');
+      throw new UnsupportedMediaTypeException('Chỉ hỗ trợ PDF, DOCX, TXT, Markdown (mã hóa UTF-8) và ảnh PNG, JPG, WebP. Hãy lưu lại tệp ở một trong các định dạng này.');
     }
     const fileName = sanitizeFileName(file.originalname, type.extension);
     const title = cleanTitle(requestedTitle) ?? titleFromFileName(fileName);

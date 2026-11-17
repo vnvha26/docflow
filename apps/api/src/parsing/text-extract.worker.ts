@@ -14,8 +14,9 @@ async function renderHtml({ mimeType, data }: Input): Promise<{ pages: string[];
 }
 
 async function read({ mimeType, data }: Input): Promise<{ pages: string[]; pageCount: number | null }> {
-  if (mimeType === 'text/plain' && data.byteLength > MAX_RAW_TEXT_CHARS * 4) throw new UnsupportedDocumentError('TEXT_TOO_LONG');
-  if (mimeType === 'text/plain') return { pages: [Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString('utf8')], pageCount: null };
+  const isText = mimeType === 'text/plain' || mimeType === 'text/markdown';
+  if (isText && data.byteLength > MAX_RAW_TEXT_CHARS * 4) throw new UnsupportedDocumentError('TEXT_TOO_LONG');
+  if (isText) return { pages: [Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString('utf8')], pageCount: null };
   if (mimeType === DOCX) {
     const result = await extractRawText({ buffer: Buffer.from(data.buffer, data.byteOffset, data.byteLength) });
     return { pages: [result.value], pageCount: null };

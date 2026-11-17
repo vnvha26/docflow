@@ -15,10 +15,12 @@ const file = (mimeType: string) => ({ name: 'a', mimeType, byteSize: 1 });
 const STATUSES: DocumentStatus[] = ['PENDING', 'PROCESSING', 'SUCCEEDED', 'FAILED', 'UNSUPPORTED'];
 
 test('filters: by file type; no filter keeps everything', () => {
-  const mimes: Record<DocumentTypeFilter, string> = { pdf: 'application/pdf', docx: DOCX_MIME, txt: 'text/plain' };
-  for (const [type, mimeType] of Object.entries(mimes) as [DocumentTypeFilter, string][]) {
-    for (const other of Object.values(mimes)) {
-      assert.equal(matchesFilters(doc({ file: file(other) }), { type }), other === mimeType, `${type} vs ${other}`);
+  const mimes: Record<DocumentTypeFilter, string[]> = {
+    pdf: ['application/pdf'], docx: [DOCX_MIME], txt: ['text/plain'], md: ['text/markdown'], image: ['image/png', 'image/jpeg', 'image/webp'],
+  };
+  for (const [type, own] of Object.entries(mimes) as [DocumentTypeFilter, string[]][]) {
+    for (const other of Object.values(mimes).flat()) {
+      assert.equal(matchesFilters(doc({ file: file(other) }), { type }), own.includes(other), `${type} vs ${other}`);
     }
   }
   const empty: DocumentFilters = {};
@@ -36,7 +38,10 @@ test('info line: type, pages, then size once read or the reading state; a missin
   assert.equal(infoLine(doc({ originalAvailable: false, originalDeleting: true })), 'PDF · 1000 B', 'still being deleted: the page shows that separately');
   assert.equal(infoLine(doc({ status: 'PENDING', originalAvailable: false })), 'PDF · Chờ đọc nội dung…');
   assert.match(infoLine(doc({ pageCount: 1200 })), /^PDF · 1[.\s ]?200 trang · /);
-  assert.equal(fileTypeLabel(doc({ file: file('image/png') })), 'TỆP');
+  assert.equal(fileTypeLabel(doc({ file: file('application/zip') })), 'TỆP');
+  assert.equal(infoLine(doc({ file: { name: 'a.md', mimeType: 'text/markdown', byteSize: 2048 } })), 'Markdown · 2,0 KB');
+  assert.equal(infoLine(doc({ file: { name: 'a.jpg', mimeType: 'image/jpeg', byteSize: 2048 }, status: 'UNSUPPORTED', problem: 'IMAGE_NO_TEXT' })), 'Ảnh JPG · 2,0 KB',
+    'an image is not an error: it simply has no text yet');
 });
 
 test('problem message: only for unread files whose details are kept; unknown codes get a general hint', () => {
@@ -46,6 +51,7 @@ test('problem message: only for unread files whose details are kept; unknown cod
   assert.match(problemMessage(doc({ status: 'UNSUPPORTED', problem: 'SOMETHING_NEW' })) ?? '', /^Không đọc được nội dung/);
   assert.match(problemMessage(doc({ status: 'FAILED', problem: null })) ?? '', /Tải lại đúng tệp này/);
   assert.match(problemMessage(doc({ status: 'FAILED', problem: 'SOURCE_UNAVAILABLE' })) ?? '', /Bản tạm/);
+  assert.equal(problemMessage(doc({ status: 'UNSUPPORTED', problem: 'IMAGE_NO_TEXT', file: file('image/png') })), null);
 });
 
 test('the page keeps asking while a file is being read or its original is being deleted', () => {
@@ -56,11 +62,11 @@ test('the page keeps asking while a file is being read or its original is being 
 });
 
 test('the original can be viewed only while it is stored and the type has a viewer', () => {
-  for (const mimeType of ['application/pdf', 'text/plain', DOCX_MIME]) {
+  for (const mimeType of ['application/pdf', 'text/plain', 'text/markdown', DOCX_MIME, 'image/png', 'image/jpeg', 'image/webp']) {
     assert.equal(canViewOriginal(doc({ file: file(mimeType) })), true, mimeType);
     assert.equal(canViewOriginal(doc({ file: file(mimeType), originalAvailable: false })), false, mimeType);
   }
-  assert.equal(canViewOriginal(doc({ file: file('image/png') })), false);
+  assert.equal(canViewOriginal(doc({ file: file('image/svg+xml') })), false);
 });
 
 test('precheck: extension, emptiness and the size limit, with the limit itself allowed', () => {
@@ -68,9 +74,11 @@ test('precheck: extension, emptiness and the size limit, with the limit itself a
   assert.equal(precheck(pick('hop-dong.pdf', 10)), null);
   assert.equal(precheck(pick('HOP-DONG.DOCX', 10)), null);
   assert.equal(precheck(pick('ghi.chu.txt', MAX_UPLOAD_BYTES)), null);
-  assert.equal(precheck(pick('anh.png', 10)), 'Chỉ hỗ trợ tệp PDF, DOCX và TXT.');
-  assert.equal(precheck(pick('pdf', 10)), 'Chỉ hỗ trợ tệp PDF, DOCX và TXT.');
-  assert.equal(precheck(pick('khong-duoi', 10)), 'Chỉ hỗ trợ tệp PDF, DOCX và TXT.');
+  for (const name of ['anh.png', 'ANH.JPEG', 'a.jpg', 'a.webp', 'ghi-chu.md', 'readme.markdown']) assert.equal(precheck(pick(name, 10)), null, name);
+  assert.equal(precheck(pick('logo.svg', 10)), 'Chỉ hỗ trợ tệp PDF, DOCX, TXT, Markdown và ảnh PNG, JPG, WebP.');
+  assert.equal(precheck(pick('bang.xlsx', 10)), 'Chỉ hỗ trợ tệp PDF, DOCX, TXT, Markdown và ảnh PNG, JPG, WebP.');
+  assert.equal(precheck(pick('pdf', 10)), 'Chỉ hỗ trợ tệp PDF, DOCX, TXT, Markdown và ảnh PNG, JPG, WebP.');
+  assert.equal(precheck(pick('khong-duoi', 10)), 'Chỉ hỗ trợ tệp PDF, DOCX, TXT, Markdown và ảnh PNG, JPG, WebP.');
   assert.equal(precheck(pick('rong.txt', 0)), 'Tệp rỗng, không có gì để lưu.');
   assert.equal(precheck(pick('to.pdf', MAX_UPLOAD_BYTES + 1)), 'Tệp vượt quá 50 MB.');
 });

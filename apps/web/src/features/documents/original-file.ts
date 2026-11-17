@@ -1,9 +1,9 @@
-import { documentsApi, DOCX_MIME } from '../../lib/documents';
+import { documentsApi, DOCX_MIME, MARKDOWN_MIME } from '../../lib/documents';
 import type { DocumentSummary } from '../../lib/documents';
 import { showDocx } from './docx-viewer';
 
 async function forViewing(blob: Blob, mimeType: string): Promise<Blob> {
-  if (mimeType !== 'text/plain') return blob;
+  if (mimeType !== 'text/plain' && mimeType !== MARKDOWN_MIME) return blob;
   const head = new Uint8Array(await blob.slice(0, 3).arrayBuffer());
   const hasBom = head[0] === 0xef && head[1] === 0xbb && head[2] === 0xbf;
   return new Blob(hasBom ? [blob] : [new Uint8Array([0xef, 0xbb, 0xbf]), blob], { type: 'text/plain;charset=utf-8' });
