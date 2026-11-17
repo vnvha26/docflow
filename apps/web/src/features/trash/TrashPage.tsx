@@ -79,7 +79,7 @@ export function TrashPage({ user }: { user: User }) {
       <span className="profile-icon"><Icon name="trash" size={24} /></span>
     </div>
     <div className="trash-bar">
-      <p>Mục đã xóa được giữ {TRASH_DAYS} ngày rồi tự xóa vĩnh viễn. Trong thời gian đó chúng vẫn tính vào dung lượng và không hiện trong thư viện.</p>
+      <p>Mục đã xóa được giữ {TRASH_DAYS} ngày rồi tự xóa vĩnh viễn.</p>
       <button type="button" className="action-button bulk-danger" disabled={!items.length} onClick={() => setConfirm({ kind: 'empty' })}>Dọn sạch thùng rác…</button>
     </div>
     {notice && <div className="upload-summary tone-done library-notice" role="status"><span className="upload-summary-icon" aria-hidden="true">✓</span><div><p>{notice}</p></div></div>}

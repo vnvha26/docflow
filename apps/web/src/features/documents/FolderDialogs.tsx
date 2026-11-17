@@ -73,12 +73,12 @@ export function FolderFormDialog({ folder, path = [], onSubmit, onClose }: Folde
       </div>}
       <label className="dialog-field">
         <span>Tên thư mục</span>
-        <input value={name} onChange={(event) => setName(event.target.value)} maxLength={MAX_FOLDER_NAME} autoFocus required placeholder="Ví dụ: Nhà Cầu Giấy" />
+        <input value={name} onChange={(event) => setName(event.target.value)} maxLength={MAX_FOLDER_NAME} autoFocus required placeholder="Ví dụ: Giấy tờ xe" />
       </label>
       <label className="dialog-field">
         <span>Mục đích <small>(không bắt buộc)</small></span>
         <textarea value={purpose} onChange={(event) => setPurpose(event.target.value)} maxLength={MAX_FOLDER_PURPOSE} rows={3}
-          placeholder="Ví dụ: Giấy tờ căn nhà ở Cầu Giấy: hợp đồng thuê, hóa đơn điện nước, biên bản bàn giao" />
+          placeholder="Ví dụ: Đăng ký xe, đăng kiểm, bảo hiểm xe — các giấy tờ cần gia hạn" />
         <small>Mô tả ngắn giúp DocFlow gợi ý xếp tài liệu vào đúng thư mục sau này.</small>
       </label>
       {error && <p className="field-error" role="alert">{error}</p>}
