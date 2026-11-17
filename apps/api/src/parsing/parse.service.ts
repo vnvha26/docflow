@@ -6,6 +6,7 @@ import { FileVault } from '../crypto/file-vault.service';
 import { lockUserFiles } from '../database/locks';
 import { PrismaService } from '../database/prisma.service';
 import { ClaimedJob, JobQueue } from '../jobs/job-queue.service';
+import { IMAGE_MIME_TYPES } from '../documents/file-type';
 import { DocumentUnavailableError, RetentionService } from '../retention/retention.service';
 import { ObjectNotFoundError, ObjectStorage } from '../storage/object-storage';
 import { CHUNKER_VERSION, chunkText } from './chunker';
@@ -64,6 +65,10 @@ export class ParseService {
       return true;
     });
     if (!started) throw new Error('LEASE_LOST');
+    if (IMAGE_MIME_TYPES.includes(version.mimeType)) {
+      await this.store(target, { kind: 'unsupported', code: 'IMAGE_NO_TEXT' }, job);
+      return;
+    }
     const file = await this.read(copy.storageKey, copy.encryptionKeyRef, { copyId: copy.id, userId: target.userId }, Number(version.byteSize));
     let outcome: Outcome;
     try {

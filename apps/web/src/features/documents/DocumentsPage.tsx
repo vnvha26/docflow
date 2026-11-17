@@ -6,7 +6,7 @@ import { ApiError, StaleSessionError } from '../../lib/api';
 import type { User } from '../../lib/api';
 import {
   canViewOriginal, documentsApi, fileTypeLabel, formatBytes, infoLine, isChanging, isProcessing, matchesFilters, MAX_UPLOAD_MB, precheck, problemMessage,
-  sortLabels, typeFilterLabels,
+  ACCEPT_ATTRIBUTE, sortLabels, TYPE_FILTERS, typeFilterLabels,
 } from '../../lib/documents';
 import type { DocumentFilters, DocumentSort, DocumentSummary, DocumentTypeFilter, StorageUsage, UploadDecision, UploadResult } from '../../lib/documents';
 import { sha256Hex } from '../../lib/duplicates';
@@ -587,10 +587,10 @@ export function DocumentsPage({ user }: { user: User }) {
               { label: 'Xóa thư mục', onSelect: () => deleteNow(removeFolder(openFolder)), danger: true, hint: 'Thư mục và mọi thứ bên trong vào thùng rác; khôi phục được trong 30 ngày.' },
             ]} />}
             <button type="button" className="button-primary upload-button" onClick={() => input.current?.click()}><Icon name="upload" size={16} />Tải tài liệu</button>
-            <input ref={input} type="file" multiple hidden accept=".pdf,.docx,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain" onChange={choose} />
+            <input ref={input} type="file" multiple hidden accept={ACCEPT_ATTRIBUTE} onChange={choose} />
           </div>
           {openFolder?.purpose && <p className="folder-purpose">{openFolder.purpose}</p>}
-          <p className="upload-note"><Icon name="shield" size={14} />PDF có lớp chữ, DOCX hoặc TXT · tối đa {MAX_UPLOAD_MB} MB mỗi tệp · mã hóa trước khi lưu</p>
+          <p className="upload-note"><Icon name="shield" size={14} />PDF, DOCX, TXT, Markdown hoặc ảnh · tối đa {MAX_UPLOAD_MB} MB mỗi tệp · mã hóa trước khi lưu</p>
           {uploadSummary && <div className={`upload-summary tone-${uploadSummary.tone}`} role="status" aria-live="polite">
             {uploadSummary.tone === 'busy' ? <span className="spinner spinner-small" /> : <span className="upload-summary-icon" aria-hidden="true">{uploadSummary.tone === 'done' ? '✓' : '!'}</span>}
             <div>
@@ -602,7 +602,7 @@ export function DocumentsPage({ user }: { user: User }) {
           {error && <div className="form-alert documents-alert" role="alert"><span aria-hidden="true">!</span><p>{error}</p></div>}
           {(documents.length > 0 || filtered) && <div className="document-filters" role="group" aria-label="Lọc tài liệu">
             <div className="filter-chips">
-              {([undefined, 'pdf', 'docx', 'txt'] as (DocumentTypeFilter | undefined)[]).map((type) =>
+              {[undefined, ...TYPE_FILTERS].map((type) =>
                 <button key={type ?? 'all'} type="button" className="filter-chip" aria-pressed={fileType === type}
                   onClick={() => setFileType(type)}>{type ? typeFilterLabels[type] : 'Tất cả'}</button>)}
             </div>
