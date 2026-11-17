@@ -13,6 +13,7 @@
     "test": "npm run test --workspaces --if-present && npm run db:test",
     "test:auth": "npm run build -w apps/api && node --test tools/auth.integration.test.mjs",
     "test:documents": "npm run build -w apps/api && node --test tools/documents.integration.test.mjs",
+    "ai:check": "npm run build -w apps/api && npm run ai:check -w apps/api",
     "db:generate": "npm run db:generate -w apps/api",
     "db:migrate": "npm run db:migrate -w apps/api",
     "db:test": "node --test tools/database.test.mjs"
