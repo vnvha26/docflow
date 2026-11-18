@@ -128,7 +128,7 @@ export function FolderPane({ tree, view, onSelect, onCreate, accepts, onDrop, on
         onClick={() => setStored((current) => ({ ...current, hidden: !current.hidden }))} aria-label={stored.hidden ? 'Hiện cây thư mục' : 'Ẩn cây thư mục'}>
         <Icon name="chevron" size={14} /><span>Thư mục</span>
       </button>
-      <button type="button" className="text-button" onClick={onCreate}>+ Thư mục mới</button>
+      <button type="button" className="pane-create" onClick={onCreate} title="Thư mục mới" aria-label="Thư mục mới"><Icon name="folder-plus" size={17} /></button>
     </div>
     <ul className="folder-tree">
       {item(ALL, 'Tất cả tài liệu', tree?.totalCount, 1, 'file')}

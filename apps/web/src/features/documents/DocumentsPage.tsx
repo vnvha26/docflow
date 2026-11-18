@@ -609,9 +609,9 @@ export function DocumentsPage({ user }: { user: User }) {
           </div>}
           {showBar && <div className="bulk-bar" role="group" aria-label="Thao tác với tài liệu đã chọn">
             <strong>Đã chọn {chosen.length} tài liệu</strong>
-            <button type="button" className="action-button" onClick={() => setDialog({ kind: 'move-many', ids: chosen })}><Icon name="folder" size={15} />Chuyển tới…</button>
+            <button type="button" className="action-button icon-only" title="Chuyển tới thư mục…" aria-label={`Chuyển ${chosen.length} tài liệu đã chọn tới thư mục`} onClick={() => setDialog({ kind: 'move-many', ids: chosen })}><Icon name="folder" size={16} /></button>
             <button type="button" className="action-button bulk-danger icon-only" title="Xóa — vào thùng rác; khôi phục được trong 30 ngày." aria-label={`Xóa ${chosen.length} tài liệu đã chọn`} onClick={() => deleteNow(removeDocuments(chosen))}><Icon name="trash" size={16} /></button>
-            <button type="button" className="text-button" onClick={() => setSelected([])}>Bỏ chọn</button>
+            <button type="button" className="action-button icon-only bulk-clear" title="Bỏ chọn" aria-label="Bỏ chọn" onClick={() => setSelected([])}><Icon name="close" size={16} /></button>
           </div>}
           {!loading && !documents.length && !subfolders.length && !error && <div className="documents-empty">
             <span><Icon name="folder" size={26} /></span>
@@ -687,8 +687,9 @@ export function DocumentsPage({ user }: { user: User }) {
                 <span>Cập nhật </span><time dateTime={item.updatedAt} title={dateFormat.format(new Date(item.updatedAt))}>{shortDate(item.updatedAt)}</time>
               </p>
               <div className="document-actions">
-                <button type="button" className="action-button" onClick={() => setSummaryOf(item)}>
-                  <Icon name="summary" size={15} />Xem tóm tắt
+                <button type="button" className="action-button icon-only" onClick={() => setSummaryOf(item)}
+                  title="Xem tóm tắt" aria-label={`Xem tóm tắt ${item.title}`}>
+                  <Icon name="summary" size={16} />
                 </button>
                 <DocumentOptions document={item}
                   onRename={() => setDialog({ kind: 'rename', document: item })}

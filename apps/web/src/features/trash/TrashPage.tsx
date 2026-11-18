@@ -99,8 +99,12 @@ export function TrashPage({ user }: { user: User }) {
           <p>Xóa lúc <time dateTime={entry.deletedAt}>{dateFormat.format(new Date(entry.deletedAt))}</time> · <span className="trash-left">{remainingLabel(entry)}</span></p>
         </div>
         <div className="document-actions">
-          <button type="button" className="action-button action-primary" disabled={busy !== null} onClick={() => restore(entry)}>{busy === entry.id ? 'Đang khôi phục…' : 'Khôi phục'}</button>
-          <button type="button" className="action-button bulk-danger" disabled={busy !== null} onClick={() => setConfirm({ kind: 'purge', entry })}>Xóa vĩnh viễn…</button>
+          <button type="button" className="action-button action-primary icon-only" disabled={busy !== null} onClick={() => restore(entry)}
+            title="Khôi phục" aria-label={busy === entry.id ? 'Đang khôi phục…' : `Khôi phục ${entryTitle(entry)}`}>
+            {busy === entry.id ? <span className="spinner spinner-small" /> : <Icon name="restore" size={16} />}
+          </button>
+          <button type="button" className="action-button bulk-danger icon-only" disabled={busy !== null} onClick={() => setConfirm({ kind: 'purge', entry })}
+            title="Xóa vĩnh viễn…" aria-label={`Xóa vĩnh viễn ${entryTitle(entry)}`}><Icon name="trash" size={16} /></button>
         </div>
       </li>)}
     </ul>

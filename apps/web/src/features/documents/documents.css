@@ -147,7 +147,9 @@
 .library-main > .document-list:first-child, .library-main > .documents-empty { margin-top: 12px; }
 .folder-pane { position: sticky; top: 16px; z-index: 6; padding: 12px 8px 10px; border: 1px solid #e8ece1; border-radius: 14px; background: #fbfcf7; margin-bottom: 26px; }
 .folder-pane-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 8px 8px; font-size: 11px; letter-spacing: .6px; text-transform: uppercase; color: #8a9580; }
-.folder-pane-head .text-button { font-size: 12.5px; letter-spacing: 0; text-transform: none; }
+.pane-create { display: grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 1px solid transparent; border-radius: 7px; background: transparent; color: #55704a; cursor: pointer; transition: background .15s, border-color .15s, color .15s; }
+.pane-create:hover { background: #f1f5ea; border-color: #e0e7d6; color: #2f5537; }
+.pane-create:focus-visible { outline: 2px solid #789b7c; outline-offset: 2px; }
 .folder-tree { list-style: none; margin: 0; padding: 0; display: grid; gap: 1px; max-height: 460px; overflow-y: auto; }
 .folder-item { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 34px; padding: 6px 10px; border: 0; border-radius: 8px; background: transparent; color: #4d6045; font-size: 13px; text-align: left; transition: background .15s, color .15s; }
 .folder-item span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -249,7 +251,7 @@ body.marquee-active { user-select: none; -webkit-user-select: none; cursor: cros
 body.marquee-active .document-row { cursor: crosshair; }
 .bulk-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 12px 0 0; padding: 8px 12px; border-radius: 10px; border: 1px solid #d6e3cb; background: #eef4e7; font-size: 13px; color: #2f4a33; position: sticky; top: 8px; z-index: 3; }
 .bulk-bar strong { font-weight: 600; margin-right: auto; }
-.bulk-bar .text-button { font-size: 12.5px; margin-left: 4px; }
+.action-button.bulk-clear { border-color: transparent; background: transparent; color: #6f7f63; margin-left: 2px; }
 .action-button.bulk-danger { color: #ae4937; border-color: #ecd3ca; }
 .action-button.bulk-danger:hover:not(:disabled) { background: #fcf1ec; border-color: #e2bfb3; color: #9b3d2c; }
 .document-filters .sort-select { min-width: 170px; }
