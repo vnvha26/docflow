@@ -6,7 +6,7 @@ import { ApiError, StaleSessionError } from '../../lib/api';
 import type { User } from '../../lib/api';
 import {
   canViewOriginal, documentsApi, fileTypeLabel, formatBytes, infoLine, isChanging, isProcessing, matchesFilters, MAX_UPLOAD_MB, precheck, problemMessage,
-  ACCEPT_ATTRIBUTE, sortLabels, TYPE_FILTERS, typeFilterLabels,
+  ACCEPT_ATTRIBUTE, sortLabels,
 } from '../../lib/documents';
 import type { DocumentFilters, DocumentSort, DocumentSummary, DocumentTypeFilter, StorageUsage, UploadDecision, UploadResult } from '../../lib/documents';
 import { sha256Hex } from '../../lib/duplicates';
@@ -26,6 +26,7 @@ import { ALL, DOCUMENT_DRAG, FolderPane, hasFiles } from './FolderPane';
 import type { FolderAction } from './FolderPane';
 import { openOriginal } from './original-file';
 import { SummaryDialog } from './SummaryDialog';
+import { TypeFilterMenu } from './TypeFilterMenu';
 import { useMarquee } from './useMarquee';
 import './documents.css';
 
@@ -601,11 +602,7 @@ export function DocumentsPage({ user }: { user: User }) {
           {notice && <div className="upload-summary tone-done library-notice" role="status"><span className="upload-summary-icon" aria-hidden="true">✓</span><div><p>{notice}{undo && <> <button type="button" className="text-button" onClick={undoDelete} disabled={undoing}>{undoing ? 'Đang hoàn tác…' : 'Hoàn tác'}</button><i aria-hidden="true"> · </i><Link className="text-button" to="/trash">Mở thùng rác</Link></>}</p></div></div>}
           {error && <div className="form-alert documents-alert" role="alert"><span aria-hidden="true">!</span><p>{error}</p></div>}
           {(documents.length > 0 || filtered) && <div className="document-filters" role="group" aria-label="Lọc tài liệu">
-            <div className="filter-chips">
-              {[undefined, ...TYPE_FILTERS].map((type) =>
-                <button key={type ?? 'all'} type="button" className="filter-chip" aria-pressed={fileType === type}
-                  onClick={() => setFileType(type)}>{type ? typeFilterLabels[type] : 'Tất cả'}</button>)}
-            </div>
+            <TypeFilterMenu value={fileType} onChange={setFileType} />
             <select className="filter-select sort-select" aria-label="Sắp xếp" value={sort} onChange={(event) => setSort(event.target.value as DocumentSort)}>
               {(Object.keys(sortLabels) as DocumentSort[]).map((key) => <option key={key} value={key}>{sortLabels[key]}</option>)}
             </select>
@@ -613,7 +610,7 @@ export function DocumentsPage({ user }: { user: User }) {
           {showBar && <div className="bulk-bar" role="group" aria-label="Thao tác với tài liệu đã chọn">
             <strong>Đã chọn {chosen.length} tài liệu</strong>
             <button type="button" className="action-button" onClick={() => setDialog({ kind: 'move-many', ids: chosen })}><Icon name="folder" size={15} />Chuyển tới…</button>
-            <button type="button" className="action-button bulk-danger" title="Vào thùng rác; khôi phục được trong 30 ngày." onClick={() => deleteNow(removeDocuments(chosen))}>Xóa</button>
+            <button type="button" className="action-button bulk-danger icon-only" title="Xóa — vào thùng rác; khôi phục được trong 30 ngày." aria-label={`Xóa ${chosen.length} tài liệu đã chọn`} onClick={() => deleteNow(removeDocuments(chosen))}><Icon name="trash" size={16} /></button>
             <button type="button" className="text-button" onClick={() => setSelected([])}>Bỏ chọn</button>
           </div>}
           {!loading && !documents.length && !subfolders.length && !error && <div className="documents-empty">
